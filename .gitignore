@@ -1,6 +1,7 @@
 # 二进制与运行时产物
 panrouter
 panrouter.exe
+panrouter.exe
 data/
 *.db
 *.db-shm
@@ -11,3 +12,4 @@ config.yaml
 
 # 依赖与参考材料
 .refs/
+*.exe
