@@ -342,6 +342,13 @@ driver 是变更频率最高的模块,**必须在不碰真实账号的前提下�
 | **M3 加速与生态** | 中转流(Range 续传 + 白名单)+ 阿里/迅雷 driver(M3 前 spike)+ WebDAV | 115/夸克大文件经中转稳定下载;WebDAV 可挂载播放 |
 | **M4 硬骨头与打磨** | 百度 spike(开放平台个人配额验证)→ 实施(秒传为保底)+ 115(仅中转)+ 指标面板 + 打包文档 | 全盘位可用;release 附一键部署包 |
 
+**M2 专项(排入 2026-10-03)**:
+
+| 专项 | 内容 | 状态 / 验收 |
+|---|---|---|
+| **S1 夸克直链终验** | 转存链已在 v1.1.5 落地(resolve→save→轮询→file/download→清理,合约测试覆盖);直链 + `__puus` 合并 + 206 Range 已用真实文件线上验证 | 待账号容量释放后全链终验(resolve→提链→302→下载);当前容量超限,save 诚实返回 risk_control |
+| **S2 蓝奏云 acw_sc__v2 求解器** | 蓝奏云 CDN(dmpdmp/lanrar)对非浏览器客户端下发 JS 挑战,阻断 /stream 中转下载;算法已验证(posList 重排 + hexXor,密钥 `3000176000856006061501533003690027800375` 可产出有效 Cookie) | 工程化为 httpx 挑战中间件(检测 412/challenge 页 → 自动解题重放);验收:非浏览器 UA 经 /stream 下载蓝奏云文件成功 |
+
 ---
 
 ## 11. 风险与合规
@@ -367,9 +374,9 @@ driver 是变更频率最高的模块,**必须在不碰真实账号的前提下�
 
 ## 变更记录
 
+- **v1.1.5(2026-10-03)**:夸克转存链重构(线上实锚)——分享直链端点 `sharepage/download` 已下线(双域名全参数形态 404,实锚取证);实测当前真实流程为**转存链**:token → detail → save(`fid_list` 字段,`save_as_select_top_fids` 会 41013)→ task 轮询(status==2)→ file/download → CDN 直链;缓存 stoken 过期自动重取并重试一次(分类为 upstream,不误判 share_gone);转存受限(容量不足/次数超限)诚实分类为 risk_control;**直链 Cookie 基底修正**:CDN 需完整登录态 Cookie(file/download 的 Set-Cookie 间歇性缺失,仅 `__puus` 会被 412/403),改为登录态为基底 + Set-Cookie 同名覆盖(mergeCookies 保持基底顺序);实测**删除转存副本不使直链失效**(取链后自动清理转存副本,节省网盘空间);合约测试重写(save 链 fixture + 任务轮询 + 容量分类 + Cookie 断言);端到端终验通过:提链 → /d 302 → /stream 中转 200(775B video/mp4)+ Range 206 续传逐字节一致
 - **v1.1.4(2026-10-03)**:线上联调修复——夸克分享直链端点修正(drive-pc 旧端点 404 → drive.quark.cn + `fid` 单数 + 异步任务轮询,实测取证);夸克分享直链确认需登录态(无 Cookie 时按契约返回 AuthExpired);蓝奏云**密码分享支持**(密码页 isngis+fileid → ajaxfile.php,真实链接+提取码全链路验证);新增 lanzouu 域名路由与 lanrar/dmpdmp CDN 白名单;蓝奏云 CDN acw_sc__v2 反爬挑战对非浏览器客户端的影响已定位并列为 M2 专项
 ## 变更记录(历史)
-
 - **v1.1.3(2026-10-03)**:基于端到端测试的深度优化——新增 `internal/app` 装配层(main 与 e2e 共用,消除装配漂移类缺陷);`Registry.UpdateRoutes` 使域名路由真正热生效(带锁热替换 + 测试);过期直链并发刷新经 singleflight 收敛为一次真实调用;实现 §7.7 在途并发闸(`download_concurrency`,排队等待 + 15s 上限,不再 fail-fast);路由计数语义修正为"实际服务决策点"(/d 与 aria2 推送);app 支持 `ExtraDrivers` 注入式 driver(测试 fake 与未来插件共用通道)
 - **v1.1.2(2026-10-03)**:生产化评审修复——中转流与 API 调用拆分客户端(去除 30s 体传输截断,P1);账号 cooling 冷却到期自动复位(补全状态机);配置解析失败不再静默回落默认密钥;管理页文件名 XSS 转义;扩展点收敛(`drivers` 为 map + 工厂注册,新增网盘只改 driver 包与 config);`FID` 列名显式映射(修复 GORM 默认命名 `f_id` 与查询字面量不一致导致的落库必炸 bug);新增 repo/sign/config/httpx/relay 共 11 个回归测试;非 loopback + 默认密钥拒绝启动;删除未接线的全局 Proxy 配置与 own 模式死参数
 - **v1.1.1(2026-10-03)**:M1 实现同步——下载路径带 `share_key` 段(`/d/{pan}/{share_key}/{fid}`,fid 非全局唯一);`BindUA` 字段并入 UA 等值匹配规则;错误契约新增 `KindUnsupported`;M1 落地说明:JWT 为自实现 HS256、`/metrics` 为极简 Prometheus 文本实现(M2 替换 client_golang)
