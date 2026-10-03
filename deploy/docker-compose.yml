@@ -1,0 +1,45 @@
+# PanRouter 自用部署:panrouter + aria2(+ 可选 caddy 反代)
+# 使用:cp ../config.example.yaml ./config.yaml && 改密钥 && docker compose up -d
+services:
+  panrouter:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    container_name: panrouter
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:6400:6400"
+    environment:
+      - PANROUTER_MASTER_KEY=${PANROUTER_MASTER_KEY:-please-change-32bytes-random-master-key}
+    volumes:
+      - ./config.yaml:/app/config.yaml:ro
+      - panrouter-data:/app/data
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:6400/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  aria2:
+    image: p3terx/aria2-pro
+    container_name: panrouter-aria2
+    restart: unless-stopped
+    environment:
+      - RPC_SECRET=${ARIA2_SECRET:-please-change-aria2-secret}
+      - RPC_PORT=6800
+    volumes:
+      - ./downloads:/downloads
+      - aria2-config:/config
+
+  # 可选:域名 + HTTPS 反代(base_url 与 deploy_profile 需同步调整)
+  # caddy:
+  #   image: caddy:2-alpine
+  #   restart: unless-stopped
+  #   ports: ["80:80", "443:443"]
+  #   volumes:
+  #     - ./Caddyfile:/etc/caddy/Caddyfile:ro
+  #     - caddy-data:/data
+
+volumes:
+  panrouter-data:
+  aria2-config:

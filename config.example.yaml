@@ -1,0 +1,63 @@
+# PanRouter 配置示例 —— 复制为 config.yaml 后修改
+# 热加载:除 listen 外的变更(限频/画像/域名路由)5 秒内自动生效;
+# 代理与重定向白名单在客户端构建时固化,变更需重启。
+
+server:
+  listen: 127.0.0.1:6400
+  base_url: http://127.0.0.1:6400     # 对外访问地址;若经反代/域名访问,填 https://pan.example.com
+  deploy_profile: home                # home=服务跑在家里(与客户端同 LAN) | cloud=服务跑在云主机(直链绑 IP 时自动走中转)
+  sign_ttl: 72h                       # /d、/stream 签名有效期(≥ 最长下载时长)
+  data_dir: ./data
+
+auth:
+  username: admin
+  # bcrypt 哈希;示例为 "admin123",上线前必须更换!
+  # 生成:htpasswd -bnBC 10 "" '你的密码' | tr -d ':\n'
+  # (若填明文密码也可登录,但每次登录会打警告日志,建议尽早改为哈希)
+  password_bcrypt: "$2a$10$ZmboqbL3NvvVCXSDUR3ev.EWMUKRFo6OjQObNE3K6b.XggHNyuT9K"
+  api_token: change-me-to-random      # 脚本调用令牌;非 loopback 监听时为默认值将拒绝启动
+  jwt_secret: change-me-to-random     # 会话签名密钥;同时也是凭据加密主密钥的回落值
+  # 凭据加密主密钥建议用独立环境变量 PANROUTER_MASTER_KEY(32+ 位随机串)
+
+# 分享链接域名 → 网盘 ID 路由表(可热改;网盘换域名时改这里)
+domain_routes:
+  quark:
+    - pan.quark.cn
+  lanzou:
+    - lanzou.com
+    - lanzouw.com
+    - lanzoui.com
+    - lanzoue.com
+    - lanzouf.com
+    - lanzoa.com
+    - lanzoub.com
+    - lanzouc.com
+    - lanzoud.com
+    - lanzouv.com
+    - lanzoux.com
+    - lansov.com
+    - lanzn.com
+
+# 每网盘驱动配置(键 = driver ID;新增网盘加一个键即可)
+drivers:
+  quark:
+    enabled: true
+    limit_qps: 2                      # 本地限频,防触发风控
+    download_concurrency: 3
+    upstream_allow: [".quark.cn"]
+    redirect_allow: [".quark.cn", ".quarkcdn.cn", ".uc.cn"]  # 中转重定向白名单,只能加严
+    proxy: ""                         # 可选:http://user:pass@host:port
+  lanzou:
+    enabled: true
+    limit_qps: 5
+    download_concurrency: 3
+    upstream_allow: [".lanzouw.com", ".lanzou.com", ".xlig.cn"]
+    redirect_allow: [".lanzouw.com", ".lanzou.com", ".xlig.cn"]
+
+aria2:
+  endpoint: http://127.0.0.1:6800/jsonrpc
+  secret: ""                          # aria2.conf 里 rpc-secret 的值
+  same_host: true                     # aria2 是否与 PanRouter 同机/同内网(决定绑 IP 直链能否直下)
+
+log:
+  level: info

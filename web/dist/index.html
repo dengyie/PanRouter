@@ -1,0 +1,185 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>PanRouter · 网盘直链聚合</title>
+<style>
+  :root { --bg:#0f1115; --card:#171a21; --line:#252a35; --txt:#e6e9ef; --sub:#8b93a3; --acc:#4f8cff; --ok:#3fb96f; --warn:#e2a33c; }
+  * { box-sizing:border-box; margin:0; }
+  body { background:var(--bg); color:var(--txt); font:14px/1.6 system-ui,"Segoe UI","Microsoft YaHei",sans-serif; padding:32px 16px; }
+  .wrap { max-width:860px; margin:0 auto; }
+  h1 { font-size:20px; margin-bottom:4px; } h1 span { color:var(--acc); }
+  .sub { color:var(--sub); margin-bottom:24px; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:10px; padding:20px; margin-bottom:16px; }
+  label { display:block; color:var(--sub); font-size:12px; margin:10px 0 4px; }
+  input { width:100%; background:#0c0e13; border:1px solid var(--line); color:var(--txt); border-radius:6px; padding:9px 12px; font-size:14px; }
+  input:focus { outline:none; border-color:var(--acc); }
+  button { background:var(--acc); border:none; color:#fff; border-radius:6px; padding:9px 18px; font-size:14px; cursor:pointer; margin-top:12px; }
+  button.ghost { background:transparent; border:1px solid var(--line); color:var(--sub); }
+  button:disabled { opacity:.5; cursor:default; }
+  table { width:100%; border-collapse:collapse; margin-top:8px; }
+  th,td { text-align:left; padding:7px 8px; border-bottom:1px solid var(--line); font-size:13px; }
+  th { color:var(--sub); font-weight:500; }
+  .badge { display:inline-block; padding:1px 8px; border-radius:10px; font-size:12px; }
+  .b302 { background:#12351f; color:var(--ok); } .baria2 { background:#3a2f10; color:var(--warn); } .bstream { background:#14263d; color:var(--acc); }
+  .msg { margin-top:10px; padding:10px 12px; border-radius:6px; font-size:13px; }
+  .err { background:#3a1717; color:#ff9d9d; } .info { background:#12283a; color:#9ecbff; }
+  a { color:var(--acc); text-decoration:none; }
+  .row { display:flex; gap:10px; } .row > * { flex:1; }
+  .hide { display:none; }
+  code { background:#0c0e13; padding:2px 6px; border-radius:4px; font-size:12px; color:var(--sub); word-break:break-all; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>Pan<span>Link</span> <small style="color:var(--sub);font-size:12px" id="ver"></small></h1>
+  <div class="sub">自用网盘直链聚合 · 302 / aria2 / 中转自动择路</div>
+
+  <div class="card" id="loginCard">
+    <label>访问令牌(登录用户名密码换取,或直接填 config 中的 api_token)</label>
+    <div class="row">
+      <input id="user" placeholder="用户名">
+      <input id="pass" type="password" placeholder="密码">
+    </div>
+    <button onclick="login()">登录</button>
+    <div id="loginMsg"></div>
+  </div>
+
+  <div class="card hide" id="mainCard">
+    <label>分享链接</label>
+    <input id="url" placeholder="https://pan.quark.cn/s/xxxx 或 https://xxx.lanzouw.com/xxxx">
+    <label>提取码(可空)</label>
+    <input id="pwd" placeholder="1234" style="max-width:200px">
+    <button onclick="resolve()">解析</button>
+    <span style="margin-left:8px;color:var(--sub);font-size:12px">解析文件后点行内「提链」获取直链</span>
+    <div id="shareMsg"></div>
+    <div id="files"></div>
+    <div id="linkBox"></div>
+  </div>
+
+  <div class="card hide" id="accCard">
+    <label>夸克账号 Cookie(自用登录态;页面登录夸克后从开发者工具复制)</label>
+    <div class="row">
+      <input id="accName" placeholder="备注名">
+      <input id="accCookie" placeholder="__pus=...; __puus=...; ...">
+    </div>
+    <button class="ghost" onclick="addAccount()">添加账号</button>
+    <div id="accList"></div>
+  </div>
+</div>
+
+<script>
+const $ = id => document.getElementById(id);
+let TOKEN = localStorage.getItem('panrouter_token') || '';
+let LAST = null; // 最近一次解析上下文 {pan, share_key}
+
+// 外部可控字符串(文件名/备注/上游报错)一律转义后再进 innerHTML,防管理员页 XSS
+function esc(s) {
+  return String(s ?? '').replace(/[&<>"']/g, c =>
+    ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+
+async function api(path, opts={}) {
+  const res = await fetch('/api/v1' + path, {
+    ...opts,
+    headers: {'Content-Type':'application/json', ...(TOKEN?{'Authorization':'Bearer '+TOKEN}:{}), ...(opts.headers||{})},
+  });
+  const data = await res.json().catch(()=>({}));
+  if (res.status === 401 && TOKEN) { // 会话失效:清 token,回登录页
+    logout();
+    throw Object.assign(new Error(data.message || '登录已过期'), {status:401});
+  }
+  if (!res.ok) throw Object.assign(new Error(data.message||res.statusText), {status:res.status, kind:data.kind});
+  return data;
+}
+
+function logout() {
+  localStorage.removeItem('panrouter_token'); TOKEN = '';
+  $('mainCard').classList.add('hide');
+  $('accCard').classList.add('hide');
+  $('loginCard').classList.remove('hide');
+}
+
+async function login() {
+  try {
+    const d = await api('/auth/login', {method:'POST', body: JSON.stringify({username:$('user').value, password:$('pass').value})});
+    TOKEN = d.token; localStorage.setItem('panrouter_token', TOKEN);
+    enter();
+  } catch(e) { $('loginMsg').innerHTML = `<div class="msg err">${esc(e.message)}</div>`; }
+}
+
+function enter() {
+  $('loginCard').classList.add('hide');
+  $('mainCard').classList.remove('hide');
+  $('accCard').classList.remove('hide');
+  loadAccounts(); // 首个鉴权调用;401 由 api() 全局处理并回登录页
+  fetch('/healthz').then(r=>r.json()).then(h=>$('ver').textContent='v'+h.version).catch(()=>{});
+}
+
+async function resolve() {
+  $('shareMsg').innerHTML=''; $('files').innerHTML=''; $('linkBox').innerHTML='';
+  try {
+    const d = await api('/resolve', {method:'POST', body: JSON.stringify({url:$('url').value, pwd:$('pwd').value})});
+    LAST = d;
+    const rows = d.files.map(f =>
+      `<tr><td>${esc(f.name)}</td><td>${fmtSize(f.size)}</td>`+
+      (f.is_dir ? `<td>目录</td>` :
+       `<td><a href="javascript:link('${esc(f.fid)}')">提链</a></td>`) + `</tr>`).join('');
+    $('files').innerHTML = `<table><tr><th>文件</th><th>大小</th><th></th></tr>${rows}</table>`;
+  } catch(e) { $('shareMsg').innerHTML = `<div class="msg err">${esc(e.message)}</div>`; }
+}
+
+async function link(fid) {
+  try {
+    const d = await api('/resolve', {method:'POST', body: JSON.stringify({url:$('url').value, pwd:$('pwd').value, fid})});
+    const badge = {['302']:'b302', aria2:'baria2', stream:'bstream'}[d.route] || 'bstream';
+    const aria2 = `aria2c -x16 -s16 --header="User-Agent: ${d.ua||'默认'}"${d.referer?` --header="Referer: ${d.referer}"`:''} "${d.need_headers?d.stream_url:d.download_url}" -o "${d.file_name}"`;
+    $('linkBox').innerHTML = `
+      <div class="msg info" style="margin-top:12px">
+        <b>${esc(d.file_name)}</b> · 路径:<span class="badge ${badge}">${esc(d.route)}</span> ·
+        缓存:${d.cache_hit?'命中':'新解析'} · 有效期至 ${esc(new Date(d.expires_at).toLocaleString())}<br>
+        <a href="${esc(d.download_url)}" target="_blank">点此下载(自动择路)</a> ·
+        <a href="javascript:push('${esc(fid)}')">推送到 aria2</a><br>
+        <code>${esc(aria2)}</code>
+        <button class="ghost" onclick="navigator.clipboard.writeText(this.previousElementSibling.textContent)">复制命令</button>
+      </div>`;
+  } catch(e) { $('linkBox').innerHTML = `<div class="msg err">${esc(e.message)}</div>`; }
+}
+
+async function push(fid) {
+  try {
+    await api('/downloads', {method:'POST', body: JSON.stringify({pan:LAST?.pan, share_key:LAST?.share_key, fid})});
+    $('linkBox').innerHTML += `<div class="msg info">已推送到 aria2</div>`;
+  } catch(e) { alert('推送失败:'+e.message); }
+}
+
+async function loadAccounts() {
+  try {
+    const d = await api('/accounts?pan=quark');
+    $('accList').innerHTML = '<table><tr><th>ID</th><th>备注</th><th>状态</th><th></th></tr>' +
+      d.accounts.map(a=>`<tr><td>${esc(a.id)}</td><td>${esc(a.name)}</td><td>${esc(a.status)}</td>`+
+      `<td><a href="javascript:refreshAcc(${Number(a.id)})">校验</a> · <a href="javascript:delAcc(${Number(a.id)})">删除</a></td></tr>`).join('') + '</table>';
+  } catch(e) { $('accList').innerHTML = `<div class="msg err">${esc(e.message)}</div>`; }
+}
+
+async function addAccount() {
+  try {
+    await api('/accounts', {method:'POST', body: JSON.stringify({pan_type:'quark', name:$('accName').value, cookie:$('accCookie').value})});
+    $('accCookie').value=''; loadAccounts();
+  } catch(e) { alert(e.message); }
+}
+async function refreshAcc(id) { try { await api(`/accounts/${id}/refresh`, {method:'POST'}); loadAccounts(); } catch(e){ alert(e.message); } }
+async function delAcc(id) { try { await api(`/accounts/${id}`, {method:'DELETE'}); loadAccounts(); } catch(e){ alert(e.message); } }
+
+function fmtSize(n) {
+  if (!n) return '-';
+  const u=['B','KB','MB','GB','TB']; let i=0;
+  while (n>=1024 && i<u.length-1) { n/=1024; i++; }
+  return n.toFixed(1)+' '+u[i];
+}
+
+if (TOKEN) { enter(); }
+</script>
+</body>
+</html>
