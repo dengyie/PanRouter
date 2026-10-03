@@ -16,25 +16,31 @@ import (
 )
 
 const (
-	baseURL = "https://drive-pc.quark.cn"
-	infoURL = "https://pan.quark.cn/account/info"
-	referer = "https://pan.quark.cn/"
-	QuarkUA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) quark-cloud-drive/3.14.2 Chrome/112.0.5615.165 Electron/24.1.3.8 Safari/537.36 Channel/pckk_other_ch"
-	linkTTL = 2 * time.Hour
+	baseURL  = "https://drive-pc.quark.cn"
+	shareURL = "https://drive.quark.cn"
+	infoURL  = "https://pan.quark.cn/account/info"
+	referer  = "https://pan.quark.cn/"
+	QuarkUA  = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) quark-cloud-drive/3.14.2 Chrome/112.0.5615.165 Electron/24.1.3.8 Safari/537.36 Channel/pckk_other_ch"
+	linkTTL  = 2 * time.Hour
 )
 
 var pwdIDRe = regexp.MustCompile(`/s/([0-9a-zA-Z]+)`)
 
 type Driver struct {
-	client *httpx.Client
-	base   string // 生产为官方地址;测试注入 httptest 地址
+	client       *httpx.Client
+	base         string        // token/detail/file 下载(drive-pc);测试注入 httptest 地址
+	shareBase    string        // 分享直链端点(drive.quark.cn);测试注入 httptest 地址
+	taskInterval time.Duration // 任务轮询间隔(测试可缩短)
 }
 
-func New(client *httpx.Client, base string) *Driver {
+func New(client *httpx.Client, base, shareBase string) *Driver {
 	if base == "" {
 		base = baseURL
 	}
-	return &Driver{client: client, base: base}
+	if shareBase == "" {
+		shareBase = shareURL
+	}
+	return &Driver{client: client, base: base, shareBase: shareBase, taskInterval: time.Second}
 }
 
 func (d *Driver) ID() string { return "quark" }
@@ -97,15 +103,10 @@ func (d *Driver) call(ctx context.Context, method, rawURL string, body any, cred
 	return res, nil
 }
 
-// mustOK 校验业务码并完成 Data 的二级反序列化。
-func mustOK[T any](resp *apiResp, out *T) error {
+// mustOK 校验业务码;Data 的反序列化由调用方按实际结构处理。
+func mustOK(resp *apiResp) error {
 	if resp.Code != 0 {
 		return classify(resp.Message)
-	}
-	if out != nil {
-		if err := json.Unmarshal(resp.Data, out); err != nil {
-			return driver.NewErr(driver.KindInterfaceChanged, "夸克响应结构变化,解析失败", err)
-		}
 	}
 	return nil
 }
@@ -119,8 +120,11 @@ func (d *Driver) stoken(ctx context.Context, pwdID, passcode string, cred *drive
 	var data struct {
 		Stoken string `json:"stoken"`
 	}
-	if err := mustOK(&resp, &data); err != nil {
+	if err := mustOK(&resp); err != nil {
 		return "", err
+	}
+	if err := json.Unmarshal(resp.Data, &data); err != nil {
+		return "", driver.NewErr(driver.KindInterfaceChanged, "夸克响应结构变化,解析失败", err)
 	}
 	if data.Stoken == "" {
 		return "", driver.NewErr(driver.KindInterfaceChanged, "夸克响应缺少 stoken", nil)
@@ -165,8 +169,11 @@ func (d *Driver) ResolveShare(ctx context.Context, share driver.ShareLink, cred 
 				Total int `json:"_total"`
 			} `json:"metadata"`
 		}
-		if err := mustOK(&resp, &data); err != nil {
+		if err := mustOK(&resp); err != nil {
 			return nil, err
+		}
+		if err := json.Unmarshal(resp.Data, &data); err != nil {
+			return nil, driver.NewErr(driver.KindInterfaceChanged, "夸克响应结构变化,解析失败", err)
 		}
 		for _, f := range data.List {
 			name := f.FileName
@@ -186,50 +193,147 @@ func (d *Driver) ResolveShare(ctx context.Context, share driver.ShareLink, cred 
 }
 
 func (d *Driver) GetDirectLink(ctx context.Context, cred *driver.Credential, ref driver.FileRef) (driver.DirectLink, error) {
-	var (
-		u    string
-		body any
-	)
 	if ref.Own {
-		u = d.base + "/1/clouddrive/file/download?pr=ucpro&fr=pc&uc_param_str="
-		body = map[string]any{"fids": []string{ref.FID}}
-	} else {
-		pwdID := ref.Ext["pwd_id"]
-		if pwdID == "" {
-			return driver.DirectLink{}, driver.NewErr(driver.KindNotFound, "缺少夸克分享上下文,请重新解析", nil)
+		if cred == nil || cred.Cookie == "" {
+			return driver.DirectLink{}, driver.NewErr(driver.KindAuthExpired, "夸克网盘内文件提链需要登录态,请添加夸克账号 Cookie", nil)
 		}
-		st := ref.Ext["stoken"]
-		if st == "" {
-			var err error
-			if st, err = d.stoken(ctx, pwdID, ref.Ext["pwd"], cred); err != nil {
-				return driver.DirectLink{}, err
-			}
+		u := d.base + "/1/clouddrive/file/download?pr=ucpro&fr=pc&uc_param_str="
+		var resp apiResp
+		res, err := d.call(ctx, "POST", u, map[string]any{"fids": []string{ref.FID}}, cred, &resp)
+		if err != nil {
+			return driver.DirectLink{}, err
 		}
-		u = d.base + "/1/clouddrive/share/sharepage/download?pr=ucpro&fr=pc"
-		body = map[string]any{"pwd_id": pwdID, "stoken": st, "fids": []string{ref.FID}}
+		return d.linkFromList(res, &resp)
 	}
+
+	// 分享模式:端点在 drive.quark.cn,h5 网关对未登录请求隐藏(实测 404),必须带 Cookie
+	pwdID := ref.Ext["pwd_id"]
+	if pwdID == "" {
+		return driver.DirectLink{}, driver.NewErr(driver.KindNotFound, "缺少夸克分享上下文,请重新解析", nil)
+	}
+	if cred == nil || cred.Cookie == "" {
+		return driver.DirectLink{}, driver.NewErr(driver.KindAuthExpired, "夸克分享直链需要登录态,请先在「账号管理」添加夸克账号 Cookie", nil)
+	}
+	st := ref.Ext["stoken"]
+	if st == "" {
+		var err error
+		if st, err = d.stoken(ctx, pwdID, ref.Ext["pwd"], cred); err != nil {
+			return driver.DirectLink{}, err
+		}
+	}
+	u := d.shareBase + "/1/clouddrive/share/sharepage/download?pr=ucpro&fr=pc"
 	var resp apiResp
-	res, err := d.call(ctx, "POST", u, body, cred, &resp)
+	res, err := d.call(ctx, "POST", u,
+		map[string]any{"fid": ref.FID, "pwd_id": pwdID, "stoken": st}, cred, &resp)
 	if err != nil {
 		return driver.DirectLink{}, err
 	}
+	if err := mustOK(&resp); err != nil {
+		return driver.DirectLink{}, err
+	}
+	return d.extractShareLink(ctx, cred, &resp, res)
+}
+
+// extractShareLink 解析分享下载接口的三种响应形态:
+// 1) data 为数组,元素带 download_url;2) data.task_id → 轮询任务;3) data.data[0].download_url。
+func (d *Driver) extractShareLink(ctx context.Context, cred *driver.Credential, resp *apiResp, res *httpx.Result) (driver.DirectLink, error) {
+	// 形态 1:同步数组
+	var list []struct {
+		DownloadURL string `json:"download_url"`
+	}
+	if err := json.Unmarshal(resp.Data, &list); err == nil && len(list) > 0 && list[0].DownloadURL != "" {
+		return d.buildLink(res, list[0].DownloadURL), nil
+	}
+	// 形态 3:data.data[0].download_url
+	var nested struct {
+		Data []struct {
+			DownloadURL string `json:"download_url"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(resp.Data, &nested); err == nil && len(nested.Data) > 0 && nested.Data[0].DownloadURL != "" {
+		return d.buildLink(res, nested.Data[0].DownloadURL), nil
+	}
+	// 形态 2:异步任务
+	var task struct {
+		TaskID string `json:"task_id"`
+	}
+	if err := json.Unmarshal(resp.Data, &task); err == nil && task.TaskID != "" {
+		return d.pollTask(ctx, cred, task.TaskID, res)
+	}
+	return driver.DirectLink{}, driver.NewErr(driver.KindInterfaceChanged,
+		fmt.Sprintf("夸克分享下载响应结构未识别: %.200s", string(resp.Data)), nil)
+}
+
+// pollTask 轮询夸克异步任务,直至 status==2(完成)拿 download_url。
+func (d *Driver) pollTask(ctx context.Context, cred *driver.Credential, taskID string, dlRes *httpx.Result) (driver.DirectLink, error) {
+	const attempts = 30
+	for i := 0; i < attempts; i++ {
+		select {
+		case <-ctx.Done():
+			return driver.DirectLink{}, driver.NewErr(driver.KindUpstream, "等待夸克任务时请求已取消", ctx.Err())
+		case <-time.After(d.taskInterval):
+		}
+		u := fmt.Sprintf("%s/1/clouddrive/task?pr=ucpro&fr=pc&task_id=%s&retry_index=%d", d.shareBase, url.QueryEscape(taskID), i)
+		var resp apiResp
+		if _, err := d.call(ctx, "GET", u, nil, cred, &resp); err != nil {
+			return driver.DirectLink{}, err
+		}
+		if err := mustOK(&resp); err != nil {
+			return driver.DirectLink{}, err
+		}
+		var data struct {
+			Status int `json:"status"`
+			Data   []struct {
+				DownloadURL string `json:"download_url"`
+			} `json:"data"`
+			DownloadURL string `json:"download_url"`
+		}
+		if err := json.Unmarshal(resp.Data, &data); err != nil {
+			return driver.DirectLink{}, driver.NewErr(driver.KindInterfaceChanged, "夸克任务响应结构变化,解析失败", err)
+		}
+		if data.Status == 2 {
+			if u := data.DownloadURL; u != "" {
+				return d.buildLink(dlRes, u), nil
+			}
+			if len(data.Data) > 0 && data.Data[0].DownloadURL != "" {
+				return d.buildLink(dlRes, data.Data[0].DownloadURL), nil
+			}
+			return driver.DirectLink{}, driver.NewErr(driver.KindInterfaceChanged, "夸克任务已完成但缺少下载直链", nil)
+		}
+	}
+	return driver.DirectLink{}, driver.NewErr(driver.KindUpstream, "夸克任务轮询超时,请稍后重试", nil)
+}
+
+func (d *Driver) linkFromList(res *httpx.Result, resp *apiResp) (driver.DirectLink, error) {
 	var data []struct {
 		DownloadURL string `json:"download_url"`
 	}
-	if err := mustOK(&resp, &data); err != nil {
+	if err := mustOK(resp); err != nil {
 		return driver.DirectLink{}, err
+	}
+	if err := json.Unmarshal(resp.Data, &data); err != nil {
+		return driver.DirectLink{}, driver.NewErr(driver.KindInterfaceChanged, "夸克响应结构变化,解析失败", err)
 	}
 	if len(data) == 0 || data[0].DownloadURL == "" {
 		return driver.DirectLink{}, driver.NewErr(driver.KindInterfaceChanged, "夸克响应缺少下载直链", nil)
 	}
+	return d.buildLink(res, data[0].DownloadURL), nil
+}
+
+// buildLink 组装 DirectLink:直链要求夸克客户端 UA + Referer,并携带下载接口下发的 Cookie(如 __puus)。
+func (d *Driver) buildLink(res *httpx.Result, downloadURL string) driver.DirectLink {
+	var cookie string
+	if res != nil {
+		cookie = joinCookies(res.Header.Values("Set-Cookie"))
+	}
 	return driver.DirectLink{
-		URL:       data[0].DownloadURL,
+		URL:       downloadURL,
 		UA:        QuarkUA,
 		Referer:   referer,
-		Cookie:    joinCookies(res.Header.Values("Set-Cookie")),
+		Cookie:    cookie,
 		BindIP:    false,
 		ExpiresAt: time.Now().Add(linkTTL),
-	}, nil
+	}
 }
 
 func (d *Driver) CheckCredential(ctx context.Context, cred driver.Credential) (driver.CredStatus, error) {

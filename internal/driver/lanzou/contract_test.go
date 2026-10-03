@@ -24,7 +24,8 @@ const (
 
 func newTestServer(t *testing.T) *httptest.Server {
 	t.Helper()
-	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	var srv *httptest.Server
+	srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		switch r.URL.Path {
 		case "/page1":
@@ -40,7 +41,11 @@ func newTestServer(t *testing.T) *httptest.Server {
 		case "/gone":
 			_, _ = w.Write([]byte(`<html>文件取消分享了</html>`))
 		case "/pwd":
-			_, _ = w.Write([]byte(`<html><div id="passwddiv">请输入密码</div></html>`))
+			// 真实密码页结构:isngis 令牌 + 指向 ajaxfile.php?file=<id> 的绝对地址
+			page := `<html><title>文件</title><div id="passwddiv"></div><input name="pwd">
+				<script>var isngis = 'PWD_SIGN_TOKEN_123456';</script>
+				<script>url : '` + srv.URL + `/ajaxfile.php?file=999',</script></html>`
+			_, _ = w.Write([]byte(page))
 		case "/broken":
 			_, _ = w.Write([]byte(`<html>页面改版了,啥都没有</html>`))
 		case "/ajaxm.php":
@@ -50,10 +55,27 @@ func newTestServer(t *testing.T) *httptest.Server {
 			}
 			w.Header().Set("Content-Type", "application/json")
 			_, _ = w.Write([]byte(ajaxOK))
+		case "/ajaxfile.php":
+			if err := r.ParseForm(); err != nil || r.PostForm.Get("p") == "" {
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
+			if r.URL.Query().Get("file") != "999" {
+				w.WriteHeader(http.StatusNotFound)
+				return
+			}
+			if r.PostForm.Get("p") != "fobb" {
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(`{"zt":0,"inf":"文件无法识别"}`))
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write([]byte(`{"zt":1,"dom":"https://sls.example.com","url":"/file/?CW8xyz","inf":"EhViewer-2.0.2.5.apk"}`))
 		default:
 			w.WriteHeader(http.StatusNotFound)
 		}
 	}))
+	return srv
 }
 
 func newTestDriver(t *testing.T, srv *httptest.Server) *Driver {
@@ -102,6 +124,42 @@ func TestResolveShareModernFlow(t *testing.T) {
 	}
 	if len(nodes) != 1 || nodes[0].Name != "新页面.bin - 蓝奏云" {
 		t.Fatalf("nodes: %+v", nodes)
+	}
+}
+
+// 密码分享:解析时携带提取码 → isngis+fileid → ajaxfile.php → 最终直链。
+func TestResolveShareWithPassword(t *testing.T) {
+	srv := newTestServer(t)
+	defer srv.Close()
+	d := newTestDriver(t, srv)
+
+	nodes, err := d.ResolveShare(context.Background(),
+		driver.ShareLink{URL: srv.URL + "/pwd", Pwd: "fobb"}, nil)
+	if err != nil {
+		t.Fatalf("ResolveShare(pwd): %v", err)
+	}
+	if len(nodes) != 1 || nodes[0].Name != "EhViewer-2.0.2.5.apk" || nodes[0].Ext["pwd"] != "fobb" {
+		t.Fatalf("nodes: %+v", nodes)
+	}
+	dl, err := d.GetDirectLink(context.Background(), nil, driver.FileRef{FID: "file", Ext: nodes[0].Ext})
+	if err != nil {
+		t.Fatalf("GetDirectLink: %v", err)
+	}
+	if dl.URL != "https://sls.example.com/file/?CW8xyz" {
+		t.Fatalf("final url: %s", dl.URL)
+	}
+
+	// 错误提取码 → 密码错误
+	_, err = d.ResolveShare(context.Background(),
+		driver.ShareLink{URL: srv.URL + "/pwd", Pwd: "wrong"}, nil)
+	if !isKind(err, string(driver.KindNotFound)) {
+		t.Fatalf("wrong pwd: %v", err)
+	}
+
+	// 未提供提取码 → Unsupported 提示
+	_, err = d.ResolveShare(context.Background(), driver.ShareLink{URL: srv.URL + "/pwd"}, nil)
+	if !isKind(err, string(driver.KindUnsupported)) {
+		t.Fatalf("no pwd: %v", err)
 	}
 }
 

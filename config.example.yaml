@@ -37,6 +37,7 @@ domain_routes:
     - lanzoux.com
     - lansov.com
     - lanzn.com
+    - lanzouu.com
 
 # 每网盘驱动配置(键 = driver ID;新增网盘加一个键即可)
 drivers:
@@ -51,8 +52,8 @@ drivers:
     enabled: true
     limit_qps: 5
     download_concurrency: 3
-    upstream_allow: [".lanzouw.com", ".lanzou.com", ".xlig.cn"]
-    redirect_allow: [".lanzouw.com", ".lanzou.com", ".xlig.cn"]
+    upstream_allow: [".lanzouw.com", ".lanzou.com", ".lanzouu.com", ".xlig.cn", ".lanrar.com", ".dmpdmp.com"]
+    redirect_allow: [".lanzouw.com", ".lanzou.com", ".lanzouu.com", ".xlig.cn", ".lanrar.com", ".dmpdmp.com"]
 
 aria2:
   endpoint: http://127.0.0.1:6800/jsonrpc

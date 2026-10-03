@@ -367,6 +367,9 @@ driver 是变更频率最高的模块,**必须在不碰真实账号的前提下�
 
 ## 变更记录
 
+- **v1.1.4(2026-10-03)**:线上联调修复——夸克分享直链端点修正(drive-pc 旧端点 404 → drive.quark.cn + `fid` 单数 + 异步任务轮询,实测取证);夸克分享直链确认需登录态(无 Cookie 时按契约返回 AuthExpired);蓝奏云**密码分享支持**(密码页 isngis+fileid → ajaxfile.php,真实链接+提取码全链路验证);新增 lanzouu 域名路由与 lanrar/dmpdmp CDN 白名单;蓝奏云 CDN acw_sc__v2 反爬挑战对非浏览器客户端的影响已定位并列为 M2 专项
+## 变更记录(历史)
+
 - **v1.1.3(2026-10-03)**:基于端到端测试的深度优化——新增 `internal/app` 装配层(main 与 e2e 共用,消除装配漂移类缺陷);`Registry.UpdateRoutes` 使域名路由真正热生效(带锁热替换 + 测试);过期直链并发刷新经 singleflight 收敛为一次真实调用;实现 §7.7 在途并发闸(`download_concurrency`,排队等待 + 15s 上限,不再 fail-fast);路由计数语义修正为"实际服务决策点"(/d 与 aria2 推送);app 支持 `ExtraDrivers` 注入式 driver(测试 fake 与未来插件共用通道)
 - **v1.1.2(2026-10-03)**:生产化评审修复——中转流与 API 调用拆分客户端(去除 30s 体传输截断,P1);账号 cooling 冷却到期自动复位(补全状态机);配置解析失败不再静默回落默认密钥;管理页文件名 XSS 转义;扩展点收敛(`drivers` 为 map + 工厂注册,新增网盘只改 driver 包与 config);`FID` 列名显式映射(修复 GORM 默认命名 `f_id` 与查询字面量不一致导致的落库必炸 bug);新增 repo/sign/config/httpx/relay 共 11 个回归测试;非 loopback + 默认密钥拒绝启动;删除未接线的全局 Proxy 配置与 own 模式死参数
 - **v1.1.1(2026-10-03)**:M1 实现同步——下载路径带 `share_key` 段(`/d/{pan}/{share_key}/{fid}`,fid 非全局唯一);`BindUA` 字段并入 UA 等值匹配规则;错误契约新增 `KindUnsupported`;M1 落地说明:JWT 为自实现 HS256、`/metrics` 为极简 Prometheus 文本实现(M2 替换 client_golang)

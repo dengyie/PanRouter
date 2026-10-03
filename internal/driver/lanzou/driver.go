@@ -30,17 +30,24 @@ func (d *Driver) ID() string { return "lanzou" }
 var (
 	iframeRe = regexp.MustCompile(`(?i)<iframe[^>]+src=["']([^"']*(?:fn\?)[^"']*)["']`)
 	// 词边界硬化:避免误配页面里的 wp_sign 等同名变量(RE2 无 lookbehind,用前置字符排除)
-	signRe  = regexp.MustCompile(`(?i)(?:^|[^A-Za-z_])sign\s*=\s*['"]([^'"]{10,})['"]`)
-	titleRe = regexp.MustCompile(`(?i)<title>([^<]+)</title>`)
-	sizeRe  = regexp.MustCompile(`大小[：:]\s*([\d.]+)\s*([KMG]?B)`)
+	signRe     = regexp.MustCompile(`(?i)(?:^|[^A-Za-z_])sign\s*=\s*['"]([^'"]{10,})['"]`)
+	isngisRe   = regexp.MustCompile(`(?i)(?:^|[^A-Za-z_])isngis\s*=\s*['"]([^'"]{10,})['"]`)
+	ajaxFileRe = regexp.MustCompile(`(?i)url\s*:\s*['"](https?://[^'"]*ajaxfile\.php\?file=\d+)['"]`)
+	titleRe    = regexp.MustCompile(`(?i)<title>([^<]+)</title>`)
+	sizeRe     = regexp.MustCompile(`大小[：:]\s*([\d.]+)\s*([KMG]?B)`)
 )
+
+// isPasswordPage 识别蓝奏云密码门页面(带密码分享的入口页)。
+func isPasswordPage(body string) bool {
+	return containsAny(body, "passwddiv", `id="password"`, `name="pwd"`)
+}
 
 func goneOrPassword(body string) error {
 	if containsAny(body, "文件取消分享了", "文件不存在", "来晚一步") {
 		return driver.NewErr(driver.KindShareGone, "蓝奏云分享已失效", nil)
 	}
-	if containsAny(body, "passwddiv", `id="password"`, `name="pwd"`) {
-		return driver.NewErr(driver.KindUnsupported, "暂不支持带密码的蓝奏云链接(M1)", nil)
+	if isPasswordPage(body) {
+		return driver.NewErr(driver.KindUnsupported, "该蓝奏云链接带密码,请在解析时提供提取码", nil)
 	}
 	return nil
 }
@@ -73,14 +80,21 @@ func (d *Driver) get(ctx context.Context, rawURL, referer string) (string, error
 	return string(res.Body), nil
 }
 
-// resolvePage 执行 分享页 →(iframe)→ sign → ajaxm.php 的完整解析链。
-func (d *Driver) resolvePage(ctx context.Context, shareURL string) (finalURL, fileName string, fileSize int64, err error) {
+// resolvePage 执行 分享页 →(iframe)→ sign → ajaxm.php 的完整解析链;
+// 带密码分享则走 密码页 → isngis+fileid → ajaxfile.php 路径(提交码由调用方传入)。
+func (d *Driver) resolvePage(ctx context.Context, shareURL, pwd string) (finalURL, fileName string, fileSize int64, err error) {
 	page, err := d.get(ctx, shareURL, "")
 	if err != nil {
 		return "", "", 0, err
 	}
-	if e := goneOrPassword(page); e != nil {
-		return "", "", 0, e
+	if containsAny(page, "文件取消分享了", "文件不存在", "来晚一步") {
+		return "", "", 0, driver.NewErr(driver.KindShareGone, "蓝奏云分享已失效", nil)
+	}
+	if isPasswordPage(page) {
+		if pwd == "" {
+			return "", "", 0, driver.NewErr(driver.KindUnsupported, "该蓝奏云链接带密码,请在解析时提供提取码", nil)
+		}
+		return d.resolvePasswordPage(ctx, page, shareURL, pwd)
 	}
 	sign, pageRef := extractSign(page, shareURL)
 	if sign == "" {
@@ -120,6 +134,61 @@ func extractSign(body, fallbackRef string) (sign, ref string) {
 	return "", fallbackRef
 }
 
+// resolvePasswordPage 走 密码页 → 提取 isngis+fileid → ajaxfile.php 提交提取码 的链路。
+// 页面内嵌脚本形如: url : 'https://apifile.woozooo.com/ajaxfile.php?file=321571261'
+func (d *Driver) resolvePasswordPage(ctx context.Context, page, shareURL, pwd string) (finalURL, fileName string, fileSize int64, err error) {
+	isngis := ""
+	if m := isngisRe.FindStringSubmatch(page); len(m) > 1 {
+		isngis = m[1]
+	}
+	if isngis == "" {
+		return "", "", 0, driver.NewErr(driver.KindInterfaceChanged, "蓝奏云密码页缺少 isngis 令牌", nil)
+	}
+	ajaxURL := ""
+	if m := ajaxFileRe.FindStringSubmatch(page); len(m) > 1 {
+		ajaxURL = m[1]
+	}
+	if ajaxURL == "" {
+		return "", "", 0, driver.NewErr(driver.KindInterfaceChanged, "蓝奏云密码页缺少 ajaxfile 端点", nil)
+	}
+	form := url.Values{"action": {"downprocess"}, "sign": {isngis}, "kd": {"1"}, "p": {pwd}}
+	req, err := http.NewRequestWithContext(ctx, "POST", ajaxURL, strings.NewReader(form.Encode()))
+	if err != nil {
+		return "", "", 0, driver.NewErr(driver.KindUpstream, "构造请求失败", err)
+	}
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.Header.Set("User-Agent", BrowserUA)
+	req.Header.Set("Referer", shareURL)
+	req.Header.Set("X-Requested-With", "XMLHttpRequest")
+	res, err := d.client.Do(req)
+	if err != nil {
+		return "", "", 0, driver.NewErr(driver.KindUpstream, "蓝奏云网络请求失败", err)
+	}
+	var aj struct {
+		ZT  int    `json:"zt"`
+		Dom string `json:"dom"`
+		URL string `json:"url"`
+		Inf string `json:"inf"`
+	}
+	if err := json.Unmarshal(res.Body, &aj); err != nil {
+		return "", "", 0, driver.NewErr(driver.KindInterfaceChanged, "蓝奏云 ajaxfile 响应结构变化", err)
+	}
+	if aj.ZT != 1 || aj.Dom == "" || aj.URL == "" {
+		if containsAny(aj.Inf, "无法识别", "密码") {
+			return "", "", 0, driver.NewErr(driver.KindNotFound, "提取码错误或文件无法识别", nil)
+		}
+		if containsAny(aj.Inf, "频繁", "稍后") {
+			return "", "", 0, driver.NewErr(driver.KindRiskControl, "蓝奏云触发限流,请稍后重试", nil)
+		}
+		return "", "", 0, driver.NewErr(driver.KindInterfaceChanged, "蓝奏云密码流程失败:"+aj.Inf, nil)
+	}
+	name := aj.Inf
+	if name == "" {
+		name = "蓝奏云文件"
+	}
+	return joinFinalURL(aj.Dom, aj.URL), name, 0, nil
+}
+
 func (d *Driver) ajaxm(ctx context.Context, shareURL, pageRef, sign string) (string, error) {
 	u, err := url.Parse(shareURL)
 	if err != nil {
@@ -154,7 +223,16 @@ func (d *Driver) ajaxm(ctx context.Context, shareURL, pageRef, sign string) (str
 		}
 		return "", driver.NewErr(driver.KindInterfaceChanged, "蓝奏云解析失败:"+aj.Inf, nil)
 	}
-	return strings.TrimRight(aj.Dom, "/") + aj.URL, nil
+	return joinFinalURL(aj.Dom, aj.URL), nil
+}
+
+// joinFinalURL 拼接最终直链:不同接口的 url 字段可能带或不带 /file/ 前缀,避免重复拼接。
+func joinFinalURL(dom, u string) string {
+	dom = strings.TrimRight(dom, "/")
+	if strings.Contains(u, "/file/") {
+		return dom + u
+	}
+	return dom + "/file/" + u
 }
 
 func absolutize(href, base string) string {
@@ -202,14 +280,14 @@ func (d *Driver) ResolveShare(ctx context.Context, share driver.ShareLink, cred 
 	if strings.Contains(u.Path, "/s/") || strings.Contains(u.Path, "/s.html") {
 		return nil, driver.NewErr(driver.KindUnsupported, "暂不支持蓝奏云文件夹分享(M1)", nil)
 	}
-	final, name, size, err := d.resolvePage(ctx, share.URL)
+	final, name, size, err := d.resolvePage(ctx, share.URL, share.Pwd)
 	if err != nil {
 		return nil, err
 	}
 	_ = final // 列表场景不需要直链;GetDirectLink 会用 Ext.share_url 重新解析取新链
 	return []driver.FileNode{{
 		FID: "file", Name: name, Size: size, IsDir: false,
-		Ext: map[string]string{"share_url": share.URL},
+		Ext: map[string]string{"share_url": share.URL, "pwd": share.Pwd},
 	}}, nil
 }
 
@@ -221,7 +299,7 @@ func (d *Driver) GetDirectLink(ctx context.Context, cred *driver.Credential, ref
 	if shareURL == "" {
 		return driver.DirectLink{}, driver.NewErr(driver.KindNotFound, "缺少蓝奏云分享上下文,请重新解析", nil)
 	}
-	final, _, _, err := d.resolvePage(ctx, shareURL)
+	final, _, _, err := d.resolvePage(ctx, shareURL, ref.Ext["pwd"])
 	if err != nil {
 		return driver.DirectLink{}, err
 	}

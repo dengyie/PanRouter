@@ -73,7 +73,7 @@ func Default() *Config {
 	c.Auth.JWTSecret = DefaultJWTSecret
 	c.DomainRoutes = map[string][]string{
 		"quark":  {"pan.quark.cn"},
-		"lanzou": {"lanzou.com", "lanzouw.com", "lanzoui.com", "lanzoue.com", "lanzouf.com", "lanzoa.com", "lanzoub.com", "lanzouc.com", "lanzoud.com", "lanzouv.com", "lanzoux.com", "lansov.com", "lanzn.com", "lanzouq.com", "lanzouy.com"},
+		"lanzou": {"lanzou.com", "lanzouw.com", "lanzoui.com", "lanzoue.com", "lanzouf.com", "lanzoa.com", "lanzoub.com", "lanzouc.com", "lanzoud.com", "lanzouv.com", "lanzoux.com", "lansov.com", "lanzn.com", "lanzouq.com", "lanzouy.com", "lanzouu.com"},
 	}
 	c.Drivers = map[string]DriverCommon{
 		"quark": {
@@ -83,8 +83,8 @@ func Default() *Config {
 		},
 		"lanzou": {
 			Enabled: true, LimitQPS: 5, DownloadConc: 3,
-			UpstreamAllow: []string{"lanzou.com", "lanzouw.com", "lanzoui.com", "lanzoue.com", "lanzouf.com", "lanzoa.com", "lanzoub.com", "lanzouc.com", "lanzoud.com", "lanzouv.com", "lanzoux.com", "lansov.com", "lanzn.com", "lanzouq.com", "lanzouy.com", ".xlig.cn", ".feijipan.com"},
-			RedirectAllow: []string{"lanzou.com", "lanzouw.com", "lanzoui.com", "lanzoue.com", "lanzouf.com", "lanzoa.com", "lanzoub.com", "lanzouc.com", "lanzoud.com", "lanzouv.com", "lanzoux.com", "lansov.com", "lanzn.com", "lanzouq.com", "lanzouy.com", ".xlig.cn"},
+			UpstreamAllow: []string{"lanzou.com", "lanzouw.com", "lanzoui.com", "lanzoue.com", "lanzouf.com", "lanzoa.com", "lanzoub.com", "lanzouc.com", "lanzoud.com", "lanzouv.com", "lanzoux.com", "lansov.com", "lanzn.com", "lanzouq.com", "lanzouy.com", "lanzouu.com", ".xlig.cn", ".feijipan.com", ".lanrar.com", ".dmpdmp.com"},
+			RedirectAllow: []string{"lanzou.com", "lanzouw.com", "lanzoui.com", "lanzoue.com", "lanzouf.com", "lanzoa.com", "lanzoub.com", "lanzouc.com", "lanzoud.com", "lanzouv.com", "lanzoux.com", "lansov.com", "lanzn.com", "lanzouq.com", "lanzouy.com", "lanzouu.com", ".xlig.cn", ".lanrar.com", ".dmpdmp.com"},
 		},
 	}
 	c.Aria2.Endpoint = "http://127.0.0.1:6800/jsonrpc"

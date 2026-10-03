@@ -51,7 +51,7 @@ func newTestDriver(t *testing.T, srv *httptest.Server) *Driver {
 	if err != nil {
 		t.Fatal(err)
 	}
-	return New(cl, srv.URL)
+	return New(cl, srv.URL, srv.URL)
 }
 
 func TestResolveShareAndDirectLink(t *testing.T) {
@@ -70,7 +70,18 @@ func TestResolveShareAndDirectLink(t *testing.T) {
 		t.Fatalf("ext lost: %+v", nodes[0].Ext)
 	}
 
-	dl, err := d.GetDirectLink(context.Background(), nil, driver.FileRef{FID: "F1", Ext: nodes[0].Ext})
+	// 分享直链必须携带登录态
+	if _, err := d.GetDirectLink(context.Background(), nil, driver.FileRef{FID: "F1", Ext: nodes[0].Ext}); err == nil {
+		t.Fatal("无 Cookie 时应返回 AuthExpired")
+	} else {
+		var de *driver.Error
+		if !errors.As(err, &de) || de.Kind != driver.KindAuthExpired {
+			t.Fatalf("expect auth_expired, got %v", err)
+		}
+	}
+
+	cred := &driver.Credential{Cookie: "session=1"}
+	dl, err := d.GetDirectLink(context.Background(), cred, driver.FileRef{FID: "F1", Ext: nodes[0].Ext})
 	if err != nil {
 		t.Fatalf("GetDirectLink: %v", err)
 	}
@@ -82,6 +93,40 @@ func TestResolveShareAndDirectLink(t *testing.T) {
 	}
 	if dl.UA != QuarkUA {
 		t.Errorf("直链 UA 应为夸克客户端 UA: %s", dl.UA)
+	}
+}
+
+// 异步任务形态:data.task_id → 轮询 /1/clouddrive/task 至 status==2。
+func TestDirectLinkViaAsyncTask(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/share/sharepage/token"):
+			_, _ = w.Write([]byte(tokenRespBody))
+		case strings.HasSuffix(r.URL.Path, "/share/sharepage/detail"):
+			_, _ = w.Write([]byte(detailRespBody))
+		case strings.HasSuffix(r.URL.Path, "/share/sharepage/download"):
+			_, _ = w.Write([]byte(`{"code":0,"data":{"task_id":"T123"}}`))
+		case strings.HasSuffix(r.URL.Path, "/clouddrive/task"):
+			if r.URL.Query().Get("task_id") != "T123" || r.URL.Query().Get("retry_index") == "" {
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
+			_, _ = w.Write([]byte(`{"code":0,"data":{"status":2,"data":[{"download_url":"https://dl.example.com/task-file"}]}}`))
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer srv.Close()
+	d := newTestDriver(t, srv)
+
+	dl, err := d.GetDirectLink(context.Background(), &driver.Credential{Cookie: "session=1"},
+		driver.FileRef{FID: "F1", Ext: map[string]string{"pwd_id": "abc123", "stoken": "STOKEN"}})
+	if err != nil {
+		t.Fatalf("GetDirectLink(async): %v", err)
+	}
+	if dl.URL != "https://dl.example.com/task-file" {
+		t.Fatalf("task download url: %s", dl.URL)
 	}
 }
 
