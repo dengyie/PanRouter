@@ -169,12 +169,29 @@ func (d *Driver) ResolveShare(ctx context.Context, share driver.ShareLink, cred 
 		return nil, err
 	}
 	ext := map[string]string{"pwd_id": pwdID, "stoken": st, "pwd": share.Pwd}
-	return d.walkShare(ctx, cred, "0", "", 0, ext, map[string]struct{}{}, &shareWalkBudget{files: maxShareFiles, dirs: maxShareDirs})
+	bud := &shareWalkBudget{files: maxShareFiles, dirs: maxShareDirs}
+	nodes, err := d.walkShare(ctx, cred, "0", "", 0, ext, map[string]struct{}{}, bud)
+	if err != nil {
+		return nil, err
+	}
+	if bud.truncated {
+		if len(nodes) == 0 {
+			nodes = []driver.FileNode{{Ext: map[string]string{"truncated": "1"}}}
+		} else {
+			last := &nodes[len(nodes)-1]
+			if last.Ext == nil {
+				last.Ext = map[string]string{}
+			}
+			last.Ext["truncated"] = "1"
+		}
+	}
+	return nodes, nil
 }
 
 type shareWalkBudget struct {
-	files int
-	dirs  int
+	files     int
+	dirs      int
+	truncated bool
 }
 
 func joinSharePath(prefix, name string) string {
@@ -198,6 +215,9 @@ func (d *Driver) listShareDir(ctx context.Context, cred *driver.Credential, pwdI
 	}
 	var files []quarkFile
 	for page := 1; page <= 100; page++ {
+		if err := ctx.Err(); err != nil {
+			return nil, driver.NewErr(driver.KindUpstream, "分享目录遍历已取消", err)
+		}
 		q := url.Values{}
 		q.Set("pr", "ucpro")
 		q.Set("fr", "pc")
@@ -237,7 +257,11 @@ func (d *Driver) listShareDir(ctx context.Context, cred *driver.Credential, pwdI
 
 // walkShare 递归展开分享目录,只返回文件(名称带相对路径)。根目录是文件夹时也能一次列出内部文件。
 func (d *Driver) walkShare(ctx context.Context, cred *driver.Credential, pdirFID, prefix string, depth int, ext map[string]string, seen map[string]struct{}, bud *shareWalkBudget) ([]driver.FileNode, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, driver.NewErr(driver.KindUpstream, "分享目录遍历已取消", err)
+	}
 	if depth > maxShareDepth || bud.files <= 0 {
+		bud.truncated = true
 		return nil, nil
 	}
 	entries, err := d.listShareDir(ctx, cred, ext["pwd_id"], ext["stoken"], pdirFID)
@@ -259,6 +283,7 @@ func (d *Driver) walkShare(ctx context.Context, cred *driver.Credential, pdirFID
 			continue
 		}
 		if bud.files <= 0 {
+			bud.truncated = true
 			break
 		}
 		bud.files--
@@ -269,6 +294,7 @@ func (d *Driver) walkShare(ctx context.Context, cred *driver.Credential, pdirFID
 	}
 	for _, dir := range dirs {
 		if bud.dirs <= 0 || bud.files <= 0 || depth >= maxShareDepth {
+			bud.truncated = true
 			break
 		}
 		bud.dirs--

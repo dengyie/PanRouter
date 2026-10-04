@@ -12,3 +12,6 @@ config.yaml
 # 依赖与参考材料
 .refs/
 *.exe
+
+# 本地会话记忆(含主机/账号线索,不入库)
+.codex-memory/

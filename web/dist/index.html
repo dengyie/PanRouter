@@ -123,14 +123,16 @@ async function resolve() {
     const d = await api('/resolve', {method:'POST', body: JSON.stringify({url:$('url').value, pwd:$('pwd').value})});
     LAST = d;
     if (d.hint) $('shareMsg').innerHTML = `<div class="msg err">${esc(d.hint)}</div>`;
-    const rows = (d.files||[]).map(f => {
-      let act = '<td></td>';
-      if (f.is_dir) act = '<td>目录</td>';
-      else if (f.download_url) act = `<td><a href="${esc(f.download_url)}" target="_blank">下载</a> · <a href="javascript:link('${esc(f.fid)}')">刷新</a></td>`;
-      else if (f.link_error) act = `<td><a href="javascript:link('${esc(f.fid)}')">提链</a></td>`;
-      else act = `<td><a href="javascript:link('${esc(f.fid)}')">提链</a></td>`;
-      return `<tr><td>${esc(f.name)}</td><td>${fmtSize(f.size)}</td>${act}</tr>`;
-    }).join('');
+	    const rows = (d.files||[]).map(f => {
+	      let act = '<td></td>';
+	      if (f.is_dir) act = '<td>目录</td>';
+	      else if (f.download_url) act = `<td><a href="${esc(f.download_url)}" target="_blank">下载</a> · <a href="javascript:link('${esc(f.fid)}')">刷新</a></td>`;
+	      else {
+	        const err = f.link_error ? `<span title="${esc(f.link_error)}" style="color:#ff9d9d">${esc(f.link_error.length>24?f.link_error.slice(0,24)+'…':f.link_error)}</span> · ` : '';
+	        act = `<td>${err}<a href="javascript:link('${esc(f.fid)}')">提链</a></td>`;
+	      }
+	      return `<tr><td>${esc(f.name)}</td><td>${fmtSize(f.size)}</td>${act}</tr>`;
+	    }).join('');
     $('files').innerHTML = `<table><tr><th>文件</th><th>大小</th><th></th></tr>${rows}</table>`;
     const ready = (d.files||[]).find(f => f.download_url);
     if (ready) {

@@ -1,4 +1,4 @@
-# PanRouter — 网盘直链聚合与加速下载服务 · 方案设计 v1.1.9
+# PanRouter — 网盘直链聚合与加速下载服务 · 方案设计 v1.1.10
 
 > 自用优先的单机服务:聚合主流网盘的分享解析/提链,缓存直链,按直链特性自动在 **302 透传 / aria2 直下 / 服务端中转** 三条路径中选择最优下载方式。
 > 定位:个人自部署、单管理员、可接受登录态(Cookie / Token)。**不破解限速、不绕过会员权限、仅解析用户主动提供的分享链接。**
@@ -223,8 +223,8 @@ NeedRelay = !Can302 && !CanAria2
 	→ 无 fid:service.ResolveShare
 	   1. driver.Detect(url) 识别网盘
 	   2. driver.ResolveShare 列文件(夸克递归展开目录,只返回文件)
-	   3. 对前 N 个文件自动 ResolveFile(N=8);AuthExpired 立刻停,提示加账号
-	   4. 返回 files[](含 download_url/link_error)+ hint
+		   3. 对前 N 个文件自动 ResolveFile(夸克 N=2,其余 N=8);整次解析 90s 截止,剩余不足 15s 不再提链;AuthExpired 立刻停并 warn 日志
+		   4. 返回 files[](fid/name/size/route/download_url/link_error)+ hint;目录遍历截断时 truncated=true
 	→ 有 fid:service.ResolveFile
 	   1. 查 links 缓存(shareKey+fid),未过期 → 直接返回(cacheHit=true)
 	   2. limiter 取令牌 → account picker 选号 → driver.GetDirectLink
@@ -351,7 +351,8 @@ driver 是变更频率最高的模块,**必须在不碰真实账号的前提下�
 | **S1 夸克直链终验** | 转存链已在 v1.1.5 落地;v1.1.6 完成根因修复与全链终验 | **已闭环**:resolve→提链→/d 302→/stream 中转 200(775B mp4)+ Range 206 续传逐字节一致;转存副本经专用暂存目录隔离并自动清理 |
 | **S2 蓝奏云 acw_sc__v2 求解器** | 蓝奏云 CDN(dmpdmp/lanrar)对非浏览器客户端下发 JS 挑战,阻断 /stream 中转下载;算法已验证(posList 重排 + hexXor,密钥 `3000176000856006061501533003690027800375` 可产出有效 Cookie) | **已闭环**(v1.1.7):`httpx` 中间件检测 412/挑战页 → 解题 → 同请求重放,按 host 缓存 Cookie;验收:非浏览器 UA 经 /stream 下载挑战页上游成功,Range 续传命中缓存不再吃挑战 |
 | **S2.1 蓝奏云 CDN 二次验证页** | 过 acw 后仍可能落到「验证并下载」HTML(`down_r` + POST `ajax.php`),浏览器 302 与 /stream 都拿不到文件 | **已闭环**(v1.1.8):`GetDirectLink` 跟过落地页,提取 file/sign 后 POST ajax.php 换真实文件 URL;NeedHeaders 改看明文 Cookie 而非密文长度 |
-| **S3 一键提链** | 分享根节点是文件夹时页面不给出提链;解析与提链两步过繁琐 | **已闭环**(v1.1.9):夸克 `ResolveShare` 按 `pdir_fid` 递归展开目录;无 fid 的 resolve 对前 8 个文件自动提链;前端直接给出下载。夸克直链仍需账号 Cookie |
+| **S3 一键提链** | 分享根节点是文件夹时页面不给出提链;解析与提链两步过繁琐 | **已闭环**(v1.1.9):夸克 `ResolveShare` 按 `pdir_fid` 递归展开目录;无 fid 的 resolve 自动提链;前端直接给出下载。夸克直链仍需账号 Cookie |
+| **S3.1 一键提链生产化** | 自动提链无请求截止、失败静默 200、夸克 N=8 易触 CF 524、截断无提示、FileItem 拷贝过重、`.codex-memory` 入库 | **已闭环**(v1.1.10):resolve 90s deadline;剩余不足 15s 停提链;失败 warn(pan/fid/kind/hint);夸克自动提链 2;截断 `truncated`+hint;FileItem 只留 download_url/link_error/route;记忆目录 gitignore |
 
 ---
 
@@ -378,6 +379,7 @@ driver 是变更频率最高的模块,**必须在不碰真实账号的前提下�
 
 ## 变更记录
 
+- **v1.1.10(2026-10-04)**:一键提链生产化——`POST /resolve` 与 `ResolveShare` 加 90s 截止,剩余不足 15s 不再自动提链;自动提链失败打 warn(pan/fid/kind/hint),AuthExpired 仍停后续并 200+hint;夸克自动提链上限 2、免登录盘仍 8;目录遍历截断写 `truncated` 与 hint;FileItem 不再拷贝 ResolveFileResult 全字段;前端合并提链分支并展示行内错误;`.codex-memory/` 移出公共仓
 - **v1.1.9(2026-10-04)**:一键提链——夸克分享目录按 `pdir_fid` 递归展开(深度 8 / 文件 200 / 目录 64),`ResolveShare` 对前 8 个文件自动 `ResolveFile`;AuthExpired 立刻停并在 `hint` 提示加 Cookie;前端有 `download_url` 时直接给出下载,不再强制二次点提链。夸克直链仍依赖账号 Cookie(转存链未变)
 - **v1.1.8(2026-10-04)**:蓝奏云 CDN 二次验证页——过 acw 后 dmpdmp 仍可能返回「验证并下载」HTML,需 POST `ajax.php`(file/sign/el)才拿到文件地址;`lanzou.followCDN` 在 `GetDirectLink` 跟过该页,合约测试覆盖落地页与非 HTML 跳过;NeedHeaders 改为解密后的明文 Cookie 判断(空 Cookie 的 AES 密文非空曾误标 need_headers,前端会走 /stream);白名单补 `.bakstotre.com`(落地页静态资源 host,ajax 成功后偶发跳转)
 - **v1.1.7(2026-10-04)**:蓝奏云 CDN acw_sc__v2 求解器工程化(M2 S2)——`internal/pkg/httpx` 在 `Do`/`DoStream` 检测 412/挑战页,posList 重排 + hexXor 产出 `acw_sc__v2` 后同请求重放(最多 1 次);按 host 缓存 Cookie,跨 host 302 在 CheckRedirect 注入,Range 续传不再重复解题;二进制/206 响应跳过窥探,避免把真实文件当挑战页。合约测试覆盖求解向量、解题重放、缓存 Range、持续挑战失败、跨域 302 注入;/stream 中转回放验收非浏览器 UA 拿到真实文件

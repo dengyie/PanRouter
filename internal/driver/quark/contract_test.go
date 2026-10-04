@@ -185,6 +185,27 @@ func TestResolveShareWalksDirectory(t *testing.T) {
 	}
 }
 
+func TestWalkShareTruncates(t *testing.T) {
+	cs := &chainServer{detailResp: func(string) string {
+		return `{"code":0,"message":"ok","data":{"list":[{"fid":"F1","file_name":"a.bin","size":1,"dir":false},{"fid":"F2","file_name":"b.bin","size":1,"dir":false},{"fid":"F3","file_name":"c.bin","size":1,"dir":false}],"metadata":{"_total":3}}}`
+	}}
+	srv := newChainServer(t, cs)
+	defer srv.Close()
+	d := newTestDriver(t, srv)
+	ext := map[string]string{"pwd_id": "abc123", "stoken": "STOKEN", "pwd": ""}
+	bud := &shareWalkBudget{files: 2, dirs: 64}
+	nodes, err := d.walkShare(context.Background(), nil, "0", "", 0, ext, map[string]struct{}{}, bud)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bud.truncated {
+		t.Fatal("file budget 耗尽应标记 truncated")
+	}
+	if len(nodes) != 2 {
+		t.Fatalf("want 2 files, got %+v", nodes)
+	}
+}
+
 func TestGetDirectLinkSaveChain(t *testing.T) {
 	cs := &chainServer{}
 	srv := newChainServer(t, cs)

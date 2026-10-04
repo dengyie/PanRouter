@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
 	"io/fs"
 	"net/http"
@@ -34,11 +35,13 @@ func clientUA(r *http.Request, explicit string) string {
 }
 
 func (d *Deps) doResolve(r *http.Request, q resolveReq) (any, error) {
+	ctx, cancel := context.WithTimeout(r.Context(), 90*time.Second)
+	defer cancel()
 	ua := clientUA(r, q.UA)
 	if q.FID == "" {
-		return d.Resolver.ResolveShare(r.Context(), q.URL, q.Pwd, ua)
+		return d.Resolver.ResolveShare(ctx, q.URL, q.Pwd, ua)
 	}
-	return d.Resolver.ResolveFile(r.Context(), q.URL, q.Pwd, q.FID, false, ua)
+	return d.Resolver.ResolveFile(ctx, q.URL, q.Pwd, q.FID, false, ua)
 }
 
 // handleResolve POST /api/v1/resolve

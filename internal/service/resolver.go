@@ -81,31 +81,79 @@ func (r *Resolver) acquire(ctx context.Context, pan string) (release func(), err
 
 // ---- 对外结果结构 ----
 
-// autoLinkMax 一次分享解析自动提链的文件数上限,避免夸克转存链把请求拖死或触发风控。
-const autoLinkMax = 8
+const (
+	defaultAutoLinkMax = 8
+	quarkAutoLinkMax   = 2 // 转存链单文件可达 ~30s;2 个仍低于 CF 524
+	resolveShareBudget = 90 * time.Second
+	minAutoLinkBudget  = 15 * time.Second
+)
 
+func autoLinkMaxFor(pan string) int {
+	if pan == "quark" {
+		return quarkAutoLinkMax
+	}
+	return defaultAutoLinkMax
+}
+
+func withDeadlineIfNone(ctx context.Context, d time.Duration) (context.Context, context.CancelFunc) {
+	if _, ok := ctx.Deadline(); ok {
+		return ctx, func() {}
+	}
+	return context.WithTimeout(ctx, d)
+}
+
+func canAutoLink(ctx context.Context) bool {
+	if ctx.Err() != nil {
+		return false
+	}
+	deadline, ok := ctx.Deadline()
+	if !ok {
+		return true
+	}
+	return time.Until(deadline) >= minAutoLinkBudget
+}
+
+func listingTruncated(nodes []driver.FileNode) bool {
+	truncated := false
+	for i := range nodes {
+		if nodes[i].Ext == nil {
+			continue
+		}
+		if nodes[i].Ext["truncated"] == "1" {
+			truncated = true
+			delete(nodes[i].Ext, "truncated")
+		}
+	}
+	return truncated
+}
+
+func joinHints(parts ...string) string {
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		if p != "" {
+			out = append(out, p)
+		}
+	}
+	return strings.Join(out, ";")
+}
+
+// FileItem 是分享列表行:只带页面需要的提链结果,避免把 ResolveFileResult 整份拷进来。
 type FileItem struct {
-	FID         string     `json:"fid"`
-	Name        string     `json:"name"`
-	Size        int64      `json:"size"`
-	IsDir       bool       `json:"is_dir"`
-	Route       string     `json:"route,omitempty"`
-	DownloadURL string     `json:"download_url,omitempty"`
-	StreamURL   string     `json:"stream_url,omitempty"`
-	DirectURL   string     `json:"direct_url,omitempty"`
-	UA          string     `json:"ua,omitempty"`
-	Referer     string     `json:"referer,omitempty"`
-	NeedHeaders bool       `json:"need_headers,omitempty"`
-	ExpiresAt   *time.Time `json:"expires_at,omitempty"`
-	CacheHit    bool       `json:"cache_hit,omitempty"`
-	LinkError   string     `json:"link_error,omitempty"`
+	FID         string `json:"fid"`
+	Name        string `json:"name"`
+	Size        int64  `json:"size"`
+	IsDir       bool   `json:"is_dir"`
+	Route       string `json:"route,omitempty"`
+	DownloadURL string `json:"download_url,omitempty"`
+	LinkError   string `json:"link_error,omitempty"`
 }
 
 type ResolveShareResult struct {
-	Pan      string     `json:"pan"`
-	ShareKey string     `json:"share_key"`
-	Files    []FileItem `json:"files"`
-	Hint     string     `json:"hint,omitempty"`
+	Pan       string     `json:"pan"`
+	ShareKey  string     `json:"share_key"`
+	Files     []FileItem `json:"files"`
+	Hint      string     `json:"hint,omitempty"`
+	Truncated bool       `json:"truncated,omitempty"`
 }
 
 type ResolveFileResult struct {
@@ -211,6 +259,9 @@ func (r *Resolver) pick(pan string) (*repo.Account, *driver.Credential, error) {
 // ---- 对外方法 ----
 
 func (r *Resolver) ResolveShare(ctx context.Context, rawURL, pwd, clientUA string) (*ResolveShareResult, error) {
+	ctx, cancel := withDeadlineIfNone(ctx, resolveShareBudget)
+	defer cancel()
+
 	drv, err := r.reg.Detect(rawURL)
 	if err != nil {
 		return nil, err
@@ -228,6 +279,10 @@ func (r *Resolver) ResolveShare(ctx context.Context, rawURL, pwd, clientUA strin
 	if err := r.mapErr(pan, acc, err); err != nil {
 		return nil, err
 	}
+	truncated := listingTruncated(nodes)
+	if truncated && len(nodes) == 1 && nodes[0].FID == "" && nodes[0].Name == "" {
+		nodes = nil
+	}
 	key := r.shareKey(pan, rawURL, pwd)
 	raw, _ := json.Marshal(nodes)
 	if err := r.store.UpsertShare(&repo.Share{
@@ -237,39 +292,50 @@ func (r *Resolver) ResolveShare(ctx context.Context, rawURL, pwd, clientUA strin
 		r.log.Warnf("save share: %v", err)
 	}
 	items := make([]FileItem, 0, len(nodes))
-	linked, authBlocked := 0, false
+	linked, authBlocked, budgetStop := 0, false, false
 	hint := ""
+	limit := autoLinkMaxFor(pan)
 	for _, n := range nodes {
 		it := FileItem{FID: n.FID, Name: n.Name, Size: n.Size, IsDir: n.IsDir}
-		if !n.IsDir && n.FID != "" && linked < autoLinkMax && !authBlocked {
-			linked++
-			file, lerr := r.ResolveFile(ctx, rawURL, pwd, n.FID, false, clientUA)
-			if lerr != nil {
-				var de *driver.Error
-				if errors.As(lerr, &de) && de.Kind == driver.KindAuthExpired {
-					authBlocked = true
-					hint = de.UserHint
-					it.LinkError = de.UserHint
-				} else {
-					it.LinkError = lerr.Error()
-				}
+		if !n.IsDir && n.FID != "" && linked < limit && !authBlocked && !budgetStop {
+			if !canAutoLink(ctx) {
+				budgetStop = true
+				hint = joinHints(hint, "请求剩余时间不足,未继续自动提链")
+				r.log.Warnw("auto-link skipped: deadline", "pan", pan, "fid", n.FID)
 			} else {
-				exp := file.ExpiresAt
-				it.Route = file.Route
-				it.DownloadURL = file.DownloadURL
-				it.StreamURL = file.StreamURL
-				it.DirectURL = file.DirectURL
-				it.UA = file.UA
-				it.Referer = file.Referer
-				it.NeedHeaders = file.NeedHeaders
-				it.ExpiresAt = &exp
-				it.CacheHit = file.CacheHit
+				linked++
+				file, lerr := r.ResolveFile(ctx, rawURL, pwd, n.FID, false, clientUA)
+				if lerr != nil {
+					kind := "upstream_error"
+					var de *driver.Error
+					if errors.As(lerr, &de) {
+						kind = string(de.Kind)
+						it.LinkError = de.UserHint
+						if de.Kind == driver.KindAuthExpired {
+							authBlocked = true
+							hint = joinHints(hint, de.UserHint)
+						}
+					} else {
+						it.LinkError = lerr.Error()
+					}
+					if errors.Is(lerr, context.DeadlineExceeded) || errors.Is(lerr, context.Canceled) {
+						budgetStop = true
+						hint = joinHints(hint, "请求已超时或取消,未继续自动提链")
+					}
+					r.log.Warnw("auto-link failed", "pan", pan, "fid", n.FID, "kind", kind, "hint", it.LinkError)
+				} else {
+					it.Route = file.Route
+					it.DownloadURL = file.DownloadURL
+				}
 			}
 		}
 		items = append(items, it)
 	}
+	if truncated {
+		hint = joinHints(hint, fmt.Sprintf("分享过大,仅展开前 %d 个文件", len(nodes)))
+	}
 	r.met.Inc("panrouter_resolve_total", map[string]string{"pan": pan, "kind": "share"})
-	return &ResolveShareResult{Pan: pan, ShareKey: key, Files: items, Hint: hint}, nil
+	return &ResolveShareResult{Pan: pan, ShareKey: key, Files: items, Hint: hint, Truncated: truncated}, nil
 }
 
 // ResolveFile 获取单个文件直链:缓存未过期直接返回,否则走 driver 并落库。
