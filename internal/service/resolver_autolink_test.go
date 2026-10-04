@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -116,20 +117,23 @@ func TestResolveShareTruncationHint(t *testing.T) {
 type credSpyDriver struct {
 	fakeDriver
 	cookie atomic.Value // string
+	calls  atomic.Int32
 }
 
 func (d *credSpyDriver) GetDirectLink(_ context.Context, cred *driver.Credential, ref driver.FileRef) (driver.DirectLink, error) {
+	cookie := ""
 	if cred != nil {
-		d.cookie.Store(cred.Cookie)
-	} else {
-		d.cookie.Store("")
+		cookie = cred.Cookie
 	}
-	return d.fakeDriver.GetDirectLink(context.Background(), cred, ref)
+	d.cookie.Store(cookie)
+	d.calls.Add(1)
+	dl, err := d.fakeDriver.GetDirectLink(context.Background(), cred, ref)
+	dl.Cookie = cookie
+	return dl, err
 }
 
-func TestGuestResolveSkipsAccountCookie(t *testing.T) {
-	d := &credSpyDriver{fakeDriver: fakeDriver{linkURL: "https://up.invalid/f"}}
-	resolver, store := newTestResolver(t, d, config.DriverCommon{Enabled: true, LimitQPS: 1000, DownloadConc: 3})
+func seedCookieAccount(t *testing.T, store *repo.Store) {
+	t.Helper()
 	enc, err := crypto.New("k").EncryptBytes([]byte("secret-cookie"))
 	if err != nil {
 		t.Fatal(err)
@@ -137,6 +141,12 @@ func TestGuestResolveSkipsAccountCookie(t *testing.T) {
 	if err := store.CreateAccount(&repo.Account{PanType: "fake", Name: "t", CredEnc: enc, Status: "ok", CredVersion: 1}); err != nil {
 		t.Fatal(err)
 	}
+}
+
+func TestGuestResolveSkipsAccountCookie(t *testing.T) {
+	d := &credSpyDriver{fakeDriver: fakeDriver{linkURL: "https://up.invalid/f"}}
+	resolver, store := newTestResolver(t, d, config.DriverCommon{Enabled: true, LimitQPS: 1000, DownloadConc: 3})
+	seedCookieAccount(t, store)
 
 	if _, err := resolver.ResolveShare(context.Background(), testShareURL, "", ""); err != nil {
 		t.Fatal(err)
@@ -155,6 +165,96 @@ func TestGuestResolveSkipsAccountCookie(t *testing.T) {
 	got, _ = d.cookie.Load().(string)
 	if got != "secret-cookie" {
 		t.Fatalf("登录后应使用账号 Cookie, got %q", got)
+	}
+}
+
+func TestResolveShareGuestAuthExpiredHint(t *testing.T) {
+	d := &twoFileDriver{fn: func(context.Context, string) (driver.DirectLink, error) {
+		return driver.DirectLink{}, driver.NewErr(driver.KindAuthExpired, "夸克分享直链需要登录态", nil)
+	}}
+	resolver, _ := newTestResolver(t, d, config.DriverCommon{Enabled: true, LimitQPS: 1000, DownloadConc: 3})
+
+	res, err := resolver.ResolveShare(context.Background(), testShareURL, "", "")
+	if err != nil {
+		t.Fatalf("列表仍应成功: %v", err)
+	}
+	if !strings.Contains(res.Hint, "请先登录") {
+		t.Fatalf("游客 AuthExpired 应提示登录, got %q", res.Hint)
+	}
+	if strings.Contains(res.Hint, "账号管理") {
+		t.Fatalf("游客不应被指到账号管理: %q", res.Hint)
+	}
+}
+
+func TestGuestResolveFileSkipsCookieCache(t *testing.T) {
+	d := &credSpyDriver{fakeDriver: fakeDriver{linkURL: "https://up.invalid/f"}}
+	resolver, store := newTestResolver(t, d, config.DriverCommon{Enabled: true, LimitQPS: 1000, DownloadConc: 3})
+	seedCookieAccount(t, store)
+
+	if _, err := resolver.ResolveFile(WithAuthed(context.Background(), true), testShareURL, "", "f1", false, ""); err != nil {
+		t.Fatal(err)
+	}
+	d.calls.Store(0)
+	d.cookie.Store("stale")
+
+	_, err := resolver.ResolveFile(context.Background(), testShareURL, "", "f1", false, "")
+	if err == nil {
+		t.Fatal("游客不得命中带 Cookie 的直链缓存")
+	}
+	var de *driver.Error
+	if !errors.As(err, &de) || de.Kind != driver.KindAuthExpired {
+		t.Fatalf("want AuthExpired, got %v", err)
+	}
+	if !strings.Contains(de.UserHint, "请先登录") {
+		t.Fatalf("hint=%q", de.UserHint)
+	}
+	if d.calls.Load() != 0 {
+		t.Fatalf("游客不应重提链, calls=%d", d.calls.Load())
+	}
+	if got, _ := d.cookie.Load().(string); got != "stale" {
+		t.Fatalf("游客不得读取账号 Cookie, got %q", got)
+	}
+}
+
+func TestGetFreshLinkRenewsExpiredCookieLink(t *testing.T) {
+	d := &credSpyDriver{fakeDriver: fakeDriver{linkURL: "https://up.invalid/f"}}
+	resolver, store := newTestResolver(t, d, config.DriverCommon{Enabled: true, LimitQPS: 1000, DownloadConc: 3})
+	seedCookieAccount(t, store)
+
+	if _, err := resolver.ResolveShare(WithAuthed(context.Background(), true), testShareURL, "", ""); err != nil {
+		t.Fatal(err)
+	}
+	key := resolver.shareKey("fake", testShareURL, "")
+	if err := store.DB().Model(&repo.Link{}).Where("share_key = ? AND fid = ?", key, "f1").
+		Update("expires_at", time.Now().Add(-time.Minute)).Error; err != nil {
+		t.Fatal(err)
+	}
+	d.cookie.Store("")
+	d.calls.Store(0)
+
+	link, err := resolver.GetFreshLink(context.Background(), key, "f1", "")
+	if err != nil {
+		t.Fatalf("已签发下载过期后应能续命: %v", err)
+	}
+	if link == nil {
+		t.Fatal("nil link")
+	}
+	got, _ := d.cookie.Load().(string)
+	if got != "secret-cookie" {
+		t.Fatalf("续命应 Pick 账号 Cookie, got %q", got)
+	}
+	if d.calls.Load() != 1 {
+		t.Fatalf("calls=%d", d.calls.Load())
+	}
+}
+
+func TestGuardKeySplitsGuest(t *testing.T) {
+	r := &Resolver{}
+	if got := r.guardKey(context.Background(), "quark"); got != "quark:guest" {
+		t.Fatalf("guest key=%q", got)
+	}
+	if got := r.guardKey(WithAuthed(context.Background(), true), "quark"); got != "quark" {
+		t.Fatalf("authed key=%q", got)
 	}
 }
 

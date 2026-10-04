@@ -190,14 +190,23 @@ func (r *Resolver) driverCfg(pan string) config.DriverCommon {
 	return config.DriverCommon{Enabled: true, LimitQPS: 2, DownloadConc: 3}
 }
 
+func (r *Resolver) guardKey(ctx context.Context, pan string) string {
+	if canPick(ctx) {
+		return pan
+	}
+	return pan + ":guest"
+}
+
 // guard 统一执行 熔断检查 → 本地限频 → 调用 → 熔断记录。
-func (r *Resolver) guard(pan string, fn func() error) error {
-	b := r.breakers.Get(pan)
+// 游客与已登录分桶,避免匿名刷分享把管理员提链熔断。
+func (r *Resolver) guard(ctx context.Context, pan string, fn func() error) error {
+	key := r.guardKey(ctx, pan)
+	b := r.breakers.Get(key)
 	if !b.Allow() {
 		r.met.Inc("panrouter_driver_error_total", map[string]string{"pan": pan, "kind": "breaker_open"})
 		return driver.NewErr(driver.KindRiskControl, "该网盘熔断中(近期风控/异常过多),请稍后再试", nil)
 	}
-	if !r.limiter.Allow(pan, r.driverCfg(pan).LimitQPS) {
+	if !r.limiter.Allow(key, r.driverCfg(pan).LimitQPS) {
 		return driver.NewErr(driver.KindRiskControl, "本地限频:请求过于频繁,请稍后", nil)
 	}
 	err := fn()
@@ -236,7 +245,7 @@ func (r *Resolver) mapErr(ctx context.Context, pan string, acc *repo.Account, er
 	case driver.KindAuthExpired:
 		if acc != nil {
 			r.accounts.MarkStatus(acc.ID, "expired")
-		} else if !authed(ctx) {
+		} else if !canPick(ctx) {
 			de.UserHint = "该网盘需要登录后才能提链,请先登录;" + de.UserHint
 		} else {
 			de.UserHint = "该网盘需要登录态,请先在「账号管理」添加账号;" + de.UserHint
@@ -251,20 +260,27 @@ func (r *Resolver) mapErr(ctx context.Context, pan string, acc *repo.Account, er
 
 type resolverCtxKey int
 
-const authedCtxKey resolverCtxKey = 1
+const pickOKCtxKey resolverCtxKey = 1
 
 // WithAuthed 标记请求已通过管理员登录;游客解析不得读取网盘 Cookie。
 func WithAuthed(ctx context.Context, ok bool) context.Context {
-	return context.WithValue(ctx, authedCtxKey, ok)
+	if !ok {
+		return ctx
+	}
+	return withPick(ctx)
 }
 
-func authed(ctx context.Context) bool {
-	v, _ := ctx.Value(authedCtxKey).(bool)
+func withPick(ctx context.Context) context.Context {
+	return context.WithValue(ctx, pickOKCtxKey, true)
+}
+
+func canPick(ctx context.Context) bool {
+	v, _ := ctx.Value(pickOKCtxKey).(bool)
 	return v
 }
 
 func (r *Resolver) pick(ctx context.Context, pan string) (*repo.Account, *driver.Credential, error) {
-	if !authed(ctx) {
+	if !canPick(ctx) {
 		return nil, nil, nil
 	}
 	acc, cred, err := r.accounts.Pick(pan)
@@ -272,6 +288,18 @@ func (r *Resolver) pick(ctx context.Context, pan string) (*repo.Account, *driver
 		return nil, nil, driver.NewErr(driver.KindUpstream, "读取账号凭据失败", err)
 	}
 	return acc, cred, nil
+}
+
+// linkHoldsCookie 判断直链缓存是否带上游 Cookie。空明文(免登录盘)不算。
+func (r *Resolver) linkHoldsCookie(l *repo.Link) bool {
+	if l == nil || len(l.CookieEnc) == 0 {
+		return false
+	}
+	plain, err := r.aes.DecryptBytes(l.CookieEnc)
+	if err != nil {
+		return true
+	}
+	return len(plain) > 0
 }
 
 // ---- 对外方法 ----
@@ -290,7 +318,7 @@ func (r *Resolver) ResolveShare(ctx context.Context, rawURL, pwd, clientUA strin
 		return nil, err
 	}
 	var nodes []driver.FileNode
-	err = r.guard(pan, func() error {
+	err = r.guard(ctx, pan, func() error {
 		nodes, err = drv.ResolveShare(ctx, driver.ShareLink{URL: rawURL, Pwd: pwd}, cred)
 		return err
 	})
@@ -365,10 +393,15 @@ func (r *Resolver) ResolveFile(ctx context.Context, rawURL, pwd, fid string, own
 	pan := drv.ID()
 	key := r.shareKey(pan, rawURL, pwd)
 
-	// 缓存命中
-	if l, _ := r.store.GetLink(key, fid); l != nil && l.ExpiresAt.After(time.Now()) {
-		r.met.Inc("panrouter_link_cache_hit_total", map[string]string{"pan": pan})
-		return r.buildResult(pan, key, l, clientUA, true), nil
+	if l, _ := r.store.GetLink(key, fid); l != nil {
+		// 游客不得复用或覆盖带账号 Cookie 的直链(管理员提链结果不能共享给匿名 /resolve)。
+		if !canPick(ctx) && r.linkHoldsCookie(l) {
+			return nil, r.mapErr(ctx, pan, nil, driver.NewErr(driver.KindAuthExpired, "该分享直链需要登录态", nil))
+		}
+		if l.ExpiresAt.After(time.Now()) {
+			r.met.Inc("panrouter_link_cache_hit_total", map[string]string{"pan": pan})
+			return r.buildResult(pan, key, l, clientUA, true), nil
+		}
 	}
 
 	acc, cred, err := r.pick(ctx, pan)
@@ -384,7 +417,7 @@ func (r *Resolver) ResolveFile(ctx context.Context, rawURL, pwd, fid string, own
 		return nil, err
 	}
 	var dl driver.DirectLink
-	err = r.guard(pan, func() error {
+	err = r.guard(ctx, pan, func() error {
 		dl, err = drv.GetDirectLink(ctx, cred, *ref)
 		return err
 	})
@@ -488,18 +521,22 @@ func (r *Resolver) GetFreshLink(ctx context.Context, shareKey, fid, clientUA str
 	if l, _ := r.store.GetLink(shareKey, fid); l != nil && l.ExpiresAt.After(time.Now()) {
 		return l, nil
 	}
-	// singleflight:并发请求同一过期链接收敛为一次真实刷新(其余等待复用结果)
+	// singleflight:并发请求同一过期链接收敛为一次真实刷新(其余等待复用结果)。
+	// 续命是否 Pick 由库内是否已有 Link 决定,不跟第一个 HTTP 请求的游客/登录态走。
 	v, err, _ := r.sf.Do("link:"+shareKey+"|"+fid, func() (any, error) {
-		// double-check:等待期间可能已被前一个调用刷新
-		if l, _ := r.store.GetLink(shareKey, fid); l != nil && l.ExpiresAt.After(time.Now()) {
-			return l, nil
+		existing, _ := r.store.GetLink(shareKey, fid)
+		if existing != nil && existing.ExpiresAt.After(time.Now()) {
+			return existing, nil
 		}
-		// 需要原始分享链接才能重解析
+		refreshCtx := ctx
+		if existing != nil {
+			refreshCtx = withPick(ctx)
+		}
 		var sh repo.Share
 		if err := r.store.DB().Where("share_key = ?", shareKey).First(&sh).Error; err != nil {
 			return nil, fmt.Errorf("share %s not found, cannot refresh link", shareKey)
 		}
-		if _, err := r.ResolveFile(ctx, sh.ShareURL, sh.Pwd, fid, false, clientUA); err != nil {
+		if _, err := r.ResolveFile(refreshCtx, sh.ShareURL, sh.Pwd, fid, false, clientUA); err != nil {
 			return nil, err
 		}
 		return r.store.GetLink(shareKey, fid)

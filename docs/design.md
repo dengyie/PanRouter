@@ -1,4 +1,4 @@
-# PanRouter — 网盘直链聚合与加速下载服务 · 方案设计 v1.1.11
+# PanRouter — 网盘直链聚合与加速下载服务 · 方案设计 v1.1.12
 
 > 自用优先的单机服务:聚合主流网盘的分享解析/提链,缓存直链,按直链特性自动在 **302 透传 / aria2 直下 / 服务端中转** 三条路径中选择最优下载方式。
 > 定位:个人自部署、单管理员、可接受登录态(Cookie / Token)。**不破解限速、不绕过会员权限、仅解析用户主动提供的分享链接。**
@@ -290,7 +290,7 @@ POST /api/v1/downloads {fid, dest, options?}
 | POST/GET | `/downloads`、`/downloads/{gid}` | 推送 aria2(URL+headers 由服务端选择)、查询进度;`/downloads/batch` 批量 |
 | GET | `/healthz` `/readyz` `/metrics` | 健康检查、Prometheus 指标 |
 
-- 认证:`/resolve` 可选登录(游客不碰 Cookie);账号/aria2/`/json` 必须登录;脚本端 `Authorization: Bearer <api-token>`
+- 认证:`/resolve` 可选登录(游客不碰 Cookie;坏 Bearer 仍 401);账号/aria2/`/json` 必须登录;已签发 `/d` `/stream` 过期后可 Pick 续命;脚本端 `Authorization: Bearer <api-token>`
 - 错误格式:`{code, kind, message, retriable, hint}`——`kind` 即 §4.2 的 Kind,`hint` 为可操作提示
 - `/d`、`/stream` 的签名:HMAC(fid + cred_version, master_key) + 过期时间,**默认 TTL 72h**(≥ 最长下载时长);签名只在建立连接时校验,Range 续传复用同一 URL,不会中途 401
 
@@ -354,6 +354,7 @@ driver 是变更频率最高的模块,**必须在不碰真实账号的前提下�
 | **S3 一键提链** | 分享根节点是文件夹时页面不给出提链;解析与提链两步过繁琐 | **已闭环**(v1.1.9):夸克 `ResolveShare` 按 `pdir_fid` 递归展开目录;无 fid 的 resolve 自动提链;前端直接给出下载。夸克直链仍需账号 Cookie |
 | **S3.1 一键提链生产化** | 自动提链无请求截止、失败静默 200、夸克 N=8 易触 CF 524、截断无提示、FileItem 拷贝过重、`.codex-memory` 入库 | **已闭环**(v1.1.10):resolve 90s deadline;剩余不足 15s 停提链;失败 warn(pan/fid/kind/hint);夸克自动提链 2;截断 `truncated`+hint;FileItem 只留 download_url/link_error/route;记忆目录 gitignore |
 | **S3.2 游客解析** | 除夸克 Cookie 外无其它账号资源,VPS 可放宽 | **已闭环**(v1.1.11):`/resolve` 对游客开放;未登录不 Pick 账号 Cookie;账号/aria2/`/json` 仍需登录;前端默认展示解析框 |
+| **S3.3 游客隔离加固** | 签名 `/d` 过期刷新丢 Cookie;游客命中管理员直链缓存;坏 token 当游客;游客与管理员共用熔断 | **已闭环**(v1.1.12):已签发 Link 过期后 `GetFreshLink` 才 Pick;游客跳过带 Cookie 的缓存;坏 Bearer 401;游客 limiter/breaker 分键 |
 
 ---
 
@@ -380,6 +381,7 @@ driver 是变更频率最高的模块,**必须在不碰真实账号的前提下�
 
 ## 变更记录
 
+- **v1.1.12(2026-10-05)**:游客隔离加固——已签发 `/d` `/stream` 过期后才允许 Pick 账号 Cookie 续命(singleflight 不跟游客 ctx);游客 `/resolve` 不得命中带 Cookie 的直链缓存;坏 Bearer 对 `/resolve` 返回 401;游客与管理员 limiter/breaker 分键
 - **v1.1.11(2026-10-05)**:游客解析——`POST /resolve`/`batch` 无需登录;游客上下文不读取网盘 Cookie(夸克仍须管理员登录);账号、aria2、`/json` 保持鉴权;前端默认打开解析框
 - **v1.1.10(2026-10-04)**:一键提链生产化——`POST /resolve` 与 `ResolveShare` 加 90s 截止,剩余不足 15s 不再自动提链;自动提链失败打 warn(pan/fid/kind/hint),AuthExpired 仍停后续并 200+hint;夸克自动提链上限 2、免登录盘仍 8;目录遍历截断写 `truncated` 与 hint;FileItem 不再拷贝 ResolveFileResult 全字段;前端合并提链分支并展示行内错误;`.codex-memory/` 移出公共仓
 - **v1.1.9(2026-10-04)**:一键提链——夸克分享目录按 `pdir_fid` 递归展开(深度 8 / 文件 200 / 目录 64),`ResolveShare` 对前 8 个文件自动 `ResolveFile`;AuthExpired 立刻停并在 `hint` 提示加 Cookie;前端有 `download_url` 时直接给出下载,不再强制二次点提链。夸克直链仍依赖账号 Cookie(转存链未变)

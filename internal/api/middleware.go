@@ -82,11 +82,19 @@ func (d *Deps) tokenOK(token string) bool {
 	return err == nil
 }
 
-// optionalAuth:游客可过;已登录则在 ctx 标记,解析层才允许读取网盘 Cookie。
+// optionalAuth:无 token 当游客;坏 token 401(让前端清会话);有效 token 才允许 Pick Cookie。
 func (d *Deps) optionalAuth(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		ok := d.tokenOK(bearerToken(r))
-		next.ServeHTTP(w, r.WithContext(service.WithAuthed(r.Context(), ok)))
+		token := bearerToken(r)
+		if token == "" {
+			next.ServeHTTP(w, r)
+			return
+		}
+		if !d.tokenOK(token) {
+			writeErr(w, driver.NewErr(driver.KindAuthExpired, "登录已过期,请重新登录", nil))
+			return
+		}
+		next.ServeHTTP(w, r.WithContext(service.WithAuthed(r.Context(), true)))
 	})
 }
 

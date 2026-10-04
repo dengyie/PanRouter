@@ -263,6 +263,9 @@ func TestE2EAuthFlow(t *testing.T) {
 	if st, _ := e.do(t, "POST", "/api/v1/downloads", "", `{"pan":"fake","share_key":"x","fid":"f1"}`); st != http.StatusUnauthorized {
 		t.Fatalf("guest downloads: %d", st)
 	}
+	if st, _ := e.do(t, "POST", "/api/v1/resolve", e.token+"x", `{"url":"`+e2eShareURL+`"}`); st != http.StatusUnauthorized {
+		t.Fatalf("forged token resolve: %d", st)
+	}
 }
 
 // ---- 解析与三条下载路径 ----
