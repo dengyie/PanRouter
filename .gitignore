@@ -1,7 +1,6 @@
-# 二进制与运行时产物
-panrouter
-panrouter.exe
-panrouter.exe
+# 二进制与运行时产物(只忽略仓库根产物,勿误伤 cmd/panrouter/)
+/panrouter
+/panrouter.exe
 data/
 *.db
 *.db-shm

@@ -93,3 +93,22 @@ func TestUpsertLinkIdempotent(t *testing.T) {
 		t.Fatalf("upsert should update fields: %+v", got)
 	}
 }
+
+// ExpireLink:上游否决后立即失效缓存,下次读取视为过期(触发重解析)。
+func TestExpireLink(t *testing.T) {
+	s := newTestStore(t)
+	l := &Link{ShareKey: "k", FID: "f", FileName: "a", DirectLink: "u1", ExpiresAt: time.Now().Add(time.Hour)}
+	if err := s.UpsertLink(l); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.ExpireLink("k", "f"); err != nil {
+		t.Fatal(err)
+	}
+	got, err := s.GetLink("k", "f")
+	if err != nil || got == nil {
+		t.Fatal(err)
+	}
+	if got.ExpiresAt.After(time.Now()) {
+		t.Fatalf("link should be expired, expires_at=%v", got.ExpiresAt)
+	}
+}

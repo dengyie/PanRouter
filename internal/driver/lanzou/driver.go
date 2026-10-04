@@ -303,8 +303,7 @@ func (d *Driver) GetDirectLink(ctx context.Context, cred *driver.Credential, ref
 	if err != nil {
 		return driver.DirectLink{}, err
 	}
-	// 蓝奏云最终直链对浏览器友好(UA/Referer 通常不校验),允许 302;
-	// 若实测出现 403,把 UA/Referer 填上即自动切换为 aria2/中转路径。
+	// 浏览器 302 由浏览器自身过 CDN 挑战;非浏览器(/stream、aria2)由 httpx acw_sc__v2 中间件解题重放。
 	return driver.DirectLink{URL: final, ExpiresAt: time.Now().Add(30 * time.Minute)}, nil
 }
 

@@ -62,6 +62,14 @@ internal/pkg/              httpx(SSRF 防护)、breaker、limiter、crypto(AES-G
 - **凭据刷新互斥** §7.6:`AccountService.Check` singleflight
 - **SSRF 防护** §8:全局禁私网直连 + per-driver 重定向白名单逐跳校验
 
+## CI / 生产发版
+
+GitHub Actions(`.github/workflows/ci.yml`):
+
+- PR / push `main`:`go vet ./...` + `go test ./... -count=1`
+- push `main`(及 `workflow_dispatch`):交叉编译 `linux/amd64` 静态二进制(`CGO_ENABLED=0`,ELF 闸门)后 SSH 到生产机,`deploy/pxed-install.sh` 原子替换并 `supervisorctl restart`
+- 生产 `config.yaml` / `PANROUTER_MASTER_KEY` 只在主机控制面,不入库(本仓 `config.yaml` 已 gitignore)
+
 ## 开发
 
 ```bash
@@ -75,7 +83,7 @@ go build ./... && go vet ./... && go test ./...
 
 - 夸克:分享**列表解析已线上验证**(匿名可用,含提取码);**直链需要登录态**(已实现,无账号时返回 401 + 添加账号提示);直链端点走 drive.quark.cn + 任务轮询
 - 蓝奏云:**带密码分享已线上验证**(真实链接+提取码解析→提链→302 全链路打通,含 lanzouu 新域名与 lanrar/dmpdmp CDN);文件夹分享暂不支持
-- 蓝奏云最终 CDN(dmpdmp/lanrar)对**非浏览器客户端**有 acw_sc__v2 JS 反爬挑战:浏览器 302 直下不受影响;aria2/中转需 M2 实现挑战求解器(算法已验证至"重放出真实文件")
+- 蓝奏云最终 CDN(dmpdmp/lanrar)对**非浏览器客户端**的 acw_sc__v2 挑战已由 httpx 中间件自动求解重放(`/stream` 与 aria2 走中转时生效);浏览器 302 直下仍不经过该路径
 - 前端为最小可用页(原生 JS);Vue3 + Naive UI 正式前端在 M2
 - 多账号轮换(picker)完整逻辑、扫码登录(playwright sidecar)、WebDAV 在 M2/M3
 - `/metrics` 为极简 Prometheus 文本实现,M2 替换 client_golang

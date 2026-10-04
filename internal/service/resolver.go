@@ -381,5 +381,10 @@ func (r *Resolver) GetFreshLink(ctx context.Context, shareKey, fid, clientUA str
 	if err != nil {
 		return nil, err
 	}
-	return v.(*repo.Link), nil
+	l, ok := v.(*repo.Link)
+	if !ok || l == nil {
+		// ResolveFile 落库失败时仅告警,此处兜底为明确错误,避免 nil 解引用 panic。
+		return nil, fmt.Errorf("link %s/%s 刷新后未落库", shareKey, fid)
+	}
+	return l, nil
 }

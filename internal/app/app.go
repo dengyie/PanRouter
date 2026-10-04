@@ -28,7 +28,7 @@ import (
 
 // driverFactories:网盘 ID → 构造函数。新增网盘 = 新 driver 包 + 此处一个条目 + config 一个键。
 var driverFactories = map[string]func(*httpx.Client) driver.Driver{
-	"quark":  func(c *httpx.Client) driver.Driver { return quark.New(c, "", "") },
+	"quark":  func(c *httpx.Client) driver.Driver { return quark.New(c, "") },
 	"lanzou": func(c *httpx.Client) driver.Driver { return lanzou.New(c) },
 }
 

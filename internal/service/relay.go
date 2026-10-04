@@ -80,6 +80,15 @@ func (s *Relay) Serve(ctx context.Context, w http.ResponseWriter, in StreamInput
 	if resp.StatusCode >= 400 {
 		// 直链可能提前失效(风控/过期):尚未写响应头,可安全报错让上层提示重试
 		io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
+		// 上游明确否决时立即失效本地缓存,否则重新解析仍命中同一死链(缓存优先),
+		// 用户会在 TTL 内 (最长 2h) 反复失败。失效后下次 GetFreshLink 触发真实重解析。
+		if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden ||
+			resp.StatusCode == http.StatusNotFound || resp.StatusCode == http.StatusGone ||
+			resp.StatusCode == http.StatusPreconditionFailed {
+			if err := s.store.ExpireLink(in.ShareKey, in.FID); err != nil {
+				s.log.Warnf("expire stale link: share=%s fid=%s err=%v", in.ShareKey, in.FID, err)
+			}
+		}
 		return driver.NewErr(driver.KindUpstream,
 			fmt.Sprintf("上游返回 %d,直链可能已失效,请重新解析", resp.StatusCode), nil)
 	}

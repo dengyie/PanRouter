@@ -142,3 +142,57 @@ func TestRelayRedirectOutsideAllowlistBlocked(t *testing.T) {
 		t.Fatalf("redirect outside allowlist must be blocked: %v", err)
 	}
 }
+
+// 上游 403(直链提前失效)时必须失效本地缓存行,否则重新解析仍命中同一死链。
+func TestRelayUpstreamForbiddenInvalidatesCache(t *testing.T) {
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusForbidden)
+	}))
+	defer up.Close()
+
+	relay, key := newRelayFixture(t, up.URL)
+	rec := httptest.NewRecorder()
+	if err := relay.Serve(context.Background(), rec, StreamInput{Pan: "fake", ShareKey: key, FID: "f1"}, ""); err == nil {
+		t.Fatal("upstream 403 should surface an error")
+	}
+	got, err := relay.store.GetLink(key, "f1")
+	if err != nil || got == nil {
+		t.Fatalf("link row missing: %v", err)
+	}
+	if got.ExpiresAt.After(time.Now()) {
+		t.Fatalf("upstream 403 must expire the cached link, expires_at=%v", got.ExpiresAt)
+	}
+}
+
+// 设计文档 §10 S2:非浏览器 UA 经 /stream 遇 acw_sc__v2 挑战页须自动解题重放,拿到真实文件。
+func TestRelaySolvesLanzouACWChallenge(t *testing.T) {
+	const (
+		arg1    = "6a9c4c0e1f2b3d4a5e6f708192a3b4c5d6e7f809"
+		token   = "7eb1cd08f1e9fa0e95d70fade751cd0c73136cc2"
+		payload = "LANZOU-FILE-BYTES"
+	)
+	challenge := `<html><script>var arg1='` + arg1 + `';document.cookie='acw_sc__v2='+arg1;</script></html>`
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		c, _ := r.Cookie("acw_sc__v2")
+		if c == nil || c.Value != token {
+			w.Header().Set("Content-Type", "text/html")
+			w.WriteHeader(http.StatusPreconditionFailed)
+			_, _ = w.Write([]byte(challenge))
+			return
+		}
+		_, _ = w.Write([]byte(payload))
+	}))
+	defer up.Close()
+
+	relay, key := newRelayFixture(t, up.URL)
+	rec := httptest.NewRecorder()
+	if err := relay.Serve(context.Background(), rec, StreamInput{Pan: "fake", ShareKey: key, FID: "f1"}, ""); err != nil {
+		t.Fatalf("relay: %v", err)
+	}
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
+	}
+	if rec.Body.String() != payload {
+		t.Fatalf("body=%q want %q", rec.Body.String(), payload)
+	}
+}

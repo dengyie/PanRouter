@@ -161,6 +161,13 @@ func (s *Store) GetLink(shareKey, fid string) (*Link, error) {
 	return &l, nil
 }
 
+// ExpireLink 立即将某条直链标记为过期(上游否决时调用),使下次 GetFreshLink 触发重解析。
+func (s *Store) ExpireLink(shareKey, fid string) error {
+	return s.db.Model(&Link{}).
+		Where("share_key = ? AND fid = ?", shareKey, fid).
+		Update("expires_at", time.Now()).Error
+}
+
 // ---- Account ----
 
 func (s *Store) CreateAccount(a *Account) error { return s.db.Create(a).Error }

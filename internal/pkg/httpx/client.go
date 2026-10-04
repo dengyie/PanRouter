@@ -37,6 +37,7 @@ type Result struct {
 type Client struct {
 	hc   *http.Client
 	opts Options
+	acw  acwCache // host → acw_sc__v2;O(1) 命中,避免每次 Range 再解一次
 }
 
 const maxAPIBody = 8 << 20 // 8MB,防上游异常返回超大响应
@@ -49,21 +50,24 @@ func New(opts Options) (*Client, error) {
 		opts.Timeout = 30 * time.Second
 	}
 	dialer := &net.Dialer{Timeout: 15 * time.Second, KeepAlive: 30 * time.Second, Control: controlFn(opts.AllowPrivate)}
-	tr := &http.Transport{
-		DialContext:           dialer.DialContext,
-		ForceAttemptHTTP2:     true,
-		TLSHandshakeTimeout:   10 * time.Second,
-		MaxIdleConnsPerHost:   8,
-		IdleConnTimeout:       90 * time.Second,
-		ResponseHeaderTimeout: opts.Timeout,
-	}
-	if opts.Proxy != "" {
-		u, err := url.Parse(opts.Proxy)
-		if err != nil {
-			return nil, fmt.Errorf("bad proxy url: %w", err)
+		tr := &http.Transport{
+			DialContext:           dialer.DialContext,
+			ForceAttemptHTTP2:     true,
+			TLSHandshakeTimeout:   10 * time.Second,
+			MaxIdleConnsPerHost:   8,
+			IdleConnTimeout:       90 * time.Second,
+			ResponseHeaderTimeout: opts.Timeout,
+			// 零值 Proxy 已是直连;显式 nil 防止以后改成 DefaultTransport 时吃到
+			// 宿主 HTTP_PROXY(pxed 全局 Privoxy 会把网盘上游拐走)。
+			Proxy: nil,
 		}
-		tr.Proxy = http.ProxyURL(u)
-	}
+		if opts.Proxy != "" {
+			u, err := url.Parse(opts.Proxy)
+			if err != nil {
+				return nil, fmt.Errorf("bad proxy url: %w", err)
+			}
+			tr.Proxy = http.ProxyURL(u)
+		}
 	c := &Client{opts: opts}
 	clientTimeout := opts.Timeout
 	if opts.NoBodyTimeout {
@@ -116,6 +120,10 @@ func (c *Client) checkRedirect(req *http.Request, via []*http.Request) error {
 	if !SuffixMatch(dstHost, c.opts.RedirectAllow) {
 		return fmt.Errorf("httpx: redirect to %q blocked by allowlist", req.URL.Host)
 	}
+	// 跨 host 跳转时 Go 会剥离 Cookie;把已解的 acw_sc__v2 贴到目标 host,避免每次 302 后再吃一轮挑战。
+	if token := c.acw.get(req.URL.Host); token != "" {
+		setCookieKV(req, acwCookieName, token)
+	}
 	return c.privateGuard(req, dstHost)
 }
 
@@ -153,7 +161,7 @@ func SuffixMatch(host string, allow []string) bool {
 
 // Do 执行请求并读完全部响应体(API 调用用)。
 func (c *Client) Do(req *http.Request) (*Result, error) {
-	resp, err := c.hc.Do(req)
+	resp, err := c.doWithACW(req)
 	if err != nil {
 		return nil, err
 	}
@@ -165,8 +173,69 @@ func (c *Client) Do(req *http.Request) (*Result, error) {
 	return &Result{StatusCode: resp.StatusCode, Header: resp.Header, Body: body}, nil
 }
 
-// DoStream 执行请求并保留响应体(中转流用)。
-func (c *Client) DoStream(req *http.Request) (*http.Response, error) { return c.hc.Do(req) }
+// DoStream 执行请求并保留响应体(中转流用)。遇 acw_sc__v2 挑战页自动解题重放(设计文档 §10 S2)。
+func (c *Client) DoStream(req *http.Request) (*http.Response, error) { return c.doWithACW(req) }
+
+func (c *Client) doWithACW(req *http.Request) (*http.Response, error) {
+	cur := req
+	origCtx := req.Context()
+	for attempt := 0; attempt <= maxACWReplay; attempt++ {
+		if token := c.acw.get(cur.URL.Host); token != "" {
+			cloned, err := cloneRequest(cur, origCtx)
+			if err != nil {
+				return nil, err
+			}
+			cur = cloned
+			setCookieKV(cur, acwCookieName, token)
+		}
+		resp, err := c.hc.Do(cur)
+		if err != nil {
+			return nil, err
+		}
+		page, challenge, err := inspectChallenge(resp)
+		if err != nil {
+			return nil, err
+		}
+		if !challenge {
+			return resp, nil
+		}
+		if attempt == maxACWReplay {
+			return nil, fmt.Errorf("httpx: acw_sc__v2 challenge persisted after retry")
+		}
+		token, err := SolveACW(page)
+		if err != nil {
+			return nil, fmt.Errorf("httpx: solve acw_sc__v2: %w", err)
+		}
+		// 重放必须沿用调用方 context:关闭挑战页 Body 会取消 resp.Request.Context()。
+		final := cur.URL
+		if resp.Request != nil && resp.Request.URL != nil {
+			final = resp.Request.URL
+		}
+		c.acw.set(final.Host, token)
+		replay, err := cloneRequest(cur, origCtx)
+		if err != nil {
+			return nil, err
+		}
+		u := *final
+		replay.URL = &u
+		replay.Host = u.Host
+		setCookieKV(replay, acwCookieName, token)
+		cur = replay
+	}
+	return nil, fmt.Errorf("httpx: acw_sc__v2 exhausted")
+}
+
+func cloneRequest(r *http.Request, ctx context.Context) (*http.Request, error) {
+	nr := r.Clone(ctx)
+	if r.GetBody != nil {
+		body, err := r.GetBody()
+		if err != nil {
+			return nil, err
+		}
+		nr.Body = body
+	}
+	return nr, nil
+}
 
 // DoJSON 发送 JSON 请求并反序列化响应。
 func (c *Client) DoJSON(ctx context.Context, method, url string, headers map[string]string, body, out any) (*Result, error) {

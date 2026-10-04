@@ -1,0 +1,103 @@
+name: CI
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+    branches: ["main"]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Vet & Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Test
+        run: go test ./... -count=1
+
+  deploy:
+    name: Deploy to pxed
+    needs: test
+    if: github.repository == 'dengyie/PanRouter' && github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Cross-compile linux/amd64
+        run: |
+          set -euo pipefail
+          VER="${GITHUB_SHA:0:12}"
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath \
+            -ldflags "-s -w -X main.version=${VER}" \
+            -o panrouter ./cmd/panrouter
+          python3 - <<'PY'
+          import struct, sys
+          with open("panrouter", "rb") as f:
+              magic = f.read(4)
+              if magic != b"\x7fELF":
+                  sys.exit("not ELF")
+              ei_class, _, _, _, _ = struct.unpack("BBBBB", f.read(5))
+              f.seek(18)
+              e_machine = struct.unpack("<H", f.read(2))[0]
+              if ei_class != 2 or e_machine != 62:
+                  sys.exit(f"want ELF64 x86_64, got class={ei_class} machine={e_machine}")
+          print("elf ok: linux/amd64")
+          PY
+
+      - name: Setup SSH
+        env:
+          SSH_PRIVATE_KEY: ${{ secrets.PROD_SSH_KEY }}
+          VPS_HOST: ${{ secrets.PROD_HOST }}
+          VPS_PORT: ${{ secrets.PROD_PORT || '22' }}
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.ssh
+          printf '%s\n' "$SSH_PRIVATE_KEY" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          ssh-keyscan -p "$VPS_PORT" -H "$VPS_HOST" >> ~/.ssh/known_hosts
+
+      - name: Upload binary and install script
+        env:
+          VPS_HOST: ${{ secrets.PROD_HOST }}
+          VPS_PORT: ${{ secrets.PROD_PORT || '22' }}
+          VPS_USER: ${{ secrets.PROD_USER }}
+        run: |
+          set -euo pipefail
+          ssh -i ~/.ssh/deploy_key -p "$VPS_PORT" \
+            -o StrictHostKeyChecking=yes \
+            "$VPS_USER@$VPS_HOST" 'mkdir -p /tmp/panrouter-ci /data/panrouter/bin /data/panrouter/data /data/panrouter/logs'
+          scp -i ~/.ssh/deploy_key -P "$VPS_PORT" \
+            -o StrictHostKeyChecking=yes \
+            panrouter deploy/pxed-install.sh \
+            "$VPS_USER@$VPS_HOST:/tmp/panrouter-ci/"
+
+      - name: Remote install and healthcheck
+        env:
+          VPS_HOST: ${{ secrets.PROD_HOST }}
+          VPS_PORT: ${{ secrets.PROD_PORT || '22' }}
+          VPS_USER: ${{ secrets.PROD_USER }}
+        run: |
+          set -euo pipefail
+          ssh -i ~/.ssh/deploy_key -p "$VPS_PORT" \
+            -o StrictHostKeyChecking=yes \
+            "$VPS_USER@$VPS_HOST" \
+            'bash /tmp/panrouter-ci/pxed-install.sh /tmp/panrouter-ci/panrouter'
