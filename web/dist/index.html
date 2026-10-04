@@ -52,7 +52,7 @@
     <label>提取码(可空)</label>
     <input id="pwd" placeholder="1234" style="max-width:200px">
     <button onclick="resolve()">解析</button>
-    <span style="margin-left:8px;color:var(--sub);font-size:12px">解析文件后点行内「提链」获取直链</span>
+    <span style="margin-left:8px;color:var(--sub);font-size:12px">解析后直接给出直链;夸克需先在下方添加 Cookie</span>
     <div id="shareMsg"></div>
     <div id="files"></div>
     <div id="linkBox"></div>
@@ -122,11 +122,25 @@ async function resolve() {
   try {
     const d = await api('/resolve', {method:'POST', body: JSON.stringify({url:$('url').value, pwd:$('pwd').value})});
     LAST = d;
-    const rows = d.files.map(f =>
-      `<tr><td>${esc(f.name)}</td><td>${fmtSize(f.size)}</td>`+
-      (f.is_dir ? `<td>目录</td>` :
-       `<td><a href="javascript:link('${esc(f.fid)}')">提链</a></td>`) + `</tr>`).join('');
+    if (d.hint) $('shareMsg').innerHTML = `<div class="msg err">${esc(d.hint)}</div>`;
+    const rows = (d.files||[]).map(f => {
+      let act = '<td></td>';
+      if (f.is_dir) act = '<td>目录</td>';
+      else if (f.download_url) act = `<td><a href="${esc(f.download_url)}" target="_blank">下载</a> · <a href="javascript:link('${esc(f.fid)}')">刷新</a></td>`;
+      else if (f.link_error) act = `<td><a href="javascript:link('${esc(f.fid)}')">提链</a></td>`;
+      else act = `<td><a href="javascript:link('${esc(f.fid)}')">提链</a></td>`;
+      return `<tr><td>${esc(f.name)}</td><td>${fmtSize(f.size)}</td>${act}</tr>`;
+    }).join('');
     $('files').innerHTML = `<table><tr><th>文件</th><th>大小</th><th></th></tr>${rows}</table>`;
+    const ready = (d.files||[]).find(f => f.download_url);
+    if (ready) {
+      const badge = {['302']:'b302', aria2:'baria2', stream:'bstream'}[ready.route] || 'bstream';
+      $('linkBox').innerHTML = `
+        <div class="msg info" style="margin-top:12px">
+          <b>${esc(ready.name)}</b> · 路径:<span class="badge ${badge}">${esc(ready.route||'')}</span><br>
+          <a href="${esc(ready.download_url)}" target="_blank">点此下载</a>
+        </div>`;
+    }
   } catch(e) { $('shareMsg').innerHTML = `<div class="msg err">${esc(e.message)}</div>`; }
 }
 

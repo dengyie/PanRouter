@@ -51,6 +51,7 @@ type chainServer struct {
 	taskResp     func(idx int) string
 	saveResp     func(call int) string // call: 第几次 save 调用(0 起)
 	downloadResp func() (int, string)
+	detailResp   func(pdir string) string
 	deletes      []string // 记录 cleanup 删除的 fid
 	mkdirCalls   int
 	saveCall     int
@@ -63,6 +64,10 @@ func (c *chainServer) handler() http.Handler {
 		case strings.HasSuffix(r.URL.Path, "/share/sharepage/token"):
 			writeJSONLine(w, tokenRespBody)
 		case strings.HasSuffix(r.URL.Path, "/share/sharepage/detail"):
+			if c.detailResp != nil {
+				writeJSONLine(w, c.detailResp(r.URL.Query().Get("pdir_fid")))
+				return
+			}
 			writeJSONLine(w, detailRespBody)
 		case strings.HasSuffix(r.URL.Path, "/share/sharepage/save"):
 			var body map[string]any
@@ -154,6 +159,29 @@ func TestResolveShare(t *testing.T) {
 	}
 	if nodes[0].Ext["pwd_id"] != "abc123" || nodes[0].Ext["stoken"] != "STOKEN" {
 		t.Fatalf("ext lost: %+v", nodes[0].Ext)
+	}
+}
+
+func TestResolveShareWalksDirectory(t *testing.T) {
+	cs := &chainServer{detailResp: func(pdir string) string {
+		if pdir == "DIR1" {
+			return `{"code":0,"message":"ok","data":{"list":[{"fid":"F1","file_name":"a.mp4","size":123,"dir":false}],"metadata":{"_total":1}}}`
+		}
+		return `{"code":0,"message":"ok","data":{"list":[{"fid":"DIR1","file_name":"MuMu模拟器","size":0,"dir":true}],"metadata":{"_total":1}}}`
+	}}
+	srv := newChainServer(t, cs)
+	defer srv.Close()
+	d := newTestDriver(t, srv)
+
+	nodes, err := d.ResolveShare(context.Background(), driver.ShareLink{URL: srv.URL + "/s/abc123"}, nil)
+	if err != nil {
+		t.Fatalf("ResolveShare: %v", err)
+	}
+	if len(nodes) != 1 {
+		t.Fatalf("want 1 file after walking dir, got %+v", nodes)
+	}
+	if nodes[0].FID != "F1" || nodes[0].IsDir || nodes[0].Name != "MuMu模拟器/a.mp4" {
+		t.Fatalf("unexpected flattened node: %+v", nodes[0])
 	}
 }
 

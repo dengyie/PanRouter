@@ -55,7 +55,7 @@ func newRelayFixture(t *testing.T, upstreamURL string) (*Relay, string) {
 		breaker.NewRegistry(5, time.Minute), sign.New("k"), metrics.New(), log)
 
 	const shareURL = "https://fake.example/s/x"
-	if _, err := resolver.ResolveShare(context.Background(), shareURL, ""); err != nil {
+	if _, err := resolver.ResolveShare(context.Background(), shareURL, "", ""); err != nil {
 		t.Fatalf("ResolveShare: %v", err)
 	}
 	if _, err := resolver.ResolveFile(context.Background(), shareURL, "", "f1", false, ""); err != nil {

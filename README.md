@@ -28,13 +28,13 @@ docker compose up -d --build
 # 登录换 token
 curl -s localhost:6400/api/v1/auth/login -d '{"username":"admin","password":"admin123"}'
 
-# 解析分享 → 文件列表
-curl -s localhost:6400/api/v1/resolve -H "Authorization: Bearer $T" \
-  -d '{"url":"https://pan.quark.cn/s/xxxx"}'
+# 解析分享 → 文件列表并自动提链(files[].download_url;夸克需先添加 Cookie)
+	curl -s localhost:6400/api/v1/resolve -H "Authorization: Bearer $T" \
+	  -d '{"url":"https://pan.quark.cn/s/xxxx"}'
 
-# 解析单个文件 → 直链 + 派生下载路径(route: 302|aria2|stream)
-curl -s localhost:6400/api/v1/resolve -H "Authorization: Bearer $T" \
-  -d '{"url":"https://pan.quark.cn/s/xxxx","fid":"文件fid"}'
+	# 刷新单个文件直链(可选)
+	curl -s localhost:6400/api/v1/resolve -H "Authorization: Bearer $T" \
+	  -d '{"url":"https://pan.quark.cn/s/xxxx","fid":"文件fid"}'
 
 # 下载:浏览器直接打开 download_url(302 或自动降级 stream)
 # 脚本直链(带 UA/Referer 约束说明):GET /api/v1/json/{pan}/{share_key}/{fid}

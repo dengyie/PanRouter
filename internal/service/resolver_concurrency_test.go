@@ -72,7 +72,7 @@ func TestGetFreshLinkSingleflight(t *testing.T) {
 	cd := &concDriver{fakeDriver: fakeDriver{linkURL: "https://up.invalid/f"}, delay: 50 * time.Millisecond}
 	resolver, store := newTestResolver(t, cd, config.DriverCommon{Enabled: true, LimitQPS: 1000, DownloadConc: 3})
 
-	if _, err := resolver.ResolveShare(context.Background(), testShareURL, ""); err != nil {
+	if _, err := resolver.ResolveShare(context.Background(), testShareURL, "", ""); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := resolver.ResolveFile(context.Background(), testShareURL, "", "f1", false, ""); err != nil {
@@ -117,9 +117,10 @@ func TestResolveFileConcurrencyCap(t *testing.T) {
 	cd := &concDriver{fakeDriver: fakeDriver{linkURL: "https://up.invalid/f"}, delay: 50 * time.Millisecond}
 	resolver, _ := newTestResolver(t, cd, config.DriverCommon{Enabled: true, LimitQPS: 1000, DownloadConc: 1})
 
-	if _, err := resolver.ResolveShare(context.Background(), testShareURL, ""); err != nil {
+	if _, err := resolver.ResolveShare(context.Background(), testShareURL, "", ""); err != nil {
 		t.Fatal(err)
 	}
+	base := cd.calls.Load() // 分享解析会自动提链 f1,不计入后续并发断言
 
 	const n = 4
 	var wg sync.WaitGroup
@@ -141,7 +142,7 @@ func TestResolveFileConcurrencyCap(t *testing.T) {
 	if got := cd.max.Load(); got != 1 {
 		t.Fatalf("download_concurrency=1 时峰值在途应为 1,实际 %d", got)
 	}
-	if got := cd.calls.Load(); got != n {
+	if got := cd.calls.Load() - base; got != n {
 		t.Fatalf("应完成 %d 次真实调用,实际 %d", n, got)
 	}
 }

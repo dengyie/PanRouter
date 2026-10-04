@@ -81,17 +81,31 @@ func (r *Resolver) acquire(ctx context.Context, pan string) (release func(), err
 
 // ---- 对外结果结构 ----
 
+// autoLinkMax 一次分享解析自动提链的文件数上限,避免夸克转存链把请求拖死或触发风控。
+const autoLinkMax = 8
+
 type FileItem struct {
-	FID   string `json:"fid"`
-	Name  string `json:"name"`
-	Size  int64  `json:"size"`
-	IsDir bool   `json:"is_dir"`
+	FID         string     `json:"fid"`
+	Name        string     `json:"name"`
+	Size        int64      `json:"size"`
+	IsDir       bool       `json:"is_dir"`
+	Route       string     `json:"route,omitempty"`
+	DownloadURL string     `json:"download_url,omitempty"`
+	StreamURL   string     `json:"stream_url,omitempty"`
+	DirectURL   string     `json:"direct_url,omitempty"`
+	UA          string     `json:"ua,omitempty"`
+	Referer     string     `json:"referer,omitempty"`
+	NeedHeaders bool       `json:"need_headers,omitempty"`
+	ExpiresAt   *time.Time `json:"expires_at,omitempty"`
+	CacheHit    bool       `json:"cache_hit,omitempty"`
+	LinkError   string     `json:"link_error,omitempty"`
 }
 
 type ResolveShareResult struct {
 	Pan      string     `json:"pan"`
 	ShareKey string     `json:"share_key"`
 	Files    []FileItem `json:"files"`
+	Hint     string     `json:"hint,omitempty"`
 }
 
 type ResolveFileResult struct {
@@ -196,7 +210,7 @@ func (r *Resolver) pick(pan string) (*repo.Account, *driver.Credential, error) {
 
 // ---- 对外方法 ----
 
-func (r *Resolver) ResolveShare(ctx context.Context, rawURL, pwd string) (*ResolveShareResult, error) {
+func (r *Resolver) ResolveShare(ctx context.Context, rawURL, pwd, clientUA string) (*ResolveShareResult, error) {
 	drv, err := r.reg.Detect(rawURL)
 	if err != nil {
 		return nil, err
@@ -223,11 +237,39 @@ func (r *Resolver) ResolveShare(ctx context.Context, rawURL, pwd string) (*Resol
 		r.log.Warnf("save share: %v", err)
 	}
 	items := make([]FileItem, 0, len(nodes))
+	linked, authBlocked := 0, false
+	hint := ""
 	for _, n := range nodes {
-		items = append(items, FileItem{FID: n.FID, Name: n.Name, Size: n.Size, IsDir: n.IsDir})
+		it := FileItem{FID: n.FID, Name: n.Name, Size: n.Size, IsDir: n.IsDir}
+		if !n.IsDir && n.FID != "" && linked < autoLinkMax && !authBlocked {
+			linked++
+			file, lerr := r.ResolveFile(ctx, rawURL, pwd, n.FID, false, clientUA)
+			if lerr != nil {
+				var de *driver.Error
+				if errors.As(lerr, &de) && de.Kind == driver.KindAuthExpired {
+					authBlocked = true
+					hint = de.UserHint
+					it.LinkError = de.UserHint
+				} else {
+					it.LinkError = lerr.Error()
+				}
+			} else {
+				exp := file.ExpiresAt
+				it.Route = file.Route
+				it.DownloadURL = file.DownloadURL
+				it.StreamURL = file.StreamURL
+				it.DirectURL = file.DirectURL
+				it.UA = file.UA
+				it.Referer = file.Referer
+				it.NeedHeaders = file.NeedHeaders
+				it.ExpiresAt = &exp
+				it.CacheHit = file.CacheHit
+			}
+		}
+		items = append(items, it)
 	}
 	r.met.Inc("panrouter_resolve_total", map[string]string{"pan": pan, "kind": "share"})
-	return &ResolveShareResult{Pan: pan, ShareKey: key, Files: items}, nil
+	return &ResolveShareResult{Pan: pan, ShareKey: key, Files: items, Hint: hint}, nil
 }
 
 // ResolveFile 获取单个文件直链:缓存未过期直接返回,否则走 driver 并落库。

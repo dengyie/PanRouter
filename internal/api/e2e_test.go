@@ -253,13 +253,17 @@ func TestE2EAuthFlow(t *testing.T) {
 func TestE2EResolveAndRoute302(t *testing.T) {
 	e := newE2E(t, true)
 
-	// 分享列表
+	// 分享列表:一次解析即自动提链,文件行应带 download_url
 	st, body := e.do(t, "POST", "/api/v1/resolve", e.token, `{"url":"`+e2eShareURL+`"}`)
 	if st != http.StatusOK || len(body["files"].([]any)) != 3 {
 		t.Fatalf("share: %d %v", st, body)
 	}
+	first := body["files"].([]any)[0].(map[string]any)
+	if first["download_url"] == nil || first["download_url"] == "" {
+		t.Fatalf("share auto-link missing download_url: %v", first)
+	}
 
-	// f1:裸链 → route=302,/d 直接 302 到上游直链
+	// f1:裸链 → route=302,/d 直接 302 到上游直链(分享解析已提过,此处为缓存命中)
 	res := e.resolveFile(t, "f1")
 	if res["route"] != "302" {
 		t.Fatalf("f1 route: %v", res["route"])

@@ -36,7 +36,7 @@ func clientUA(r *http.Request, explicit string) string {
 func (d *Deps) doResolve(r *http.Request, q resolveReq) (any, error) {
 	ua := clientUA(r, q.UA)
 	if q.FID == "" {
-		return d.Resolver.ResolveShare(r.Context(), q.URL, q.Pwd)
+		return d.Resolver.ResolveShare(r.Context(), q.URL, q.Pwd, ua)
 	}
 	return d.Resolver.ResolveFile(r.Context(), q.URL, q.Pwd, q.FID, false, ua)
 }

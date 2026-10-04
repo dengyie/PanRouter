@@ -34,6 +34,10 @@ const (
 	QuarkUA    = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) quark-cloud-drive/3.14.2 Chrome/112.0.5615.165 Electron/24.1.3.8 Safari/537.36 Channel/pckk_other_ch"
 	linkTTL    = 2 * time.Hour
 	tmpDirName = "panrouter_tmp" // 转存专用暂存目录;cleanup 只删该目录内副本,避免去重 fid 误删用户文件
+	// 分享目录遍历上界:避免异常响应或超大分享把解析拖死。
+	maxShareDepth = 8
+	maxShareFiles = 200
+	maxShareDirs  = 64
 )
 
 var pwdIDRe = regexp.MustCompile(`/s/([0-9a-zA-Z]+)`)
@@ -164,14 +168,42 @@ func (d *Driver) ResolveShare(ctx context.Context, share driver.ShareLink, cred 
 	if err != nil {
 		return nil, err
 	}
-	var nodes []driver.FileNode
-	for page := 1; ; page++ {
+	ext := map[string]string{"pwd_id": pwdID, "stoken": st, "pwd": share.Pwd}
+	return d.walkShare(ctx, cred, "0", "", 0, ext, map[string]struct{}{}, &shareWalkBudget{files: maxShareFiles, dirs: maxShareDirs})
+}
+
+type shareWalkBudget struct {
+	files int
+	dirs  int
+}
+
+func joinSharePath(prefix, name string) string {
+	if prefix == "" {
+		return name
+	}
+	return prefix + "/" + name
+}
+
+func quarkFileName(f quarkFile) string {
+	if f.FileName != "" {
+		return f.FileName
+	}
+	return f.ShareName
+}
+
+// listShareDir 分页列出分享内某一目录(pdir_fid=0 为根)。
+func (d *Driver) listShareDir(ctx context.Context, cred *driver.Credential, pwdID, st, pdirFID string) ([]quarkFile, error) {
+	if pdirFID == "" {
+		pdirFID = "0"
+	}
+	var files []quarkFile
+	for page := 1; page <= 100; page++ {
 		q := url.Values{}
 		q.Set("pr", "ucpro")
 		q.Set("fr", "pc")
 		q.Set("pwd_id", pwdID)
 		q.Set("stoken", st)
-		q.Set("pdir_fid", "0")
+		q.Set("pdir_fid", pdirFID)
 		q.Set("_page", fmt.Sprint(page))
 		q.Set("_size", "50")
 		q.Set("_fetch_banner", "0")
@@ -195,19 +227,56 @@ func (d *Driver) ResolveShare(ctx context.Context, share driver.ShareLink, cred 
 		if err := json.Unmarshal(resp.Data, &data); err != nil {
 			return nil, driver.NewErr(driver.KindInterfaceChanged, "夸克响应结构变化,解析失败", err)
 		}
-		for _, f := range data.List {
-			name := f.FileName
-			if name == "" {
-				name = f.ShareName
-			}
-			nodes = append(nodes, driver.FileNode{
-				FID: f.FID, Name: name, Size: f.Size, IsDir: f.Dir,
-				Ext: map[string]string{"pwd_id": pwdID, "stoken": st, "pwd": share.Pwd},
-			})
-		}
-		if len(data.List) == 0 || (data.Metadata.Total > 0 && len(nodes) >= data.Metadata.Total) {
+		files = append(files, data.List...)
+		if len(data.List) == 0 || (data.Metadata.Total > 0 && len(files) >= data.Metadata.Total) {
 			break
 		}
+	}
+	return files, nil
+}
+
+// walkShare 递归展开分享目录,只返回文件(名称带相对路径)。根目录是文件夹时也能一次列出内部文件。
+func (d *Driver) walkShare(ctx context.Context, cred *driver.Credential, pdirFID, prefix string, depth int, ext map[string]string, seen map[string]struct{}, bud *shareWalkBudget) ([]driver.FileNode, error) {
+	if depth > maxShareDepth || bud.files <= 0 {
+		return nil, nil
+	}
+	entries, err := d.listShareDir(ctx, cred, ext["pwd_id"], ext["stoken"], pdirFID)
+	if err != nil {
+		return nil, err
+	}
+	var nodes []driver.FileNode
+	var dirs []quarkFile
+	for _, f := range entries {
+		if f.FID == "" {
+			continue
+		}
+		if _, ok := seen[f.FID]; ok {
+			continue
+		}
+		seen[f.FID] = struct{}{}
+		if f.Dir {
+			dirs = append(dirs, f)
+			continue
+		}
+		if bud.files <= 0 {
+			break
+		}
+		bud.files--
+		nodeExt := map[string]string{"pwd_id": ext["pwd_id"], "stoken": ext["stoken"], "pwd": ext["pwd"]}
+		nodes = append(nodes, driver.FileNode{
+			FID: f.FID, Name: joinSharePath(prefix, quarkFileName(f)), Size: f.Size, IsDir: false, Ext: nodeExt,
+		})
+	}
+	for _, dir := range dirs {
+		if bud.dirs <= 0 || bud.files <= 0 || depth >= maxShareDepth {
+			break
+		}
+		bud.dirs--
+		kids, err := d.walkShare(ctx, cred, dir.FID, joinSharePath(prefix, quarkFileName(dir)), depth+1, ext, seen, bud)
+		if err != nil {
+			return nil, err
+		}
+		nodes = append(nodes, kids...)
 	}
 	return nodes, nil
 }
