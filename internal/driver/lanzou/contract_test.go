@@ -71,6 +71,30 @@ func newTestServer(t *testing.T) *httptest.Server {
 			}
 			w.Header().Set("Content-Type", "application/json")
 			_, _ = w.Write([]byte(`{"zt":1,"dom":"https://sls.example.com","url":"/file/?CW8xyz","inf":"EhViewer-2.0.2.5.apk"}`))
+		case "/cdn":
+			w.Header().Set("Content-Type", "text/html; charset=utf-8")
+			_, _ = w.Write([]byte(`<!DOCTYPE HTML><html><body>
+					<div onclick="down_r(1);">验证并下载</div>
+					<script>$.ajax({url:'ajax.php',data:{'file':'FILETOK123','el':el,'sign':'SIGNTOK456'}});</script>
+					</body></html>`))
+		case "/ajax.php":
+			if err := r.ParseForm(); err != nil {
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
+			if r.PostForm.Get("file") != "FILETOK123" || r.PostForm.Get("sign") != "SIGNTOK456" {
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			if r.PostForm.Get("el") != "1" {
+				_, _ = w.Write([]byte(`{"zt":"0","inf":"retry"}`))
+				return
+			}
+			_, _ = w.Write([]byte(`{"zt":"1","url":"` + srv.URL + `/real.bin"}`))
+		case "/real.bin":
+			w.Header().Set("Content-Type", "application/octet-stream")
+			_, _ = w.Write([]byte("LANZOU-FILE-BYTES"))
 		default:
 			w.WriteHeader(http.StatusNotFound)
 		}
@@ -160,6 +184,35 @@ func TestResolveShareWithPassword(t *testing.T) {
 	_, err = d.ResolveShare(context.Background(), driver.ShareLink{URL: srv.URL + "/pwd"}, nil)
 	if !isKind(err, string(driver.KindUnsupported)) {
 		t.Fatalf("no pwd: %v", err)
+	}
+}
+
+func TestFollowCDNVerifyPage(t *testing.T) {
+	srv := newTestServer(t)
+	defer srv.Close()
+	d := newTestDriver(t, srv)
+	got, err := d.followCDN(context.Background(), srv.URL+"/cdn")
+	if err != nil {
+		t.Fatalf("followCDN: %v", err)
+	}
+	if got != srv.URL+"/real.bin" {
+		t.Fatalf("followCDN url=%s", got)
+	}
+}
+
+func TestFollowCDNSkipsNonHTML(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/octet-stream")
+		_, _ = w.Write([]byte("PK\x03\x04not-html"))
+	}))
+	defer srv.Close()
+	d := newTestDriver(t, srv)
+	got, err := d.followCDN(context.Background(), srv.URL+"/file.bin")
+	if err != nil {
+		t.Fatalf("followCDN: %v", err)
+	}
+	if got != srv.URL+"/file.bin" {
+		t.Fatalf("non-html must stay: %s", got)
 	}
 }
 

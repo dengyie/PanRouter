@@ -348,6 +348,7 @@ driver 是变更频率最高的模块,**必须在不碰真实账号的前提下�
 |---|---|---|
 | **S1 夸克直链终验** | 转存链已在 v1.1.5 落地;v1.1.6 完成根因修复与全链终验 | **已闭环**:resolve→提链→/d 302→/stream 中转 200(775B mp4)+ Range 206 续传逐字节一致;转存副本经专用暂存目录隔离并自动清理 |
 | **S2 蓝奏云 acw_sc__v2 求解器** | 蓝奏云 CDN(dmpdmp/lanrar)对非浏览器客户端下发 JS 挑战,阻断 /stream 中转下载;算法已验证(posList 重排 + hexXor,密钥 `3000176000856006061501533003690027800375` 可产出有效 Cookie) | **已闭环**(v1.1.7):`httpx` 中间件检测 412/挑战页 → 解题 → 同请求重放,按 host 缓存 Cookie;验收:非浏览器 UA 经 /stream 下载挑战页上游成功,Range 续传命中缓存不再吃挑战 |
+| **S2.1 蓝奏云 CDN 二次验证页** | 过 acw 后仍可能落到「验证并下载」HTML(`down_r` + POST `ajax.php`),浏览器 302 与 /stream 都拿不到文件 | **已闭环**(v1.1.8):`GetDirectLink` 跟过落地页,提取 file/sign 后 POST ajax.php 换真实文件 URL;NeedHeaders 改看明文 Cookie 而非密文长度 |
 
 ---
 
@@ -374,6 +375,7 @@ driver 是变更频率最高的模块,**必须在不碰真实账号的前提下�
 
 ## 变更记录
 
+- **v1.1.8(2026-10-04)**:蓝奏云 CDN 二次验证页——过 acw 后 dmpdmp 仍可能返回「验证并下载」HTML,需 POST `ajax.php`(file/sign/el)才拿到文件地址;`lanzou.followCDN` 在 `GetDirectLink` 跟过该页,合约测试覆盖落地页与非 HTML 跳过;NeedHeaders 改为解密后的明文 Cookie 判断(空 Cookie 的 AES 密文非空曾误标 need_headers,前端会走 /stream);白名单补 `.bakstotre.com`(落地页静态资源 host,ajax 成功后偶发跳转)
 - **v1.1.7(2026-10-04)**:蓝奏云 CDN acw_sc__v2 求解器工程化(M2 S2)——`internal/pkg/httpx` 在 `Do`/`DoStream` 检测 412/挑战页,posList 重排 + hexXor 产出 `acw_sc__v2` 后同请求重放(最多 1 次);按 host 缓存 Cookie,跨 host 302 在 CheckRedirect 注入,Range 续传不再重复解题;二进制/206 响应跳过窥探,避免把真实文件当挑战页。合约测试覆盖求解向量、解题重放、缓存 Range、持续挑战失败、跨域 302 注入;/stream 中转回放验收非浏览器 UA 拿到真实文件
 - **v1.1.6(2026-10-03)**:夸克转存链生产化修复(final review 根因修复)——**专用暂存目录**:线上实测夸克 save 对同 hash 同名文件**去重返回既有 fid**,转存到根目录再 cleanup 会误删用户已有文件;改为转存进 `panrouter_tmp` 目录(按登录态指纹缓存目录 fid,建目录端点实测 `POST /1/clouddrive/file`,已存在则按名查找),cleanup 只可能触及目录内受控副本;**清理失败路径修复**:save 成功后即 `defer` 清理(原实现仅在取链成功时清理,取链失败/轮询超时/请求取消都会泄漏副本),用 `context.WithoutCancel` 保证取消时清理仍完成;**缓存自愈**:Relay 遇上游 401/403/404/410 立即失效本地直链缓存(`ExpireLink`),否则"请重新解析"会命中同一死链、TTL 内(最长 2h)不可恢复;**stoken 分类解耦**:`classify` 改用哨兵错误 `errStokenExpired` + `errors.Is`,不再用人类可读文案当机器判据(且该分支前置于风控分支,避免"请重试"被截走导致重试永不触发);`GetFreshLink` 补 nil 指针防护(落库失败不再 panic);删除 `New` 的 `shareBase` 死参数与 `apiResp.Status` 死字段;新增回归测试(暂存目录缓存/取链失败清理/stoken 重试/缓存失效/ExpireLink)
 - **v1.1.5(2026-10-03)**:夸克转存链重构(线上实锚)——分享直链端点 `sharepage/download` 已下线(双域名全参数形态 404,实锚取证);实测当前真实流程为**转存链**:token → detail → save(`fid_list` 字段,`save_as_select_top_fids` 会 41013)→ task 轮询(status==2)→ file/download → CDN 直链;缓存 stoken 过期自动重取并重试一次(分类为 upstream,不误判 share_gone);转存受限(容量不足/次数超限)诚实分类为 risk_control;**直链 Cookie 基底修正**:CDN 需完整登录态 Cookie(file/download 的 Set-Cookie 间歇性缺失,仅 `__puus` 会被 412/403),改为登录态为基底 + Set-Cookie 同名覆盖(mergeCookies 保持基底顺序);实测**删除转存副本不使直链失效**(取链后自动清理转存副本,节省网盘空间);合约测试重写(save 链 fixture + 任务轮询 + 容量分类 + Cookie 断言);端到端终验通过:提链 → /d 302 → /stream 中转 200(775B video/mp4)+ Range 206 续传逐字节一致

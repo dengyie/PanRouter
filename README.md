@@ -83,7 +83,7 @@ go build ./... && go vet ./... && go test ./...
 
 - 夸克:分享**列表解析已线上验证**(匿名可用,含提取码);**直链需要登录态**(已实现,无账号时返回 401 + 添加账号提示);直链端点走 drive.quark.cn + 任务轮询
 - 蓝奏云:**带密码分享已线上验证**(真实链接+提取码解析→提链→302 全链路打通,含 lanzouu 新域名与 lanrar/dmpdmp CDN);文件夹分享暂不支持
-- 蓝奏云最终 CDN(dmpdmp/lanrar)对**非浏览器客户端**的 acw_sc__v2 挑战已由 httpx 中间件自动求解重放(`/stream` 与 aria2 走中转时生效);浏览器 302 直下仍不经过该路径
+- 蓝奏云最终 CDN 对非浏览器客户端先过 acw_sc__v2,再过「验证并下载」页(`ajax.php`);`GetDirectLink` 已跟到真实文件地址,浏览器 302 与 `/stream` 都走这条链
 - 前端为最小可用页(原生 JS);Vue3 + Naive UI 正式前端在 M2
 - 多账号轮换(picker)完整逻辑、扫码登录(playwright sidecar)、WebDAV 在 M2/M3
 - `/metrics` 为极简 Prometheus 文本实现,M2 替换 client_golang

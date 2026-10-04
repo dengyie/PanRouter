@@ -52,8 +52,8 @@ drivers:
     enabled: true
     limit_qps: 5
     download_concurrency: 3
-    upstream_allow: [".lanzouw.com", ".lanzou.com", ".lanzouu.com", ".xlig.cn", ".lanrar.com", ".dmpdmp.com"]
-    redirect_allow: [".lanzouw.com", ".lanzou.com", ".lanzouu.com", ".xlig.cn", ".lanrar.com", ".dmpdmp.com"]
+    upstream_allow: [".lanzouw.com", ".lanzou.com", ".lanzouu.com", ".xlig.cn", ".lanrar.com", ".dmpdmp.com", ".bakstotre.com"]
+    redirect_allow: [".lanzouw.com", ".lanzou.com", ".lanzouu.com", ".xlig.cn", ".lanrar.com", ".dmpdmp.com", ".bakstotre.com"]
 
 aria2:
   endpoint: http://127.0.0.1:6800/jsonrpc

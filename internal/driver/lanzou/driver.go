@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
 	"regexp"
@@ -35,6 +36,10 @@ var (
 	ajaxFileRe = regexp.MustCompile(`(?i)url\s*:\s*['"](https?://[^'"]*ajaxfile\.php\?file=\d+)['"]`)
 	titleRe    = regexp.MustCompile(`(?i)<title>([^<]+)</title>`)
 	sizeRe     = regexp.MustCompile(`大小[：:]\s*([\d.]+)\s*([KMG]?B)`)
+	// CDN 落地页(过 acw 后)用 JS POST ajax.php 换真实文件地址
+	verifyFileRe = regexp.MustCompile(`(?i)['"]file['"]\s*:\s*['"]([^'"]+)['"]`)
+	verifySignRe = regexp.MustCompile(`(?i)['"]sign['"]\s*:\s*['"]([^'"]+)['"]`)
+	cdnFollow    = []string{"dmpdmp.com", "lanrar.com", "xlig.cn", "feijipan.com"}
 )
 
 // isPasswordPage 识别蓝奏云密码门页面(带密码分享的入口页)。
@@ -303,8 +308,129 @@ func (d *Driver) GetDirectLink(ctx context.Context, cred *driver.Credential, ref
 	if err != nil {
 		return driver.DirectLink{}, err
 	}
+	final, err = d.followCDN(ctx, final)
+	if err != nil {
+		return driver.DirectLink{}, err
+	}
 	// 浏览器 302 由浏览器自身过 CDN 挑战;非浏览器(/stream、aria2)由 httpx acw_sc__v2 中间件解题重放。
 	return driver.DirectLink{URL: final, ExpiresAt: time.Now().Add(30 * time.Minute)}, nil
+}
+
+func shouldFollowCDN(host string) bool {
+	host = strings.ToLower(host)
+	if host == "127.0.0.1" || host == "localhost" || host == "::1" {
+		return true
+	}
+	return httpx.SuffixMatch(host, cdnFollow)
+}
+
+func isVerifyPage(body string) bool {
+	return strings.Contains(body, "down_r(") && strings.Contains(body, "ajax.php")
+}
+
+func extractVerifyTokens(body string) (file, sign string) {
+	if m := verifyFileRe.FindStringSubmatch(body); len(m) > 1 {
+		file = m[1]
+	}
+	if m := verifySignRe.FindStringSubmatch(body); len(m) > 1 {
+		sign = m[1]
+	}
+	return file, sign
+}
+
+func ztOK(raw json.RawMessage) bool {
+	s := strings.Trim(strings.TrimSpace(string(raw)), `"`)
+	return s == "1" || s == "true"
+}
+
+// followCDN 跟过蓝奏 CDN 落地页:acw 之后仍可能是「验证并下载」页,需 POST ajax.php 才拿到文件地址。
+func (d *Driver) followCDN(ctx context.Context, rawURL string) (string, error) {
+	u, err := url.Parse(rawURL)
+	if err != nil || u.Host == "" || !shouldFollowCDN(u.Hostname()) {
+		return rawURL, nil
+	}
+	req, err := http.NewRequestWithContext(ctx, "GET", rawURL, nil)
+	if err != nil {
+		return "", driver.NewErr(driver.KindUpstream, "构造请求失败", err)
+	}
+	req.Header.Set("User-Agent", BrowserUA)
+	resp, err := d.client.DoStream(req)
+	if err != nil {
+		return "", driver.NewErr(driver.KindUpstream, "蓝奏云 CDN 请求失败", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 400 {
+		return "", driver.NewErr(driver.KindUpstream, fmt.Sprintf("蓝奏云 CDN 响应异常:%d", resp.StatusCode), nil)
+	}
+	ct := strings.ToLower(resp.Header.Get("Content-Type"))
+	if i := strings.IndexByte(ct, ';'); i >= 0 {
+		ct = ct[:i]
+	}
+	ct = strings.TrimSpace(ct)
+	if ct != "" && ct != "text/html" && ct != "application/xhtml+xml" && ct != "text/plain" {
+		return rawURL, nil
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
+	if err != nil {
+		return "", driver.NewErr(driver.KindUpstream, "读取蓝奏云 CDN 响应失败", err)
+	}
+	page := string(body)
+	if !isVerifyPage(page) {
+		return rawURL, nil
+	}
+	fileTok, signTok := extractVerifyTokens(page)
+	if fileTok == "" || signTok == "" {
+		return "", driver.NewErr(driver.KindInterfaceChanged, "蓝奏云 CDN 验证页结构变化:缺少 file/sign", nil)
+	}
+	base := rawURL
+	if resp.Request != nil && resp.Request.URL != nil {
+		base = resp.Request.URL.String()
+	}
+	ajaxURL := absolutize("ajax.php", base)
+	var lastInf string
+	for _, el := range []string{"1", "2", "3"} {
+		next, inf, err := d.postVerify(ctx, ajaxURL, base, fileTok, signTok, el)
+		if err != nil {
+			return "", err
+		}
+		if next != "" {
+			return next, nil
+		}
+		lastInf = inf
+	}
+	return "", driver.NewErr(driver.KindInterfaceChanged, "蓝奏云 CDN 验证失败:"+lastInf, nil)
+}
+
+func (d *Driver) postVerify(ctx context.Context, ajaxURL, referer, fileTok, signTok, el string) (string, string, error) {
+	form := url.Values{"file": {fileTok}, "el": {el}, "sign": {signTok}}
+	req, err := http.NewRequestWithContext(ctx, "POST", ajaxURL, strings.NewReader(form.Encode()))
+	if err != nil {
+		return "", "", driver.NewErr(driver.KindUpstream, "构造请求失败", err)
+	}
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.Header.Set("User-Agent", BrowserUA)
+	req.Header.Set("Referer", referer)
+	req.Header.Set("X-Requested-With", "XMLHttpRequest")
+	res, err := d.client.Do(req)
+	if err != nil {
+		return "", "", driver.NewErr(driver.KindUpstream, "蓝奏云 CDN 验证请求失败", err)
+	}
+	var aj struct {
+		ZT  json.RawMessage `json:"zt"`
+		URL string          `json:"url"`
+		Inf string          `json:"inf"`
+	}
+	if err := json.Unmarshal(res.Body, &aj); err != nil {
+		return "", "", driver.NewErr(driver.KindInterfaceChanged, "蓝奏云 CDN ajax.php 响应结构变化", err)
+	}
+	if !ztOK(aj.ZT) || strings.TrimSpace(aj.URL) == "" {
+		return "", aj.Inf, nil
+	}
+	next := strings.TrimSpace(aj.URL)
+	if !strings.HasPrefix(next, "http://") && !strings.HasPrefix(next, "https://") {
+		next = absolutize(next, ajaxURL)
+	}
+	return next, "", nil
 }
 
 func (d *Driver) CheckCredential(ctx context.Context, cred driver.Credential) (driver.CredStatus, error) {

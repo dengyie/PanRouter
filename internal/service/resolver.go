@@ -351,7 +351,7 @@ func (r *Resolver) buildResult(pan, key string, l *repo.Link, clientUA string, c
 		DirectURL:   l.DirectLink,
 		UA:          l.UA,
 		Referer:     l.Referer,
-		NeedHeaders: len(l.CookieEnc) > 0 || l.Referer != "" || (l.UA != "" && !strings.EqualFold(l.UA, clientUA)),
+		NeedHeaders: len(cookie) > 0 || l.Referer != "" || (l.UA != "" && !strings.EqualFold(l.UA, clientUA)),
 		ExpiresAt:   l.ExpiresAt,
 		CacheHit:    cacheHit,
 	}
