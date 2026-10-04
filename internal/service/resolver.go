@@ -224,7 +224,7 @@ func boolGauge(b bool) float64 {
 }
 
 // mapErr 处理 driver 错误的副作用(账号标记等),原样返回给上层映射 HTTP 状态。
-func (r *Resolver) mapErr(pan string, acc *repo.Account, err error) error {
+func (r *Resolver) mapErr(ctx context.Context, pan string, acc *repo.Account, err error) error {
 	if err == nil {
 		return nil
 	}
@@ -236,8 +236,9 @@ func (r *Resolver) mapErr(pan string, acc *repo.Account, err error) error {
 	case driver.KindAuthExpired:
 		if acc != nil {
 			r.accounts.MarkStatus(acc.ID, "expired")
+		} else if !authed(ctx) {
+			de.UserHint = "该网盘需要登录后才能提链,请先登录;" + de.UserHint
 		} else {
-			// 无账号时的提示要指向"添加账号"而不是"更新 Cookie"
 			de.UserHint = "该网盘需要登录态,请先在「账号管理」添加账号;" + de.UserHint
 		}
 	case driver.KindRiskControl:
@@ -248,7 +249,24 @@ func (r *Resolver) mapErr(pan string, acc *repo.Account, err error) error {
 	return err
 }
 
-func (r *Resolver) pick(pan string) (*repo.Account, *driver.Credential, error) {
+type resolverCtxKey int
+
+const authedCtxKey resolverCtxKey = 1
+
+// WithAuthed 标记请求已通过管理员登录;游客解析不得读取网盘 Cookie。
+func WithAuthed(ctx context.Context, ok bool) context.Context {
+	return context.WithValue(ctx, authedCtxKey, ok)
+}
+
+func authed(ctx context.Context) bool {
+	v, _ := ctx.Value(authedCtxKey).(bool)
+	return v
+}
+
+func (r *Resolver) pick(ctx context.Context, pan string) (*repo.Account, *driver.Credential, error) {
+	if !authed(ctx) {
+		return nil, nil, nil
+	}
 	acc, cred, err := r.accounts.Pick(pan)
 	if err != nil {
 		return nil, nil, driver.NewErr(driver.KindUpstream, "读取账号凭据失败", err)
@@ -267,7 +285,7 @@ func (r *Resolver) ResolveShare(ctx context.Context, rawURL, pwd, clientUA strin
 		return nil, err
 	}
 	pan := drv.ID()
-	acc, cred, err := r.pick(pan)
+	acc, cred, err := r.pick(ctx, pan)
 	if err != nil {
 		return nil, err
 	}
@@ -276,7 +294,7 @@ func (r *Resolver) ResolveShare(ctx context.Context, rawURL, pwd, clientUA strin
 		nodes, err = drv.ResolveShare(ctx, driver.ShareLink{URL: rawURL, Pwd: pwd}, cred)
 		return err
 	})
-	if err := r.mapErr(pan, acc, err); err != nil {
+	if err := r.mapErr(ctx, pan, acc, err); err != nil {
 		return nil, err
 	}
 	truncated := listingTruncated(nodes)
@@ -353,7 +371,7 @@ func (r *Resolver) ResolveFile(ctx context.Context, rawURL, pwd, fid string, own
 		return r.buildResult(pan, key, l, clientUA, true), nil
 	}
 
-	acc, cred, err := r.pick(pan)
+	acc, cred, err := r.pick(ctx, pan)
 	if err != nil {
 		return nil, err
 	}
@@ -371,7 +389,7 @@ func (r *Resolver) ResolveFile(ctx context.Context, rawURL, pwd, fid string, own
 		return err
 	})
 	release()
-	if err := r.mapErr(pan, acc, err); err != nil {
+	if err := r.mapErr(ctx, pan, acc, err); err != nil {
 		return nil, err
 	}
 	name, size, ext := r.fileMeta(key, fid, ref)

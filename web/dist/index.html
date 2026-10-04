@@ -37,22 +37,25 @@
   <div class="sub">自用网盘直链聚合 · 302 / aria2 / 中转自动择路</div>
 
   <div class="card" id="loginCard">
-    <label>访问令牌(登录用户名密码换取,或直接填 config 中的 api_token)</label>
-    <div class="row">
-      <input id="user" placeholder="用户名">
-      <input id="pass" type="password" placeholder="密码">
+    <label>管理员登录(夸克 Cookie / aria2;蓝奏等免登录盘无需登录)</label>
+    <div id="loginForm">
+      <div class="row">
+        <input id="user" placeholder="用户名">
+        <input id="pass" type="password" placeholder="密码">
+      </div>
+      <button onclick="login()">登录</button>
     </div>
-    <button onclick="login()">登录</button>
+    <button class="ghost hide" id="logoutBtn" onclick="logout()">退出</button>
     <div id="loginMsg"></div>
   </div>
 
-  <div class="card hide" id="mainCard">
+  <div class="card" id="mainCard">
     <label>分享链接</label>
     <input id="url" placeholder="https://pan.quark.cn/s/xxxx 或 https://xxx.lanzouw.com/xxxx">
     <label>提取码(可空)</label>
     <input id="pwd" placeholder="1234" style="max-width:200px">
     <button onclick="resolve()">解析</button>
-    <span style="margin-left:8px;color:var(--sub);font-size:12px">解析后直接给出直链;夸克需先在下方添加 Cookie</span>
+    <span style="margin-left:8px;color:var(--sub);font-size:12px">游客可解析蓝奏等免登录盘;夸克需登录后添加 Cookie</span>
     <div id="shareMsg"></div>
     <div id="files"></div>
     <div id="linkBox"></div>
@@ -96,9 +99,9 @@ async function api(path, opts={}) {
 
 function logout() {
   localStorage.removeItem('panrouter_token'); TOKEN = '';
-  $('mainCard').classList.add('hide');
   $('accCard').classList.add('hide');
-  $('loginCard').classList.remove('hide');
+  $('logoutBtn').classList.add('hide');
+  $('loginForm').classList.remove('hide');
 }
 
 async function login() {
@@ -110,11 +113,10 @@ async function login() {
 }
 
 function enter() {
-  $('loginCard').classList.add('hide');
-  $('mainCard').classList.remove('hide');
+  $('loginForm').classList.add('hide');
   $('accCard').classList.remove('hide');
-  loadAccounts(); // 首个鉴权调用;401 由 api() 全局处理并回登录页
-  fetch('/healthz').then(r=>r.json()).then(h=>$('ver').textContent='v'+h.version).catch(()=>{});
+  $('logoutBtn').classList.remove('hide');
+  loadAccounts();
 }
 
 async function resolve() {
@@ -155,8 +157,7 @@ async function link(fid) {
       <div class="msg info" style="margin-top:12px">
         <b>${esc(d.file_name)}</b> · 路径:<span class="badge ${badge}">${esc(d.route)}</span> ·
         缓存:${d.cache_hit?'命中':'新解析'} · 有效期至 ${esc(new Date(d.expires_at).toLocaleString())}<br>
-        <a href="${esc(d.download_url)}" target="_blank">点此下载(自动择路)</a> ·
-        <a href="javascript:push('${esc(fid)}')">推送到 aria2</a><br>
+        <a href="${esc(d.download_url)}" target="_blank">点此下载(自动择路)</a>${TOKEN?` · <a href="javascript:push('${esc(fid)}')">推送到 aria2</a>`:''}<br>
         <code>${esc(aria2)}</code>
         <button class="ghost" onclick="navigator.clipboard.writeText(this.previousElementSibling.textContent)">复制命令</button>
       </div>`;
@@ -195,6 +196,7 @@ function fmtSize(n) {
   return n.toFixed(1)+' '+u[i];
 }
 
+fetch('/healthz').then(r=>r.json()).then(h=>$('ver').textContent='v'+h.version).catch(()=>{});
 if (TOKEN) { enter(); }
 </script>
 </body>

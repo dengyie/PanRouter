@@ -9,6 +9,8 @@ import (
 
 	"github.com/dengyie/panrouter/internal/config"
 	"github.com/dengyie/panrouter/internal/driver"
+	"github.com/dengyie/panrouter/internal/pkg/crypto"
+	"github.com/dengyie/panrouter/internal/repo"
 )
 
 // twoFileDriver 列出两个文件,GetDirectLink 行为由 fn 决定。
@@ -50,7 +52,7 @@ func TestResolveShareAuthExpiredStops(t *testing.T) {
 	}}
 	resolver, _ := newTestResolver(t, d, config.DriverCommon{Enabled: true, LimitQPS: 1000, DownloadConc: 3})
 
-	res, err := resolver.ResolveShare(context.Background(), testShareURL, "", "")
+	res, err := resolver.ResolveShare(WithAuthed(context.Background(), true), testShareURL, "", "")
 	if err != nil {
 		t.Fatalf("ResolveShare 遇 AuthExpired 应仍返回列表, got %v", err)
 	}
@@ -108,6 +110,51 @@ func TestResolveShareTruncationHint(t *testing.T) {
 	}
 	if !strings.Contains(res.Hint, "仅展开前") {
 		t.Fatalf("hint=%q", res.Hint)
+	}
+}
+
+type credSpyDriver struct {
+	fakeDriver
+	cookie atomic.Value // string
+}
+
+func (d *credSpyDriver) GetDirectLink(_ context.Context, cred *driver.Credential, ref driver.FileRef) (driver.DirectLink, error) {
+	if cred != nil {
+		d.cookie.Store(cred.Cookie)
+	} else {
+		d.cookie.Store("")
+	}
+	return d.fakeDriver.GetDirectLink(context.Background(), cred, ref)
+}
+
+func TestGuestResolveSkipsAccountCookie(t *testing.T) {
+	d := &credSpyDriver{fakeDriver: fakeDriver{linkURL: "https://up.invalid/f"}}
+	resolver, store := newTestResolver(t, d, config.DriverCommon{Enabled: true, LimitQPS: 1000, DownloadConc: 3})
+	enc, err := crypto.New("k").EncryptBytes([]byte("secret-cookie"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.CreateAccount(&repo.Account{PanType: "fake", Name: "t", CredEnc: enc, Status: "ok", CredVersion: 1}); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := resolver.ResolveShare(context.Background(), testShareURL, "", ""); err != nil {
+		t.Fatal(err)
+	}
+	got, _ := d.cookie.Load().(string)
+	if got != "" {
+		t.Fatalf("游客不得读取账号 Cookie, got %q", got)
+	}
+	if err := store.DB().Where("1 = 1").Delete(&repo.Link{}).Error; err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := resolver.ResolveShare(WithAuthed(context.Background(), true), testShareURL, "", ""); err != nil {
+		t.Fatal(err)
+	}
+	got, _ = d.cookie.Load().(string)
+	if got != "secret-cookie" {
+		t.Fatalf("登录后应使用账号 Cookie, got %q", got)
 	}
 }
 

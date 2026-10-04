@@ -11,7 +11,7 @@ go build -o panrouter ./cmd/panrouter
 ./panrouter                            # 默认监听 127.0.0.1:6400
 ```
 
-浏览器打开 `http://127.0.0.1:6400`,用 `admin / admin123` 登录(**务必先改密码**),粘贴分享链接解析。
+浏览器打开 `http://127.0.0.1:6400`,粘贴蓝奏等免登录分享即可解析。夸克需要管理员登录并添加 Cookie(**务必先改密码**)。
 
 ## 快速开始(Docker)
 
@@ -28,9 +28,9 @@ docker compose up -d --build
 # 登录换 token
 curl -s localhost:6400/api/v1/auth/login -d '{"username":"admin","password":"admin123"}'
 
-# 解析分享 → 文件列表并自动提链(files[].download_url;夸克最多 2 个且需先添加 Cookie)
-curl -s localhost:6400/api/v1/resolve -H "Authorization: Bearer $T" \
-  -d '{"url":"https://pan.quark.cn/s/xxxx"}'
+# 解析分享(游客可解析蓝奏;夸克需登录后添加 Cookie)
+curl -s localhost:6400/api/v1/resolve \
+  -d '{"url":"https://xxx.lanzouw.com/xxxx"}'
 
 # 刷新单个文件直链(可选)
 curl -s localhost:6400/api/v1/resolve -H "Authorization: Bearer $T" \

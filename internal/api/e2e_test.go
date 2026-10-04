@@ -246,6 +246,23 @@ func TestE2EAuthFlow(t *testing.T) {
 	if st, _ := e.do(t, "GET", "/metrics", "", ""); st != http.StatusOK {
 		t.Fatalf("metrics: %d", st)
 	}
+
+	// 游客可解析免登录盘;账号与 aria2 仍需登录
+	st, body := e.do(t, "POST", "/api/v1/resolve", "", `{"url":"`+e2eShareURL+`"}`)
+	if st != http.StatusOK {
+		t.Fatalf("guest resolve: %d %v", st, body)
+	}
+	files, _ := body["files"].([]any)
+	if len(files) == 0 {
+		t.Fatalf("guest resolve empty: %v", body)
+	}
+	first := files[0].(map[string]any)
+	if first["download_url"] == nil || first["download_url"] == "" {
+		t.Fatalf("guest auto-link missing download_url: %v", first)
+	}
+	if st, _ := e.do(t, "POST", "/api/v1/downloads", "", `{"pan":"fake","share_key":"x","fid":"f1"}`); st != http.StatusUnauthorized {
+		t.Fatalf("guest downloads: %d", st)
+	}
 }
 
 // ---- 解析与三条下载路径 ----

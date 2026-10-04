@@ -1,4 +1,4 @@
-# PanRouter — 网盘直链聚合与加速下载服务 · 方案设计 v1.1.10
+# PanRouter — 网盘直链聚合与加速下载服务 · 方案设计 v1.1.11
 
 > 自用优先的单机服务:聚合主流网盘的分享解析/提链,缓存直链,按直链特性自动在 **302 透传 / aria2 直下 / 服务端中转** 三条路径中选择最优下载方式。
 > 定位:个人自部署、单管理员、可接受登录态(Cookie / Token)。**不破解限速、不绕过会员权限、仅解析用户主动提供的分享链接。**
@@ -278,8 +278,8 @@ POST /api/v1/downloads {fid, dest, options?}
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
-| POST | `/resolve` | `{url, pwd, fid?, ua?}` → 无 fid 时列文件并自动提链(files[].download_url);有 fid 时单文件直链 |
-| POST | `/resolve/batch` | `{items: [{url, pwd, fid?}]}` → 批量解析(文件夹提链;串行经 limiter,返回逐项状态) |
+| POST | `/resolve` | `{url, pwd, fid?, ua?}` → 游客可调用(免登录盘);登录后才读取网盘 Cookie。无 fid 时列文件并自动提链 |
+| POST | `/resolve/batch` | `{items: [{url, pwd, fid?}]}` → 游客可调用;批量解析(串行经 limiter) |
 | GET | `/d/{pan}/{fid}` | 302 直链;Can302=false 时自动 302 到 /stream(带签名) |
 | GET | `/stream/{fid}?sig=` | 中转流(签名 URL,支持 Range) |
 | GET | `/json/{pan}/{fid}` | 302 的 JSON 版(供脚本) |
@@ -290,7 +290,7 @@ POST /api/v1/downloads {fid, dest, options?}
 | POST/GET | `/downloads`、`/downloads/{gid}` | 推送 aria2(URL+headers 由服务端选择)、查询进度;`/downloads/batch` 批量 |
 | GET | `/healthz` `/readyz` `/metrics` | 健康检查、Prometheus 指标 |
 
-- 认证:Web 端 JWT(Cookie,HttpOnly);脚本端 `Authorization: Bearer <api-token>`
+- 认证:`/resolve` 可选登录(游客不碰 Cookie);账号/aria2/`/json` 必须登录;脚本端 `Authorization: Bearer <api-token>`
 - 错误格式:`{code, kind, message, retriable, hint}`——`kind` 即 §4.2 的 Kind,`hint` 为可操作提示
 - `/d`、`/stream` 的签名:HMAC(fid + cred_version, master_key) + 过期时间,**默认 TTL 72h**(≥ 最长下载时长);签名只在建立连接时校验,Range 续传复用同一 URL,不会中途 401
 
@@ -353,6 +353,7 @@ driver 是变更频率最高的模块,**必须在不碰真实账号的前提下�
 | **S2.1 蓝奏云 CDN 二次验证页** | 过 acw 后仍可能落到「验证并下载」HTML(`down_r` + POST `ajax.php`),浏览器 302 与 /stream 都拿不到文件 | **已闭环**(v1.1.8):`GetDirectLink` 跟过落地页,提取 file/sign 后 POST ajax.php 换真实文件 URL;NeedHeaders 改看明文 Cookie 而非密文长度 |
 | **S3 一键提链** | 分享根节点是文件夹时页面不给出提链;解析与提链两步过繁琐 | **已闭环**(v1.1.9):夸克 `ResolveShare` 按 `pdir_fid` 递归展开目录;无 fid 的 resolve 自动提链;前端直接给出下载。夸克直链仍需账号 Cookie |
 | **S3.1 一键提链生产化** | 自动提链无请求截止、失败静默 200、夸克 N=8 易触 CF 524、截断无提示、FileItem 拷贝过重、`.codex-memory` 入库 | **已闭环**(v1.1.10):resolve 90s deadline;剩余不足 15s 停提链;失败 warn(pan/fid/kind/hint);夸克自动提链 2;截断 `truncated`+hint;FileItem 只留 download_url/link_error/route;记忆目录 gitignore |
+| **S3.2 游客解析** | 除夸克 Cookie 外无其它账号资源,VPS 可放宽 | **已闭环**(v1.1.11):`/resolve` 对游客开放;未登录不 Pick 账号 Cookie;账号/aria2/`/json` 仍需登录;前端默认展示解析框 |
 
 ---
 
@@ -379,6 +380,7 @@ driver 是变更频率最高的模块,**必须在不碰真实账号的前提下�
 
 ## 变更记录
 
+- **v1.1.11(2026-10-05)**:游客解析——`POST /resolve`/`batch` 无需登录;游客上下文不读取网盘 Cookie(夸克仍须管理员登录);账号、aria2、`/json` 保持鉴权;前端默认打开解析框
 - **v1.1.10(2026-10-04)**:一键提链生产化——`POST /resolve` 与 `ResolveShare` 加 90s 截止,剩余不足 15s 不再自动提链;自动提链失败打 warn(pan/fid/kind/hint),AuthExpired 仍停后续并 200+hint;夸克自动提链上限 2、免登录盘仍 8;目录遍历截断写 `truncated` 与 hint;FileItem 不再拷贝 ResolveFileResult 全字段;前端合并提链分支并展示行内错误;`.codex-memory/` 移出公共仓
 - **v1.1.9(2026-10-04)**:一键提链——夸克分享目录按 `pdir_fid` 递归展开(深度 8 / 文件 200 / 目录 64),`ResolveShare` 对前 8 个文件自动 `ResolveFile`;AuthExpired 立刻停并在 `hint` 提示加 Cookie;前端有 `download_url` 时直接给出下载,不再强制二次点提链。夸克直链仍依赖账号 Cookie(转存链未变)
 - **v1.1.8(2026-10-04)**:蓝奏云 CDN 二次验证页——过 acw 后 dmpdmp 仍可能返回「验证并下载」HTML,需 POST `ajax.php`(file/sign/el)才拿到文件地址;`lanzou.followCDN` 在 `GetDirectLink` 跟过该页,合约测试覆盖落地页与非 HTML 跳过;NeedHeaders 改为解密后的明文 Cookie 判断(空 Cookie 的 AES 密文非空曾误标 need_headers,前端会走 /stream);白名单补 `.bakstotre.com`(落地页静态资源 host,ajax 成功后偶发跳转)

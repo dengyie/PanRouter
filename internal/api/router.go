@@ -56,10 +56,13 @@ func Router(d Deps) http.Handler {
 
 	r.Route("/api/v1", func(api chi.Router) {
 		api.Post("/auth/login", d.handleLogin)
+		api.Group(func(pub chi.Router) {
+			pub.Use(d.optionalAuth)
+			pub.Post("/resolve", d.handleResolve)
+			pub.Post("/resolve/batch", d.handleResolveBatch)
+		})
 		api.Group(func(pr chi.Router) {
 			pr.Use(d.auth)
-			pr.Post("/resolve", d.handleResolve)
-			pr.Post("/resolve/batch", d.handleResolveBatch)
 			pr.Get("/json/{pan}/{key}/{fid}", d.handleDirectJSON)
 			pr.Get("/accounts", d.handleListAccounts)
 			pr.Post("/accounts", d.handleCreateAccount)

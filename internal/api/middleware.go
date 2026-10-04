@@ -13,6 +13,7 @@ import (
 	"github.com/go-chi/chi/v5/middleware"
 
 	"github.com/dengyie/panrouter/internal/driver"
+	"github.com/dengyie/panrouter/internal/service"
 )
 
 type ctxKey int
@@ -65,23 +66,42 @@ func (d *Deps) recoverer(next http.Handler) http.Handler {
 	})
 }
 
+func bearerToken(r *http.Request) string {
+	return strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+}
+
+func (d *Deps) tokenOK(token string) bool {
+	if token == "" {
+		return false
+	}
+	apiToken := d.Cfg.Get().Auth.APIToken
+	if apiToken != "" && subtle.ConstantTimeCompare([]byte(token), []byte(apiToken)) == 1 {
+		return true
+	}
+	_, err := verifyJWT(d.Cfg.Get().Auth.JWTSecret, token)
+	return err == nil
+}
+
+// optionalAuth:游客可过;已登录则在 ctx 标记,解析层才允许读取网盘 Cookie。
+func (d *Deps) optionalAuth(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ok := d.tokenOK(bearerToken(r))
+		next.ServeHTTP(w, r.WithContext(service.WithAuthed(r.Context(), ok)))
+	})
+}
+
 // auth:Web 端 JWT 与脚本端 API Token 二选一(设计文档 §6)。
 func (d *Deps) auth(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		token := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+		token := bearerToken(r)
 		if token == "" {
 			writeErr(w, driver.NewErr(driver.KindAuthExpired, "未登录或缺少 Authorization", nil))
 			return
 		}
-		apiToken := d.Cfg.Get().Auth.APIToken
-		if apiToken != "" && subtle.ConstantTimeCompare([]byte(token), []byte(apiToken)) == 1 {
-			next.ServeHTTP(w, r)
+		if !d.tokenOK(token) {
+			writeErr(w, driver.NewErr(driver.KindAuthExpired, "登录已过期,请重新登录", nil))
 			return
 		}
-		if _, err := verifyJWT(d.Cfg.Get().Auth.JWTSecret, token); err == nil {
-			next.ServeHTTP(w, r)
-			return
-		}
-		writeErr(w, driver.NewErr(driver.KindAuthExpired, "登录已过期,请重新登录", nil))
+		next.ServeHTTP(w, r.WithContext(service.WithAuthed(r.Context(), true)))
 	})
 }
