@@ -25,6 +25,10 @@ type AccountService struct {
 	sf singleflight.Group // 内部并发安全,无需外层互斥
 }
 
+// credCheckBudget 是共享凭据检查任务的独立期限:不跟随任何一个 HTTP 请求的
+// 生命周期,也不受看门狗 ticker 取消影响;上游卡死时单轮最多占用该时长。
+const credCheckBudget = 60 * time.Second
+
 func NewAccountService(store *repo.Store, aes *crypto.AES, met *metrics.Registry, log *loggerType) *AccountService {
 	return &AccountService{store: store, aes: aes, met: met, log: log}
 }
@@ -65,13 +69,18 @@ func (s *AccountService) Check(ctx context.Context, accID uint, drv driver.Drive
 }
 
 // checkAcc 是 singleflight 校验链的核心;Check 与 Refresh 共用,账号只查一次。
+// 共享任务使用独立有界 ctx(credCheckBudget),不绑定首个调用者——首调(管理页
+// HTTP 请求)取消不拖垮看门狗与其他等待者(P2-12 同类);每个调用者在消费结果前
+// 仍会检查自身 ctx 的取消。
 func (s *AccountService) checkAcc(ctx context.Context, acc *repo.Account, drv driver.Driver) (driver.CredStatus, error) {
 	v, err, _ := s.sf.Do(fmt.Sprintf("acc:%d", acc.ID), func() (any, error) {
+		tctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), credCheckBudget)
+		defer cancel()
 		cred, err := s.DecryptCred(acc)
 		if err != nil {
 			return driver.CredStatus{Valid: false, Message: err.Error()}, nil
 		}
-		st, err := drv.CheckCredential(ctx, *cred)
+		st, err := drv.CheckCredential(tctx, *cred)
 		if err != nil {
 			return driver.CredStatus{}, err
 		}
@@ -88,6 +97,9 @@ func (s *AccountService) checkAcc(ctx context.Context, acc *repo.Account, drv dr
 		s.log.Infof("credential checked: account=%d pan=%s valid=%v", acc.ID, acc.PanType, st.Valid)
 		return st, nil
 	})
+	if cerr := ctx.Err(); cerr != nil {
+		return driver.CredStatus{}, cerr
+	}
 	if err != nil {
 		return driver.CredStatus{}, err
 	}

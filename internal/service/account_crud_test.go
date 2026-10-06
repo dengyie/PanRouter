@@ -2,7 +2,9 @@ package service
 
 import (
 	"context"
+	"errors"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/dengyie/panrouter/internal/driver"
@@ -118,5 +120,71 @@ func TestAccountServiceRefresh(t *testing.T) {
 	}
 	if _, err := svc.Refresh(context.Background(), acc.ID, func(string) (driver.Driver, bool) { return nil, false }); err == nil {
 		t.Fatal("missing driver must fail")
+	}
+}
+
+// gateCheckDriver 校验阻塞在 gate 上,验证共享任务独立于首调者 ctx。
+type gateCheckDriver struct {
+	stubDriver
+	enteredOnce sync.Once
+	entered     chan struct{}
+	gate        chan struct{}
+}
+
+func (d *gateCheckDriver) CheckCredential(ctx context.Context, c driver.Credential) (driver.CredStatus, error) {
+	d.enteredOnce.Do(func() { close(d.entered) })
+	<-d.gate
+	return d.stubDriver.CheckCredential(ctx, c)
+}
+
+// 回归(review 2026-10-07,P2-12 同类):singleflight 共享的凭据检查任务必须
+// 使用独立有界 ctx,不绑定首个调用者。首调(管理页手动 Refresh,HTTP ctx)
+// 取消后,共享任务继续完成并落库,后续等待者仍拿到结果;首调自身响应其 ctx。
+func TestRefreshFirstCallerCancelDoesNotKillSharedCheck(t *testing.T) {
+	drv := &gateCheckDriver{
+		stubDriver: stubDriver{valid: true},
+		entered:    make(chan struct{}),
+		gate:       make(chan struct{}),
+	}
+	svc, store, _ := newTestAccService(t)
+	acc, err := svc.Create("fake", "n", "c=1", panKnown)
+	if err != nil {
+		t.Fatal(err)
+	}
+	driverFor := func(string) (driver.Driver, bool) { return drv, true }
+
+	type res struct {
+		st  driver.CredStatus
+		err error
+	}
+	ctx1, cancel := context.WithCancel(context.Background())
+	ch1 := make(chan res, 1)
+	go func() {
+		st, e := svc.Refresh(ctx1, acc.ID, driverFor)
+		ch1 <- res{st, e}
+	}()
+	<-drv.entered // 共享任务已进入真实校验
+	cancel()      // 首调取消
+
+	ch2 := make(chan res, 1)
+	go func() {
+		st, e := svc.Refresh(context.Background(), acc.ID, driverFor)
+		ch2 <- res{st, e}
+	}()
+
+	close(drv.gate) // 放行真实校验
+	r1 := <-ch1
+	if !errors.Is(r1.err, context.Canceled) {
+		t.Fatalf("首调应响应自身 ctx 取消, got %v", r1.err)
+	}
+	r2 := <-ch2
+	if r2.err != nil {
+		t.Fatalf("等待者应在首调取消后仍拿到结果, got %v", r2.err)
+	}
+	if !r2.st.Valid {
+		t.Fatalf("共享结果丢失: %+v", r2.st)
+	}
+	if got, _ := store.GetAccount(acc.ID); got == nil || got.Status != "ok" {
+		t.Fatalf("共享任务应已完成落库: %+v", got)
 	}
 }

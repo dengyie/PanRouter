@@ -25,8 +25,8 @@ type BackgroundOptions struct {
 }
 
 // StartBackground 启动凭据看门狗与配置热加载协程;返回的 stop 取消两者并
-// 等待其退出(不关 Store,资源关闭由 Shutdown 统一排序)。重复调用安全,
-// 并记录到 App 供 Shutdown 兜底(main 忘调 stop 时仍能优雅收口)。
+// 等待其退出(不关 Store,资源关闭由 Shutdown 统一排序)。重复调用安全;
+// Shutdown 经 App.bgCancel/bgDone 直接收口,main 无需持有 stop。
 func (a *App) StartBackground(opts BackgroundOptions) (stop func()) {
 	ctx, cancel := context.WithCancel(context.Background())
 	var wg sync.WaitGroup
@@ -53,18 +53,36 @@ func (a *App) StartBackground(opts BackgroundOptions) (stop func()) {
 		}()
 	}
 
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+
 	once := sync.Once{}
 	stopFn := func() {
 		once.Do(func() {
 			cancel()
-			wg.Wait()
+			waitForDone(done, stopGrace)
 		})
 	}
-	a.stopBg = stopFn
+	a.bgCancel, a.bgDone = cancel, done
 	return stopFn
 }
 
-// watchdogLoop 周期校验全部账号凭据;单账号失败不中断整轮。
+// stopGrace 是 stop() 等待后台协程退出的上限:协程均响应 ctx 取消;万一协程
+// 卡在不可取消的阻塞点(如第三方 driver 忽略 ctx),超过 grace 不再挂死调用方。
+const stopGrace = 10 * time.Second
+
+func waitForDone(done <-chan struct{}, grace time.Duration) bool {
+	select {
+	case <-done:
+		return true
+	case <-time.After(grace):
+		return false
+	}
+}
+
 func (a *App) watchdogLoop(ctx context.Context, interval time.Duration) {
 	t := time.NewTicker(interval)
 	defer t.Stop()
@@ -113,11 +131,18 @@ func (a *App) reloadLoop(ctx context.Context, interval time.Duration, path strin
 	}
 }
 
-// Shutdown 优雅停机:停后台任务并等待退出,再关闭 Store。
-// ctx 仅约束等待上限——超时仍会继续关闭 Store,避免进程挂死。
+// Shutdown 优雅停机:取消后台任务并等待退出,再关闭 Store。
+// 等待受 ctx 上限约束:凭据共享校验用 WithoutCancel 派生独立 ctx(不随停机
+// 取消中断),超时后仍关库——在途任务收尾拿连接已关错误报出,不 panic、不挂死。
 func (a *App) Shutdown(ctx context.Context) error {
-	if a.stopBg != nil {
-		a.stopBg()
+	if a.bgCancel != nil {
+		a.bgCancel()
+	}
+	if a.bgDone != nil {
+		select {
+		case <-a.bgDone:
+		case <-ctx.Done():
+		}
 	}
 	return a.Store.Close()
 }

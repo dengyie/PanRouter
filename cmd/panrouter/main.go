@@ -80,7 +80,7 @@ func main() {
 	}
 
 	// 后台任务(凭据看门狗 30min、配置热加载 5s)由 App 编排;
-	// stop 停止协程并等待退出,Shutdown 时兜底再调(幂等)。
+	// 取消与等待由 Shutdown 统一收口,无需单独持有 stop。
 	a.StartBackground(app.BackgroundOptions{ConfigPath: usedPath})
 
 	go func() {

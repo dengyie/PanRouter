@@ -68,7 +68,8 @@ type App struct {
 
 	apiClients    map[string]*httpx.Client
 	streamClients map[string]*httpx.Client
-	stopBg        func() // StartBackground 注册的停机函数;Shutdown 兜底调用
+	bgCancel      func()        // 后台 ctx 取消;Shutdown 直接用,等待受其自身 ctx 界定
+	bgDone        chan struct{} // 后台协程全部退出信号;nil 表示未启动后台
 }
 
 // Build 按 config 装配全部依赖。中途失败时负责释放已建资源。
