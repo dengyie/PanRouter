@@ -62,12 +62,18 @@
   </div>
 
   <div class="card hide" id="accCard">
-    <label>夸克账号 Cookie(自用登录态;页面登录夸克后从开发者工具复制)</label>
-    <div class="row">
-      <input id="accName" placeholder="备注名">
-      <input id="accCookie" placeholder="__pus=...; __puus=...; ...">
+    <label>夸克账号(推荐:手机夸克 App 扫码,免手动贴 Cookie;或自开发者工具复制)</label>
+    <button class="ghost" onclick="qrAdd()">扫码添加账号</button>
+    <div id="qrBox" class="hide" style="text-align:center">
+      <img id="qrImg" alt="夸克扫码二维码" style="margin-top:12px;border:6px solid #fff;border-radius:6px">
+      <div id="qrMsg"></div>
+      <button class="ghost" onclick="stopQr(true)">取消扫码</button>
     </div>
-    <button class="ghost" onclick="addAccount()">添加账号</button>
+    <div class="row" style="margin-top:14px">
+      <input id="accName" placeholder="备注名">
+      <input id="accCookie" placeholder="手动方式:__pus=...; __puus=...; ...">
+    </div>
+    <button class="ghost" onclick="addAccount()">Cookie 手动添加</button>
     <div id="accList"></div>
   </div>
 </div>
@@ -99,6 +105,7 @@ async function api(path, opts={}) {
 
 function logout() {
   localStorage.removeItem('panrouter_token'); TOKEN = '';
+  stopQr(true); // 退出登录同时停掉在途扫码轮询
   $('accCard').classList.add('hide');
   $('logoutBtn').classList.add('hide');
   $('loginForm').classList.remove('hide');
@@ -188,6 +195,31 @@ async function addAccount() {
 }
 async function refreshAcc(id) { try { await api(`/accounts/${id}/refresh`, {method:'POST'}); loadAccounts(); } catch(e){ alert(e.message); } }
 async function delAcc(id) { try { await api(`/accounts/${id}`, {method:'DELETE'}); loadAccounts(); } catch(e){ alert(e.message); } }
+
+// 扫码添加:qr/token 直出 PNG data URI → <img> 渲染;2s 轮询到 confirmed/expired 停止。
+let qrTimer = null;
+async function qrAdd() {
+  stopQr(true);
+  try {
+    const d = await api('/accounts/quark/qr/token');
+    if (d.png) { $('qrImg').src = d.png; } else { $('qrImg').removeAttribute('src'); }
+    $('qrMsg').innerHTML = `手机夸克 App 扫一扫<span style="color:var(--sub);font-size:12px">(无法显示时访问 <a href="${esc(d.url)}" target="_blank">${esc(d.url.slice(0,40))}…</a>)</span>`;
+    $('qrBox').classList.remove('hide');
+    const tick = async () => {
+      try {
+        const p = await api('/accounts/quark/qr/poll', {method:'POST', body: JSON.stringify({token:d.token, name:$('accName').value || '扫码账号'})});
+        if (p.status === 'confirmed') { stopQr(); $('qrMsg').innerHTML = `<div class="msg info">账号「${esc(p.account?.name||'')}」已添加</div>`; loadAccounts(); return; }
+        if (p.status === 'expired') { stopQr(); $('qrMsg').innerHTML = '<div class="msg err">二维码已过期,请重新点击扫码</div>'; return; }
+        qrTimer = setTimeout(tick, 2000);
+      } catch(e) { stopQr(); $('qrMsg').innerHTML = `<div class="msg err">${esc(e.message)}</div>`; }
+    };
+    qrTimer = setTimeout(tick, 2000);
+  } catch(e) { $('qrMsg').innerHTML = `<div class="msg err">${esc(e.message)}</div>`; $('qrBox').classList.remove('hide'); }
+}
+function stopQr(hide) {
+  if (qrTimer) { clearTimeout(qrTimer); qrTimer = null; }
+  if (hide) { $('qrBox').classList.add('hide'); $('qrMsg').innerHTML=''; }
+}
 
 function fmtSize(n) {
   if (!n) return '-';

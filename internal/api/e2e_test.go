@@ -5,6 +5,7 @@ package api
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -552,6 +553,16 @@ func TestE2EQuarkQRLogin(t *testing.T) {
 	}
 	if u, _ := body["url"].(string); !strings.HasPrefix(u, "https://su.quark.cn/") {
 		t.Fatalf("qr url: %v", body["url"])
+	}
+	// png 字段:后端直出 data URI,前端 <img src> 零依赖渲染;必须是合法 PNG。
+	pngURI, _ := body["png"].(string)
+	const pngPrefix = "data:image/png;base64,"
+	if !strings.HasPrefix(pngURI, pngPrefix) {
+		t.Fatalf("qr png data URI missing: %q", pngURI)
+	}
+	raw, err := base64.StdEncoding.DecodeString(strings.TrimPrefix(pngURI, pngPrefix))
+	if err != nil || len(raw) < 8 || string(raw[:8]) != "\x89PNG\r\n\x1a\n" {
+		t.Fatalf("qr png invalid: err=%v magic=%x", err, raw[:min(8, len(raw))])
 	}
 
 	st, body = e.do(t, "POST", "/api/v1/accounts/quark/qr/poll", e.token,

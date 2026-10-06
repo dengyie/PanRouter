@@ -159,7 +159,7 @@ panrouter/
 
 ### 5.1 夸克扫码登录(免手动贴 Cookie)
 
-- 端点:`GET /api/v1/accounts/quark/qr/token`(返回 `{token, url}`,前端把 `url` 渲染成二维码);`POST /api/v1/accounts/quark/qr/poll {token, name?}` 轮询状态
+- 端点:`GET /api/v1/accounts/quark/qr/token`(返回 `{token, url, png}`,`png` 为 `data:image/png;base64` data URI——后端 skip2/go-qrcode 直出,前端 `<img src>` 零依赖渲染,生成失败时省略该字段回退展示链接);`POST /api/v1/accounts/quark/qr/poll {token, name?}` 轮询状态
 - 状态机:`pending`(未扫/确认中)→ `confirmed`(返回 `account`,已自动以换好的 Cookie 建号入库)或 `expired`(二维码失效,重新取 token)
 - 上游流程(官方 CAS,client_id=532):`uop.quark.cn/cas/ajax/getTokenForQrcodeLogin` 取 token → 二维码 `su.quark.cn/4_eMHBJ?token=…&ssb=weblogin` → 轮询 `getServiceTicketByQrcodeToken` 拿 `service_ticket` → `pan.quark.cn/account/info?st=<ticket>&lw=scan` 的 Set-Cookie 即登录态(含 __puus 强校验项),`joinCookies` 提取后经 `AccountService.Create` 加密入库
 - 契约:token 一次性且服务端无会话存储(前端持 token 轮询,O(1) 状态);CAS 业务码 80005000/1/2=等待、80005003/4=过期、2000000=成功;Cookie 检测必须含 __pus/__puus 否则报错;两个端点均为登录态保护(POST/GET 均在 auth 组)
