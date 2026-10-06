@@ -9,6 +9,7 @@
 - 相对路径：`fetch('/api/v1...')`、`fetch('/healthz')`
 - 登录：`POST /api/v1/auth/login` → `{token, expires_in}`，存 `localStorage.panrouter_token`，请求头 `Authorization: Bearer …`
 - 解析：`POST /api/v1/resolve`（游客可解析免登录盘；夸克 Cookie 仅登录后可用）
+- 扫码加号：`GET /api/v1/accounts/quark/qr/token` → `{token, url, png}`（`png` 为 data URI，`<img src>` 直接用）；`POST /accounts/quark/qr/poll {token, name?}` 2s 轮询到 `confirmed`/`expired` 停止
 - 下载：用响应里的绝对 `download_url` / `stream_url` 做页面跳转（`/d` `/stream` 在 API 源站，HMAC 签名），不要 XHR 跟 CDN
 - 错误体：`{code, kind, message, retriable}`；`401` 且已有 token 时清会话
 - **不加 CORS**。开发走代理，生产同源或 Caddy 同域反代

@@ -2,12 +2,14 @@ package api
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"net/http"
 	"strconv"
 	"time"
 
 	"github.com/go-chi/chi/v5"
+	"github.com/skip2/go-qrcode"
 
 	"github.com/dengyie/panrouter/internal/driver"
 	"github.com/dengyie/panrouter/internal/driver/quark"
@@ -183,7 +185,22 @@ func (d *Deps) handleQRToken(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, qr)
+	// png 直出 data URI,前端 <img src> 零依赖渲染;生成失败降级为省略字段
+	// (前端回退展示链接),不因表现层失败拒掉扫码会话。
+	resp := map[string]any{"token": qr.Token, "url": qr.URL}
+	if png, perr := qrPNG(qr.URL); perr == nil {
+		resp["png"] = png
+	}
+	writeJSON(w, http.StatusOK, resp)
+}
+
+// qrPNG 把扫码 URL 渲染成 data URI PNG。纯本地计算,无外部 I/O。
+func qrPNG(u string) (string, error) {
+	raw, err := qrcode.Encode(u, qrcode.Medium, 256)
+	if err != nil {
+		return "", err
+	}
+	return "data:image/png;base64," + base64.StdEncoding.EncodeToString(raw), nil
 }
 
 type qrPollReq struct {
