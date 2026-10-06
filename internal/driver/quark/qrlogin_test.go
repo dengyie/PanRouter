@@ -135,3 +135,23 @@ func TestQRPollExpiredAndMissingCookie(t *testing.T) {
 		t.Fatal("missing session cookie must fail")
 	}
 }
+
+// 回归(线上实测 2026-10-07):真实 CAS 对"未扫码/已扫码未确认"的轮询返回
+// status=50004001 "Query result is empty"(稳定复现,非错误),
+// token 失效/被消耗为 50004002;社区流传的 80005000 系列在实际接口上不出现。
+// QRPoll 必须把两者分别归为 pending 与 expired,不得 classify 成 upstream 错误。
+func TestQRPollRealCASWaitingStatus(t *testing.T) {
+	m := newQRMock(t)
+	d := newQRDriver(m)
+	ctx := context.Background()
+
+	m.pollCode = 50004001
+	if _, state, err := d.QRPoll(ctx, "tok-abc"); err != nil || state != "pending" {
+		t.Fatalf("50004001 必须为 pending: state=%q err=%v", state, err)
+	}
+
+	m.pollCode = 50004002
+	if _, state, err := d.QRPoll(ctx, "tok-abc"); err != nil || state != "expired" {
+		t.Fatalf("50004002 必须为 expired: state=%q err=%v", state, err)
+	}
+}

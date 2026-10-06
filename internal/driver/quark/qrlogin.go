@@ -126,10 +126,13 @@ func (d *Driver) QRPoll(ctx context.Context, token string) (cookie string, state
 	}
 }
 
-// isQRWaitingStatus:官方 CAS 对"未扫码/已扫码未确认"返回的非成功业务码(社区通用判定)。
+// isQRWaitingStatus:官方 CAS 对"未扫码/已扫码未确认"返回的非成功业务码。
+// 线上实测(2026-10-07):未扫码稳定返回 50004001 "Query result is empty";
+// 80005000 系列为社区流传旧码,保留兼容。
 func isQRWaitingStatus(code int) bool {
 	switch code {
-	case 80005000, // 未扫码
+	case 50004001, // 未扫码/查询结果为空(实测)
+		80005000, // 未扫码(社区)
 		80005001, // 已扫码,等待手机确认
 		80005002: // 确认中
 		return true
@@ -137,10 +140,11 @@ func isQRWaitingStatus(code int) bool {
 	return false
 }
 
-// isQRExpiredStatus:二维码过期或被作废。
+// isQRExpiredStatus:二维码过期、被作废或 token 已失效(50004002 实测)。
 func isQRExpiredStatus(code int) bool {
 	switch code {
-	case 80005003, // 已过期
+	case 50004002, // Token Not Found(实测:token 被消耗或失效)
+		80005003, // 已过期
 		80005004: // 已作废
 		return true
 	}
