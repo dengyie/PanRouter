@@ -2,6 +2,8 @@
 package config
 
 import (
+	"fmt"
+	"reflect"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -17,6 +19,15 @@ type Server struct {
 	DataDir       string        `mapstructure:"data_dir"`
 }
 
+// EffectiveSignTTL 返回下载入口签名的实际 TTL;非正配置回落默认 72h,
+// 避免显式配置 0/负值导致全部下载签名立即过期。
+func (s Server) EffectiveSignTTL() time.Duration {
+	if s.SignTTL <= 0 {
+		return 72 * time.Hour
+	}
+	return s.SignTTL
+}
+
 type Auth struct {
 	Username       string `mapstructure:"username"`
 	PasswordBcrypt string `mapstructure:"password_bcrypt"`
@@ -26,7 +37,6 @@ type Auth struct {
 
 type DriverCommon struct {
 	Enabled       bool     `mapstructure:"enabled"`
-	UpstreamAllow []string `mapstructure:"upstream_allow"`
 	RedirectAllow []string `mapstructure:"redirect_allow"`
 	Proxy         string   `mapstructure:"proxy"`
 	LimitQPS      float64  `mapstructure:"limit_qps"`
@@ -58,7 +68,7 @@ const (
 	DefaultJWTSecret = "panrouter-dev-jwt-secret-change-me"
 )
 
-// Default 返回一份带缺省值的配置(M1 预设 home 画像,见设计文档 §1.2)。
+// Default 返回一份带缺省值的配置(默认 home 画像)。
 func Default() *Config {
 	c := &Config{}
 	c.Server.Listen = "127.0.0.1:6400"
@@ -78,12 +88,10 @@ func Default() *Config {
 	c.Drivers = map[string]DriverCommon{
 		"quark": {
 			Enabled: true, LimitQPS: 2, DownloadConc: 3,
-			UpstreamAllow: []string{".quark.cn"},
 			RedirectAllow: []string{".quark.cn", ".quarkcdn.cn", ".uc.cn"},
 		},
 		"lanzou": {
 			Enabled: true, LimitQPS: 5, DownloadConc: 3,
-			UpstreamAllow: []string{"lanzou.com", "lanzouw.com", "lanzoui.com", "lanzoue.com", "lanzouf.com", "lanzoa.com", "lanzoub.com", "lanzouc.com", "lanzoud.com", "lanzouv.com", "lanzoux.com", "lansov.com", "lanzn.com", "lanzouq.com", "lanzouy.com", "lanzouu.com", ".xlig.cn", ".feijipan.com", ".lanrar.com", ".dmpdmp.com", ".bakstotre.com"},
 			RedirectAllow: []string{"lanzou.com", "lanzouw.com", "lanzoui.com", "lanzoue.com", "lanzouf.com", "lanzoa.com", "lanzoub.com", "lanzouc.com", "lanzoud.com", "lanzouv.com", "lanzoux.com", "lansov.com", "lanzn.com", "lanzouq.com", "lanzouy.com", "lanzouu.com", ".xlig.cn", ".lanrar.com", ".dmpdmp.com", ".bakstotre.com"},
 		},
 	}
@@ -103,8 +111,25 @@ func (p *Provider) Get() *Config  { return p.p.Load() }
 
 // Load 从 path 读取 YAML 并合并默认值;path 为空时依次尝试 ./config.yaml、./config/config.yaml。
 func Load(path string) (*Config, string, error) {
+	return load(path, nil)
+}
+
+// LoadReload merges a reload candidate onto current so omitted fields cannot
+// silently revert to development defaults. Startup-only fields must remain
+// unchanged; callers can publish the returned config atomically.
+func LoadReload(path string, current *Config) (*Config, string, error) {
+	if current == nil {
+		return nil, "", fmt.Errorf("reload requires current config")
+	}
+	return load(path, current)
+}
+
+func load(path string, base *Config) (*Config, string, error) {
 	v := viper.New()
 	c := Default()
+	if base != nil {
+		c = clone(base)
+	}
 	v.SetConfigType("yaml")
 	if path != "" {
 		v.SetConfigFile(path)
@@ -114,9 +139,7 @@ func Load(path string) (*Config, string, error) {
 		v.AddConfigPath("./config")
 	}
 	if err := v.ReadInConfig(); err != nil {
-		if _, ok := err.(viper.ConfigFileNotFoundError); ok && path == "" {
-			// 显式路径未找到才允许默认值;文件存在但解析失败必须报错,
-			// 否则会带着默认密钥静默启动(安全回归)。
+		if _, ok := err.(viper.ConfigFileNotFoundError); ok && path == "" && base == nil {
 			return c, "", nil
 		}
 		return nil, "", err
@@ -128,5 +151,48 @@ func Load(path string) (*Config, string, error) {
 	if c.Server.DeployProfile != "cloud" {
 		c.Server.DeployProfile = "home"
 	}
+	if base != nil {
+		if err := validateReload(base, c); err != nil {
+			return nil, "", err
+		}
+	}
 	return c, v.ConfigFileUsed(), nil
+}
+
+func clone(c *Config) *Config {
+	out := *c
+	out.DomainRoutes = make(map[string][]string, len(c.DomainRoutes))
+	for id, routes := range c.DomainRoutes {
+		out.DomainRoutes[id] = append([]string(nil), routes...)
+	}
+	out.Drivers = make(map[string]DriverCommon, len(c.Drivers))
+	for id, dc := range c.Drivers {
+		dc.RedirectAllow = append([]string(nil), dc.RedirectAllow...)
+		out.Drivers[id] = dc
+	}
+	return &out
+}
+
+func validateReload(old, next *Config) error {
+	if !reflect.DeepEqual(old.Auth, next.Auth) {
+		return fmt.Errorf("auth settings are startup-only; restart required")
+	}
+	if old.Server.Listen != next.Server.Listen || old.Server.DataDir != next.Server.DataDir {
+		return fmt.Errorf("listen and data_dir are startup-only; restart required")
+	}
+	if old.Aria2.Endpoint != next.Aria2.Endpoint || old.Aria2.Secret != next.Aria2.Secret {
+		return fmt.Errorf("aria2 endpoint and secret are startup-only; restart required")
+	}
+	for id, oldDriver := range old.Drivers {
+		nextDriver, ok := next.Drivers[id]
+		if !ok || oldDriver.Enabled != nextDriver.Enabled || oldDriver.Proxy != nextDriver.Proxy || !reflect.DeepEqual(oldDriver.RedirectAllow, nextDriver.RedirectAllow) {
+			return fmt.Errorf("driver %q registration or transport settings are startup-only; restart required", id)
+		}
+	}
+	for id := range next.Drivers {
+		if _, ok := old.Drivers[id]; !ok {
+			return fmt.Errorf("driver %q registration is startup-only; restart required", id)
+		}
+	}
+	return nil
 }

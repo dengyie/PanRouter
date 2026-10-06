@@ -18,6 +18,7 @@ import (
 	"github.com/dengyie/panrouter/internal/app"
 	"github.com/dengyie/panrouter/internal/config"
 	"github.com/dengyie/panrouter/internal/driver"
+	"github.com/dengyie/panrouter/internal/driver/quark"
 	"github.com/dengyie/panrouter/internal/pkg/httpx"
 	"github.com/dengyie/panrouter/internal/repo"
 )
@@ -133,13 +134,45 @@ func newE2E(t *testing.T, sameHost bool) *e2eEnv {
 		t.Fatal(err)
 	}
 
+	// 扫码登录上游(mock CAS + account/info):真 quark driver 注入,端点指向 mock。
+	qrMockMux := http.NewServeMux()
+	qrMockMux.HandleFunc("/cas/ajax/getTokenForQrcodeLogin", func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"status": 2000000, "message": "ok",
+			"data": map[string]any{"members": map[string]any{"token": "e2e-tok"}},
+		})
+	})
+	qrMockMux.HandleFunc("/cas/ajax/getServiceTicketByQrcodeToken", func(w http.ResponseWriter, _ *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"status": 2000000, "message": "ok",
+			"data": map[string]any{"members": map[string]any{"service_ticket": "e2e-st"}},
+		})
+	})
+	qrMockMux.HandleFunc("/account/info", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Add("Set-Cookie", "__pus=e2e; domain=.quark.cn; path=/")
+		w.Header().Add("Set-Cookie", "__puus=e2e2; domain=.quark.cn; path=/")
+		_ = json.NewEncoder(w).Encode(map[string]any{"status": 2000000})
+	})
+	qrUpstream := httptest.NewServer(qrMockMux)
+	t.Cleanup(qrUpstream.Close)
+	apiCl, err := httpx.New(httpx.Options{Timeout: 5 * time.Second, AllowPrivate: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	qrDriver := quark.New(apiCl, "https://drive-pc.quark.cn")
+	qrDriver.QRUopDomain = qrUpstream.URL
+	qrDriver.QRInfoURL = qrUpstream.URL + "/account/info"
+
 	// 与生产 main 相同的装配路径(AllowPrivate 仅为 e2e 的 127.0.0.1 mock 放行)
 	a, err := app.Build(app.Options{
 		Cfg: cfg, Logger: nopLogger(), MasterKey: "e2e-master-key",
-		Version: "e2e", AllowPrivateClients: true,
+		AllowPrivateClients: true,
 		ExtraDrivers: []app.ExtraDriver{{
 			Driver:       &e2eDriver{upstream: upstream.URL},
 			StreamClient: streamCl,
+		}, {
+			Driver:    qrDriver,
+			APIClient: apiCl,
 		}},
 	})
 	if err != nil {
@@ -494,6 +527,57 @@ func TestE2EBatchResolve(t *testing.T) {
 	second := results[1].(map[string]any)
 	if first["ok"] != true || second["ok"] != false {
 		t.Fatalf("batch: %v %v", first, second)
+	}
+}
+
+// 批量预算契约(§6.4):超限 400 + kind=unsupported;上限值与常量一致。
+func TestE2EBatchResolveLimit(t *testing.T) {
+	e := newE2E(t, true)
+	items := `{"items":[` + strings.Repeat(`{"url":"::::"},`, ResolveBatchMaxItems) + `{"url":"::::"}]}`
+	st, body := e.do(t, "POST", "/api/v1/resolve/batch", e.token, items)
+	if st != http.StatusBadRequest || body["kind"] != string(driver.KindUnsupported) {
+		t.Fatalf("over-limit must be 400/unsupported: %d %v", st, body["kind"])
+	}
+	if st, _ := e.do(t, "POST", "/api/v1/resolve/batch", e.token, `{"items":[]}`); st != http.StatusBadRequest {
+		t.Fatalf("empty items must be 400: %d", st)
+	}
+}
+
+// 扫码登录全链路(e2e):取 token → 轮询 confirmed → 账号自动入库且可查询。
+func TestE2EQuarkQRLogin(t *testing.T) {
+	e := newE2E(t, true)
+	st, body := e.do(t, "GET", "/api/v1/accounts/quark/qr/token", e.token, "")
+	if st != 200 || body["token"] != "e2e-tok" {
+		t.Fatalf("qr token: %d %v", st, body)
+	}
+	if u, _ := body["url"].(string); !strings.HasPrefix(u, "https://su.quark.cn/") {
+		t.Fatalf("qr url: %v", body["url"])
+	}
+
+	st, body = e.do(t, "POST", "/api/v1/accounts/quark/qr/poll", e.token,
+		`{"token":"e2e-tok","name":"扫码号"}`)
+	if st != 200 || body["status"] != "confirmed" {
+		t.Fatalf("poll confirmed: %d %v", st, body)
+	}
+	acc, _ := body["account"].(map[string]any)
+	if acc == nil || acc["id"] == nil || acc["pan_type"] != "quark" || acc["status"] != "ok" {
+		t.Fatalf("account: %v", acc)
+	}
+
+	// 账号列表可见;refresh 走真 quark driver(凭据无效是预期,断言只到端点可达)
+	st, body = e.do(t, "GET", "/api/v1/accounts", e.token, "")
+	if st != 200 {
+		t.Fatalf("list accounts: %d", st)
+	}
+	list, _ := body["accounts"].([]any)
+	found := false
+	for _, it := range list {
+		if a, ok := it.(map[string]any); ok && a["pan_type"] == "quark" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("quark account not listed: %v", body)
 	}
 }
 

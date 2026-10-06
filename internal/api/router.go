@@ -50,11 +50,10 @@ func Router(d Deps) http.Handler {
 	r.Get("/d/{pan}/{key}/{fid}", d.handleDownload302)
 	r.Get("/stream/{pan}/{key}/{fid}", d.handleStream)
 
-	if d.WebFS != nil {
-		r.Get("/", d.handleIndex)
-	}
-
 	r.Route("/api/v1", func(api chi.Router) {
+		api.NotFound(func(w http.ResponseWriter, _ *http.Request) {
+			writeJSON(w, http.StatusNotFound, map[string]any{"code": 404, "message": "not found"})
+		})
 		api.Post("/auth/login", d.handleLogin)
 		api.Group(func(pub chi.Router) {
 			pub.Use(d.optionalAuth)
@@ -68,13 +67,21 @@ func Router(d Deps) http.Handler {
 			pr.Post("/accounts", d.handleCreateAccount)
 			pr.Delete("/accounts/{id}", d.handleDeleteAccount)
 			pr.Post("/accounts/{id}/refresh", d.handleRefreshAccount)
+			pr.Get("/accounts/quark/qr/token", d.handleQRToken)
+			pr.Post("/accounts/quark/qr/poll", d.handleQRPoll)
 			pr.Post("/downloads", d.handlePushDownload)
 			pr.Get("/downloads", d.handleListDownloads)
 			pr.Get("/downloads/{gid}", d.handleDownloadStatus)
 		})
 	})
 
-	r.NotFound(func(w http.ResponseWriter, _ *http.Request) {
+	// 未匹配路径:有 WebFS 时托管静态文件 / SPA fallback;否则 JSON 404。
+	// 走 NotFound 而不是 /* ,避免通配符与 /api /d /stream 抢路由。
+	r.NotFound(func(w http.ResponseWriter, req *http.Request) {
+		if d.WebFS != nil && (req.Method == http.MethodGet || req.Method == http.MethodHead) && !reservedWebPath(req.URL.Path) {
+			d.handleWeb(w, req)
+			return
+		}
 		writeJSON(w, http.StatusNotFound, map[string]any{"code": 404, "message": "not found"})
 	})
 	return r
@@ -106,7 +113,7 @@ func kindStatus(k driver.Kind) int {
 	switch k {
 	case driver.KindNotFound, driver.KindShareGone:
 		return http.StatusNotFound
-	case driver.KindAuthExpired:
+	case driver.KindAuthExpired, driver.KindSessionExpired, driver.KindAuthInvalid:
 		return http.StatusUnauthorized
 	case driver.KindRiskControl:
 		return http.StatusTooManyRequests

@@ -11,7 +11,7 @@ import (
 )
 
 // 蓝奏云 CDN(dmpdmp/lanrar)对非浏览器客户端下发的 Aliyun WAF acw_sc__v2 挑战。
-// 算法:posList 重排 + hexXor(设计文档 §10 S2);密钥与 posList 为线上已验证常量。
+// 算法:posList 重排 + hexXor;密钥与 posList 为线上已验证常量。
 const acwXORKey = "3000176000856006061501533003690027800375"
 
 // acwPosList[i] 是 1-based 下标,指向 arg1 中应放到输出位置 i 的字符。

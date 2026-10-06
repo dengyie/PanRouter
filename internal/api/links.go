@@ -39,8 +39,8 @@ func (d *Deps) handleDownload302(w http.ResponseWriter, r *http.Request) {
 	meta := service.LinkMeta{UA: link.UA, Referer: link.Referer, Cookie: string(cookie), BindIP: link.BindIP}
 	env := service.RouteEnv{Profile: cfg.Server.DeployProfile, ClientUA: ua, Aria2SameHost: cfg.Aria2.SameHost}
 	if !service.Can302(meta, env) {
-		// 浏览器无法满足直链约束 → 降级中转,用户无感(设计文档 §4.3)
-		sig := d.Signer.Sign(pan+"|"+key+"|"+fid, cfg.Server.SignTTL)
+		// 浏览器无法满足直链约束 → 降级中转,用户无感
+		sig := d.Signer.Sign(pan+"|"+key+"|"+fid, cfg.Server.EffectiveSignTTL())
 		d.Met.Inc("panrouter_download_route_total", map[string]string{"pan": pan, "route": "stream"})
 		http.Redirect(w, r, fmt.Sprintf("/stream/%s/%s/%s?sig=%s", pan, key, fid, sig), http.StatusFound)
 		return
@@ -79,7 +79,7 @@ func (d *Deps) handleDirectJSON(w http.ResponseWriter, r *http.Request) {
 	cfg := d.Cfg.Get()
 	meta := service.LinkMeta{UA: link.UA, Referer: link.Referer, Cookie: string(cookie), BindIP: link.BindIP}
 	env := service.RouteEnv{Profile: cfg.Server.DeployProfile, ClientUA: ua, Aria2SameHost: cfg.Aria2.SameHost}
-	sig := d.Signer.Sign(pan+"|"+key+"|"+fid, cfg.Server.SignTTL)
+	sig := d.Signer.Sign(pan+"|"+key+"|"+fid, cfg.Server.EffectiveSignTTL())
 	base := cfg.Server.BaseURL
 	writeJSON(w, http.StatusOK, map[string]any{
 		"pan":          pan,
@@ -93,7 +93,7 @@ func (d *Deps) handleDirectJSON(w http.ResponseWriter, r *http.Request) {
 		"stream_url":   fmt.Sprintf("%s/stream/%s/%s/%s?sig=%s", base, pan, key, fid, sig),
 		"ua":           link.UA,
 		"referer":      link.Referer,
-		"need_headers": len(cookie) > 0 || link.Referer != "",
+		"need_headers": service.NeedHeaders(link.UA, link.Referer, string(cookie), ua),
 		"expires_at":   link.ExpiresAt,
 	})
 }

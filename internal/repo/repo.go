@@ -98,7 +98,19 @@ func Open(path string) (*Store, error) {
 	return &Store{db: db}, nil
 }
 
-func (s *Store) DB() *gorm.DB { return s.db }
+// Ping 探测底层连接可用性(readyz 用);api 层经此收口,不直接依赖 gorm.DB。
+func (s *Store) Ping() error {
+	sqlDB, err := s.db.DB()
+	if err != nil {
+		return fmt.Errorf("get sql db: %w", err)
+	}
+	return sqlDB.Ping()
+}
+
+// ClearLinks 清空直链缓存(测试隔离用)。
+func (s *Store) ClearLinks() error {
+	return s.db.Where("1 = 1").Delete(&Link{}).Error
+}
 
 // Close 关闭底层连接(测试与优雅停机用)。
 func (s *Store) Close() error {
@@ -149,6 +161,8 @@ func (s *Store) UpsertLink(l *Link) error {
 	}).Error
 }
 
+// GetLink 按 (share_key, fid) 读取直链缓存。
+// 契约:不存在返回 (nil, nil)(cache miss 语义),DB 故障返回 error(调用方不得当 miss 吞掉)。
 func (s *Store) GetLink(shareKey, fid string) (*Link, error) {
 	var l Link
 	err := s.db.Where("share_key = ? AND fid = ?", shareKey, fid).First(&l).Error
@@ -159,6 +173,20 @@ func (s *Store) GetLink(shareKey, fid string) (*Link, error) {
 		return nil, err
 	}
 	return &l, nil
+}
+
+// GetShare 按 share_key 读取分享快照。
+// 契约:不存在返回 (nil, nil),DB 故障返回 error。
+func (s *Store) GetShare(shareKey string) (*Share, error) {
+	var sh Share
+	err := s.db.Where("share_key = ?", shareKey).First(&sh).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &sh, nil
 }
 
 // ExpireLink 立即将某条直链标记为过期(上游否决时调用),使下次 GetFreshLink 触发重解析。
@@ -194,12 +222,38 @@ func (s *Store) GetAccount(id uint) (*Account, error) {
 	return &a, nil
 }
 
-func (s *Store) UpdateAccount(a *Account) error { return s.db.Save(a).Error }
+func (s *Store) UpdateAccount(a *Account) error {
+	return s.db.Model(&Account{}).Where("id = ?", a.ID).Updates(map[string]any{
+		"pan_type":       a.PanType,
+		"name":           a.Name,
+		"cred_enc":       a.CredEnc,
+		"cred_version":   a.CredVersion,
+		"status":         a.Status,
+		"cooldown_until": a.CooldownUntil,
+		"last_check_at":  a.LastCheckAt,
+	}).Error
+}
+
+func (s *Store) UpdateAccountCheck(id uint, status string, checkedAt time.Time, expectedStatus string) error {
+	// cred_version 是凭据代际(§15.3):仅凭据内容变更时经 UpdateAccount 递增,
+	// 健康检查只流转状态与 last_check_at,不得制造虚假版本变更。
+	result := s.db.Model(&Account{}).Where("id = ? AND status = ?", id, expectedStatus).Updates(map[string]any{
+		"status":        status,
+		"last_check_at": checkedAt,
+	})
+	if result.Error != nil {
+		return result.Error
+	}
+	if result.RowsAffected == 0 {
+		return gorm.ErrRecordNotFound
+	}
+	return nil
+}
 
 func (s *Store) DeleteAccount(id uint) error { return s.db.Delete(&Account{}, id).Error }
 
 // PickAccount 选出一个可用账号:状态 ok,或 cooling 且冷却已过(选中时自动复位)。
-// 状态机:ok →(风控)cooling →(冷却到期)ok;不存在其他恢复路径,见设计文档 §7.7。
+// 状态机:ok →(风控)cooling →(冷却到期)ok;不存在其他恢复路径。
 func (s *Store) PickAccount(panType string) (*Account, error) {
 	var a Account
 	now := time.Now()

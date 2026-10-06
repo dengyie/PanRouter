@@ -1,4 +1,4 @@
-// Package service:下载路径决策(设计文档 §4.3)。
+// Package service:下载路径决策。
 // 从直链约束 + 部署画像派生 Can302 / CanAria2 / Route,是纯函数,表驱动单测覆盖。
 package service
 
@@ -49,4 +49,10 @@ func Route(l LinkMeta, env RouteEnv) string {
 	default:
 		return "stream"
 	}
+}
+
+// NeedHeaders 是 need_headers 的全站唯一派生规则(§15.2 item 3):
+// 直链带 Cookie 校验、要求 Referer、或要求与客户端不同的 UA 时,下载方必须附加请求头。
+func NeedHeaders(linkUA, linkReferer, cookie, clientUA string) bool {
+	return cookie != "" || linkReferer != "" || (linkUA != "" && !strings.EqualFold(linkUA, clientUA))
 }

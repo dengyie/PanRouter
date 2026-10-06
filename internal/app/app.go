@@ -4,7 +4,6 @@ package app
 
 import (
 	"fmt"
-	"io/fs"
 	"os"
 	"path/filepath"
 	"sort"
@@ -36,8 +35,6 @@ type Options struct {
 	Cfg       *config.Config
 	Logger    *zap.SugaredLogger
 	MasterKey string // 凭据加密主密钥(main 从环境变量解析;测试显式传入)
-	WebFS     fs.FS  // 前端静态资源,可为 nil
-	Version   string
 	// AllowPrivateClients 仅供测试:客户端允许直连私网地址(e2e 的 mock 上游在 127.0.0.1)。
 	// 生产必须为 false,SSRF 防护依赖该默认值。
 	AllowPrivateClients bool
@@ -71,6 +68,7 @@ type App struct {
 
 	apiClients    map[string]*httpx.Client
 	streamClients map[string]*httpx.Client
+	stopBg        func() // StartBackground 注册的停机函数;Shutdown 兜底调用
 }
 
 // Build 按 config 装配全部依赖。中途失败时负责释放已建资源。
@@ -99,7 +97,7 @@ func Build(o Options) (*App, error) {
 		})
 	}
 
-	// 每个 driver 两个客户端:API 调用受总超时约束;中转流不限体传输时长(设计文档 §7)
+	// 每个 driver 两个客户端:API 调用受总超时约束;中转流不限体传输时长
 	apiClients := map[string]*httpx.Client{}
 	streamClients := map[string]*httpx.Client{}
 	var driversList []driver.Driver
@@ -146,7 +144,7 @@ func Build(o Options) (*App, error) {
 	cfgp := &config.Provider{}
 	cfgp.Set(cfg)
 
-	accSvc := service.NewAccountService(store, aes, o.Logger)
+	accSvc := service.NewAccountService(store, aes, met, o.Logger)
 	resolver := service.NewResolver(cfgp, reg, store, aes, accSvc, lim, brs, signer, met, o.Logger)
 	relay := service.NewRelay(resolver, streamClients, store, aes, o.Logger)
 	aria2, err := service.NewAria2(cfgp, signer, resolver, store, aes, met, o.Logger)
@@ -163,7 +161,7 @@ func Build(o Options) (*App, error) {
 }
 
 // ApplyConfig 应用热加载的新配置:限频、部署画像、域名路由即时生效;
-// 代理与重定向白名单在客户端构建时固化,变更需重启(设计文档 §7.11)。
+// 代理与重定向白名单在客户端构建时固化,变更需重启。
 func (a *App) ApplyConfig(nc *config.Config) {
 	a.Cfg.Set(nc)
 	for id, dc := range nc.Drivers {

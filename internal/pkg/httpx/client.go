@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -15,6 +16,10 @@ import (
 	"syscall"
 	"time"
 )
+
+// ErrBadPayload 标记 HTTP 层成功但响应体不是合法 JSON——接口改版的典型征兆,
+// 调用方据此分类为 interface_changed 而非可重试的网络错误。
+var ErrBadPayload = errors.New("response body is not valid JSON")
 
 type Options struct {
 	Timeout       time.Duration
@@ -50,24 +55,24 @@ func New(opts Options) (*Client, error) {
 		opts.Timeout = 30 * time.Second
 	}
 	dialer := &net.Dialer{Timeout: 15 * time.Second, KeepAlive: 30 * time.Second, Control: controlFn(opts.AllowPrivate)}
-		tr := &http.Transport{
-			DialContext:           dialer.DialContext,
-			ForceAttemptHTTP2:     true,
-			TLSHandshakeTimeout:   10 * time.Second,
-			MaxIdleConnsPerHost:   8,
-			IdleConnTimeout:       90 * time.Second,
-			ResponseHeaderTimeout: opts.Timeout,
-			// 零值 Proxy 已是直连;显式 nil 防止以后改成 DefaultTransport 时吃到
-			// 宿主 HTTP_PROXY(pxed 全局 Privoxy 会把网盘上游拐走)。
-			Proxy: nil,
+	tr := &http.Transport{
+		DialContext:           dialer.DialContext,
+		ForceAttemptHTTP2:     true,
+		TLSHandshakeTimeout:   10 * time.Second,
+		MaxIdleConnsPerHost:   8,
+		IdleConnTimeout:       90 * time.Second,
+		ResponseHeaderTimeout: opts.Timeout,
+		// 零值 Proxy 已是直连;显式 nil 防止以后改成 DefaultTransport 时吃到
+		// 宿主 HTTP_PROXY(pxed 全局 Privoxy 会把网盘上游拐走)。
+		Proxy: nil,
+	}
+	if opts.Proxy != "" {
+		u, err := url.Parse(opts.Proxy)
+		if err != nil {
+			return nil, fmt.Errorf("bad proxy url: %w", err)
 		}
-		if opts.Proxy != "" {
-			u, err := url.Parse(opts.Proxy)
-			if err != nil {
-				return nil, fmt.Errorf("bad proxy url: %w", err)
-			}
-			tr.Proxy = http.ProxyURL(u)
-		}
+		tr.Proxy = http.ProxyURL(u)
+	}
 	c := &Client{opts: opts}
 	clientTimeout := opts.Timeout
 	if opts.NoBodyTimeout {
@@ -173,7 +178,7 @@ func (c *Client) Do(req *http.Request) (*Result, error) {
 	return &Result{StatusCode: resp.StatusCode, Header: resp.Header, Body: body}, nil
 }
 
-// DoStream 执行请求并保留响应体(中转流用)。遇 acw_sc__v2 挑战页自动解题重放(设计文档 §10 S2)。
+// DoStream 执行请求并保留响应体(中转流用)。遇 acw_sc__v2 挑战页自动解题重放。
 func (c *Client) DoStream(req *http.Request) (*http.Response, error) { return c.doWithACW(req) }
 
 func (c *Client) doWithACW(req *http.Request) (*http.Response, error) {
@@ -207,12 +212,19 @@ func (c *Client) doWithACW(req *http.Request) (*http.Response, error) {
 			return nil, fmt.Errorf("httpx: solve acw_sc__v2: %w", err)
 		}
 		// 重放必须沿用调用方 context:关闭挑战页 Body 会取消 resp.Request.Context()。
+		// 模板取 resp.Request(重定向后的最终生效请求):POST 遇 302/303 已被改写为
+		// GET 且 body 剥离,307/308 保留 body;以原始请求为模板会把已失效的
+		// method/body 重放到跳转目标。
 		final := cur.URL
 		if resp.Request != nil && resp.Request.URL != nil {
 			final = resp.Request.URL
 		}
 		c.acw.set(final.Host, token)
-		replay, err := cloneRequest(cur, origCtx)
+		tmpl := cur
+		if resp.Request != nil {
+			tmpl = resp.Request
+		}
+		replay, err := cloneRequest(tmpl, origCtx)
 		if err != nil {
 			return nil, err
 		}
@@ -263,7 +275,7 @@ func (c *Client) DoJSON(ctx context.Context, method, url string, headers map[str
 	}
 	if out != nil && len(res.Body) > 0 {
 		if err := json.Unmarshal(res.Body, out); err != nil {
-			return res, fmt.Errorf("decode response: %w (body head: %.200s)", err, string(res.Body))
+			return res, fmt.Errorf("%w: decode response: %w (body head: %.200s)", ErrBadPayload, err, string(res.Body))
 		}
 	}
 	return res, nil

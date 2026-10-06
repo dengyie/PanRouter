@@ -82,7 +82,7 @@ func (d *Deps) handleLogin(w http.ResponseWriter, r *http.Request) {
 	}
 	if req.Username != cfg.Auth.Username || !passOK {
 		d.Store.AddAudit("login_failed", "username="+req.Username)
-		writeErr(w, driver.NewErr(driver.KindAuthExpired, "用户名或密码错误", nil))
+		writeErr(w, driver.NewErr(driver.KindAuthInvalid, "用户名或密码错误", nil))
 		return
 	}
 	ttl := 7 * 24 * time.Hour

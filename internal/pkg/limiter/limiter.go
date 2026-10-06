@@ -15,10 +15,34 @@ type tokenBucket struct {
 type Limiter struct {
 	mu      sync.Mutex
 	buckets map[string]*tokenBucket
+	now     func() time.Time
 }
 
-func New() *Limiter {
-	return &Limiter{buckets: map[string]*tokenBucket{}}
+func New() *Limiter { return NewWithClock(time.Now) }
+
+func NewWithClock(now func() time.Time) *Limiter {
+	if now == nil {
+		now = time.Now
+	}
+	return &Limiter{buckets: map[string]*tokenBucket{}, now: now}
+}
+
+func capacity(rate float64) float64 {
+	if rate < 1 {
+		return 1
+	}
+	return rate
+}
+
+func refill(b *tokenBucket, now time.Time, rate float64) {
+	if b.rate > 0 {
+		b.tokens += now.Sub(b.last).Seconds() * b.rate
+	}
+	cap := capacity(rate)
+	if b.tokens > cap {
+		b.tokens = cap
+	}
+	b.last, b.rate = now, rate
 }
 
 // Allow 取一个令牌;rate<=0 表示不限流。
@@ -26,19 +50,17 @@ func (l *Limiter) Allow(key string, rate float64) bool {
 	if rate <= 0 {
 		return true
 	}
-	now := time.Now()
+	now := l.now()
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	b, ok := l.buckets[key]
 	if !ok {
-		l.buckets[key] = &tokenBucket{tokens: rate, last: now, rate: rate}
-		return true
+		b = &tokenBucket{tokens: capacity(rate), last: now, rate: rate}
+		l.buckets[key] = b
 	}
-	b.tokens += now.Sub(b.last).Seconds() * b.rate
-	if b.tokens > b.rate { // 桶容量 = 1 秒的量
-		b.tokens = b.rate
+	if ok {
+		refill(b, now, rate)
 	}
-	b.last, b.rate = now, rate
 	if b.tokens < 1 {
 		return false
 	}
@@ -48,12 +70,10 @@ func (l *Limiter) Allow(key string, rate float64) bool {
 
 // SetRate 热更新速率(配置热加载时调用)。
 func (l *Limiter) SetRate(key string, rate float64) {
+	now := l.now()
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	if b, ok := l.buckets[key]; ok {
-		b.rate = rate
-		if b.tokens > rate {
-			b.tokens = rate
-		}
+		refill(b, now, rate)
 	}
 }

@@ -17,7 +17,9 @@ import (
 type Kind string
 
 const (
-	KindAuthExpired      Kind = "auth_expired"      // 凭据失效
+	KindAuthExpired      Kind = "auth_expired"      // 网盘上游凭据失效
+	KindSessionExpired   Kind = "session_expired"   // PanRouter 站点会话失效
+	KindAuthInvalid      Kind = "auth_invalid"      // PanRouter 登录凭据错误
 	KindRiskControl      Kind = "risk_control"      // 风控/限流/验证码
 	KindShareGone        Kind = "share_gone"        // 分享失效/被取消
 	KindNotFound         Kind = "not_found"         // 链接/文件不存在

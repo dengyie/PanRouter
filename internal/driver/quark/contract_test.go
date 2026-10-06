@@ -16,7 +16,7 @@ import (
 	"github.com/dengyie/panrouter/internal/pkg/httpx"
 )
 
-// 合约测试:用 httptest 回放夸克响应样本,不打真实网盘(设计文档 §9)。
+// 合约测试:用 httptest 回放夸克响应样本,不打真实网盘。
 // 分享直链为转存链:建暂存目录 → save → 轮询任务拿新 fid → file/download → cleanup delete(线上实测形态)。
 
 const (
@@ -388,7 +388,7 @@ func TestErrorClassification(t *testing.T) {
 		{`{"code":41013,"message":"转存失败"}`, driver.KindRiskControl},
 		{`{"code":31001,"message":"请登录后操作"}`, driver.KindAuthExpired},
 		{`{"code":70016,"message":"提取码错误"}`, driver.KindNotFound},
-		{`<html>unexpected</html>`, driver.KindUpstream}, // 非 JSON → 上游异常
+		{`<html>unexpected</html>`, driver.KindInterfaceChanged}, // 非 JSON 200 → 接口改版征兆
 	}
 	for _, c := range cases {
 		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
