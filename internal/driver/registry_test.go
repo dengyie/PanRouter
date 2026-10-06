@@ -57,7 +57,7 @@ func TestDetectRouteWithoutEnabledDriverSkipped(t *testing.T) {
 	}
 }
 
-// 优化回归:域名路由表必须支持热更新(设计文档 §7.11)。
+// 优化回归:域名路由表必须支持热更新。
 func TestUpdateRoutesHotReload(t *testing.T) {
 	reg := NewRegistry([]Driver{&stubDriver{id: "quark"}}, map[string][]string{
 		"quark": {"old.example"},

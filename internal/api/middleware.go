@@ -82,7 +82,7 @@ func (d *Deps) tokenOK(token string) bool {
 	return err == nil
 }
 
-// optionalAuth:无 token 当游客;坏 token 401(让前端清会话);有效 token 才允许 Pick Cookie。
+// optionalAuth:无 token 当游客;坏 token 返回站点会话失效;有效 token 才允许 Pick Cookie。
 func (d *Deps) optionalAuth(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		token := bearerToken(r)
@@ -91,23 +91,23 @@ func (d *Deps) optionalAuth(next http.Handler) http.Handler {
 			return
 		}
 		if !d.tokenOK(token) {
-			writeErr(w, driver.NewErr(driver.KindAuthExpired, "登录已过期,请重新登录", nil))
+			writeErr(w, driver.NewErr(driver.KindSessionExpired, "登录已过期,请重新登录", nil))
 			return
 		}
 		next.ServeHTTP(w, r.WithContext(service.WithAuthed(r.Context(), true)))
 	})
 }
 
-// auth:Web 端 JWT 与脚本端 API Token 二选一(设计文档 §6)。
+// auth:Web 端 JWT 与脚本端 API Token 二选一。
 func (d *Deps) auth(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		token := bearerToken(r)
 		if token == "" {
-			writeErr(w, driver.NewErr(driver.KindAuthExpired, "未登录或缺少 Authorization", nil))
+			writeErr(w, driver.NewErr(driver.KindSessionExpired, "未登录或缺少 Authorization", nil))
 			return
 		}
 		if !d.tokenOK(token) {
-			writeErr(w, driver.NewErr(driver.KindAuthExpired, "登录已过期,请重新登录", nil))
+			writeErr(w, driver.NewErr(driver.KindSessionExpired, "登录已过期,请重新登录", nil))
 			return
 		}
 		next.ServeHTTP(w, r.WithContext(service.WithAuthed(r.Context(), true)))

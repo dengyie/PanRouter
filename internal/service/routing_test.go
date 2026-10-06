@@ -2,7 +2,7 @@ package service
 
 import "testing"
 
-// 表驱动覆盖设计文档 §4.3 决策表的全部关键组合。
+// 表驱动覆盖决策表的全部关键组合。
 func TestRouteDecision(t *testing.T) {
 	chromeUA := "Mozilla/5.0 (Windows NT 10.0) Chrome/126.0.0.0 Safari/537.36"
 	cases := []struct {
@@ -35,7 +35,7 @@ func TestCan302Rules(t *testing.T) {
 		t.Error("裸链应可 302")
 	}
 	if Can302(LinkMeta{BindIP: true}, env) != false {
-		t.Error("绑 IP 一律禁 302(保守处理,见设计文档 §4.3)")
+		t.Error("绑 IP 一律禁 302(保守处理)")
 	}
 	if Can302(LinkMeta{Cookie: "k=v"}, env) != false {
 		t.Error("带 Cookie 校验禁 302")

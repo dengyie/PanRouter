@@ -155,7 +155,7 @@ func TestGuestResolveSkipsAccountCookie(t *testing.T) {
 	if got != "" {
 		t.Fatalf("游客不得读取账号 Cookie, got %q", got)
 	}
-	if err := store.DB().Where("1 = 1").Delete(&repo.Link{}).Error; err != nil {
+	if err := store.ClearLinks(); err != nil {
 		t.Fatal(err)
 	}
 
@@ -225,8 +225,7 @@ func TestGetFreshLinkRenewsExpiredCookieLink(t *testing.T) {
 		t.Fatal(err)
 	}
 	key := resolver.shareKey("fake", testShareURL, "")
-	if err := store.DB().Model(&repo.Link{}).Where("share_key = ? AND fid = ?", key, "f1").
-		Update("expires_at", time.Now().Add(-time.Minute)).Error; err != nil {
+	if err := store.ExpireLink(key, "f1"); err != nil {
 		t.Fatal(err)
 	}
 	d.cookie.Store("")

@@ -1,9 +1,12 @@
 package repo
 
 import (
+	"errors"
 	"path/filepath"
 	"testing"
 	"time"
+
+	"gorm.io/gorm"
 )
 
 func newTestStore(t *testing.T) *Store {
@@ -72,6 +75,57 @@ func TestPickAccountStateMachine(t *testing.T) {
 	}
 }
 
+func TestAccountUpdatesDoNotResurrectDeletedRows(t *testing.T) {
+	s := newTestStore(t)
+	a := &Account{PanType: "quark", Name: "n", CredEnc: []byte("secret"), Status: "ok", CredVersion: 1}
+	if err := s.CreateAccount(a); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.DeleteAccount(a.ID); err != nil {
+		t.Fatal(err)
+	}
+	a.Status = "expired"
+	if err := s.UpdateAccount(a); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.GetAccount(a.ID); err != nil {
+		t.Fatal(err)
+	}
+	var count int64
+	if err := s.db.Model(&Account{}).Count(&count).Error; err != nil {
+		t.Fatal(err)
+	}
+	if count != 0 {
+		t.Fatalf("deleted account was resurrected: %d rows", count)
+	}
+	if err := s.UpdateAccountCheck(a.ID, "ok", time.Now(), "ok"); !errors.Is(err, gorm.ErrRecordNotFound) {
+		t.Fatalf("deleted account check should report not found, got %v", err)
+	}
+}
+
+// cred_version 语义(§15.3):凭据代际,仅凭据内容变更(重新保存)时递增;
+// 健康检查只更新状态与 last_check_at,不得递增——否则管理页每次刷新都会制造虚假版本变更。
+func TestUpdateAccountCheckKeepsCredVersion(t *testing.T) {
+	s := newTestStore(t)
+	a := &Account{PanType: "quark", Name: "n", CredEnc: []byte("x"), Status: "ok", CredVersion: 7}
+	if err := s.CreateAccount(a); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.UpdateAccountCheck(a.ID, "ok", time.Now(), "ok"); err != nil {
+		t.Fatal(err)
+	}
+	got, err := s.GetAccount(a.ID)
+	if err != nil || got == nil {
+		t.Fatal(err)
+	}
+	if got.CredVersion != 7 {
+		t.Fatalf("health check must not bump cred_version: got %d", got.CredVersion)
+	}
+	if got.LastCheckAt.IsZero() {
+		t.Fatal("last_check_at must be updated")
+	}
+}
+
 func TestUpsertLinkIdempotent(t *testing.T) {
 	s := newTestStore(t)
 	l1 := &Link{ShareKey: "k", FID: "f", FileName: "a", DirectLink: "u1", ExpiresAt: time.Now().Add(time.Hour)}
@@ -110,5 +164,19 @@ func TestExpireLink(t *testing.T) {
 	}
 	if got.ExpiresAt.After(time.Now()) {
 		t.Fatalf("link should be expired, expires_at=%v", got.ExpiresAt)
+	}
+}
+
+// Store.Ping:readyz 探活的唯一入口,api 层不得直接依赖 gorm.DB。
+func TestStorePing(t *testing.T) {
+	s := newTestStore(t)
+	if err := s.Ping(); err != nil {
+		t.Fatalf("open store should ping ok: %v", err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Ping(); err == nil {
+		t.Fatal("ping must fail after close")
 	}
 }

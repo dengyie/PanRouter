@@ -12,6 +12,8 @@ func TestKindStatusMapping(t *testing.T) {
 		driver.KindNotFound:         http.StatusNotFound,
 		driver.KindShareGone:        http.StatusNotFound,
 		driver.KindAuthExpired:      http.StatusUnauthorized,
+		driver.KindSessionExpired:   http.StatusUnauthorized,
+		driver.KindAuthInvalid:      http.StatusUnauthorized,
 		driver.KindRiskControl:      http.StatusTooManyRequests,
 		driver.KindUnsupported:      http.StatusBadRequest,
 		driver.KindInterfaceChanged: http.StatusBadGateway,

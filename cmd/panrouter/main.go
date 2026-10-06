@@ -57,12 +57,16 @@ func main() {
 	}
 
 	a, err := app.Build(app.Options{
-		Cfg: cfg, Logger: logger, MasterKey: masterKey, WebFS: webFS, Version: version,
+		Cfg: cfg, Logger: logger, MasterKey: masterKey,
 	})
 	if err != nil {
 		logger.Fatalf("build app: %v", err)
 	}
-	defer func() { _ = a.Close() }()
+	defer func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		_ = a.Shutdown(ctx)
+	}()
 
 	deps := api.Deps{
 		Version: version, Cfg: a.Cfg, Resolver: a.Resolver, Relay: a.Relay, Aria2: a.Aria2,
@@ -75,58 +79,9 @@ func main() {
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 
-	// 凭据看门狗:每 30min 校验全部账号(设计文档 §7.6)
-	watchCtx, cancelWatch := context.WithCancel(context.Background())
-	defer cancelWatch()
-	go func() {
-		t := time.NewTicker(30 * time.Minute)
-		defer t.Stop()
-		for {
-			select {
-			case <-watchCtx.Done():
-				return
-			case <-t.C:
-				accounts, err := a.Store.ListAccounts("")
-				if err != nil {
-					continue
-				}
-				for _, acc := range accounts {
-					drv, ok := a.Registry.Get(acc.PanType)
-					if !ok {
-						continue
-					}
-					if _, err := a.Accounts.Check(watchCtx, acc.ID, drv); err != nil {
-						logger.Warnf("watchdog check account=%d: %v", acc.ID, err)
-					}
-				}
-			}
-		}
-	}()
-
-	// 配置热加载(5s 轮询):限频/部署画像/域名路由即时生效;
-	// 代理与重定向白名单在客户端构建时固化,变更需重启(设计文档 §7.11)
-	if usedPath != "" {
-		go func() {
-			t := time.NewTicker(5 * time.Second)
-			defer t.Stop()
-			for {
-				select {
-				case <-watchCtx.Done():
-					return
-				case <-t.C:
-					nc, _, err := config.Load(usedPath)
-					if err != nil {
-						logger.Warnf("config 热加载失败(保留旧配置): %v", err)
-						continue
-					}
-					if nc.Server.Listen != cfg.Server.Listen {
-						continue // 监听地址变更需重启,忽略
-					}
-					a.ApplyConfig(nc)
-				}
-			}
-		}()
-	}
+	// 后台任务(凭据看门狗 30min、配置热加载 5s)由 App 编排;
+	// stop 停止协程并等待退出,Shutdown 时兜底再调(幂等)。
+	a.StartBackground(app.BackgroundOptions{ConfigPath: usedPath})
 
 	go func() {
 		logger.Infof("panrouter %s listening on %s (profile=%s, drivers=%v, config=%s)",
@@ -140,10 +95,11 @@ func main() {
 	signal.Notify(quit, os.Interrupt, syscall.SIGTERM)
 	<-quit
 	logger.Info("shutting down...")
-	cancelWatch()
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
-	_ = srv.Shutdown(ctx)
+	if err := srv.Shutdown(ctx); err != nil {
+		logger.Warnf("http shutdown: %v", err)
+	}
 	logger.Info("bye")
 }
 

@@ -50,9 +50,10 @@ func newRelayFixture(t *testing.T, upstreamURL string) (*Relay, string) {
 
 	fd := &fakeDriver{linkURL: upstreamURL + "/file"}
 	reg := driver.NewRegistry([]driver.Driver{fd}, map[string][]string{"fake": {"fake.example"}})
-	acc := NewAccountService(store, aes, log)
+	met := metrics.New()
+	acc := NewAccountService(store, aes, met, log)
 	resolver := NewResolver(cfgp, reg, store, aes, acc, limiter.New(),
-		breaker.NewRegistry(5, time.Minute), sign.New("k"), metrics.New(), log)
+		breaker.NewRegistry(5, time.Minute), sign.New("k"), met, log)
 
 	const shareURL = "https://fake.example/s/x"
 	if _, err := resolver.ResolveShare(context.Background(), shareURL, "", ""); err != nil {
@@ -164,7 +165,7 @@ func TestRelayUpstreamForbiddenInvalidatesCache(t *testing.T) {
 	}
 }
 
-// 设计文档 §10 S2:非浏览器 UA 经 /stream 遇 acw_sc__v2 挑战页须自动解题重放,拿到真实文件。
+// 非浏览器 UA 经 /stream 遇 acw_sc__v2 挑战页须自动解题重放,拿到真实文件。
 func TestRelaySolvesLanzouACWChallenge(t *testing.T) {
 	const (
 		arg1    = "6a9c4c0e1f2b3d4a5e6f708192a3b4c5d6e7f809"

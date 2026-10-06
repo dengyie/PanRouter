@@ -62,9 +62,10 @@ func newTestResolver(t *testing.T, drv driver.Driver, dc config.DriverCommon) (*
 	aes := crypto.New("k")
 	reg := driver.NewRegistry([]driver.Driver{drv}, map[string][]string{"fake": {"fake.example"}})
 
+	met := metrics.New()
 	return NewResolver(cfgp, reg, store, aes,
-		NewAccountService(store, aes, log), limiter.New(),
-		breaker.NewRegistry(5, time.Minute), sign.New("k"), metrics.New(), log), store
+		NewAccountService(store, aes, met, log), limiter.New(),
+		breaker.NewRegistry(5, time.Minute), sign.New("k"), met, log), store
 }
 
 // 优化回归:过期直链的并发刷新必须经 singleflight 收敛为一次真实 driver 调用。
@@ -80,8 +81,7 @@ func TestGetFreshLinkSingleflight(t *testing.T) {
 	}
 	key := resolver.shareKey("fake", testShareURL, "")
 	// 把已存直链置为过期
-	if err := store.DB().Model(&repo.Link{}).Where("share_key = ? AND fid = ?", key, "f1").
-		Update("expires_at", time.Now().Add(-time.Minute)).Error; err != nil {
+	if err := store.ExpireLink(key, "f1"); err != nil {
 		t.Fatal(err)
 	}
 

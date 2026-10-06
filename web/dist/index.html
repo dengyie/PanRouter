@@ -89,9 +89,9 @@ async function api(path, opts={}) {
     headers: {'Content-Type':'application/json', ...(TOKEN?{'Authorization':'Bearer '+TOKEN}:{}), ...(opts.headers||{})},
   });
   const data = await res.json().catch(()=>({}));
-  if (res.status === 401 && TOKEN) { // 会话失效:清 token,回登录页
+  if (res.status === 401 && TOKEN && data.kind === 'session_expired') {
     logout();
-    throw Object.assign(new Error(data.message || '登录已过期'), {status:401});
+    throw Object.assign(new Error(data.message || '登录已过期'), {status:401, kind:data.kind});
   }
   if (!res.ok) throw Object.assign(new Error(data.message||res.statusText), {status:res.status, kind:data.kind});
   return data;

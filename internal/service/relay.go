@@ -1,4 +1,4 @@
-// Relay:服务端中转流(设计文档 §4.4 ③)——补请求头、白名单重定向、Range 透传与续传。
+// Relay:服务端中转流——补请求头、白名单重定向、Range 透传与续传。
 package service
 
 import (
@@ -39,7 +39,7 @@ type StreamInput struct {
 }
 
 // Serve 执行中转:取新鲜直链 → 携带约束头请求上游 → 透传响应(含 Range/续传)。
-// 签名只在建立连接时校验,Range 续传复用同一 URL,不会中途 401(设计文档 §6)。
+// 签名只在建立连接时校验,Range 续传复用同一 URL,不会中途 401。
 func (s *Relay) Serve(ctx context.Context, w http.ResponseWriter, in StreamInput, rangeHeader string) error {
 	link, err := s.resolver.GetFreshLink(ctx, in.ShareKey, in.FID, in.ClientUA)
 	if err != nil {

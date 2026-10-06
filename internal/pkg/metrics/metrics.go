@@ -95,38 +95,43 @@ func (r *Registry) Set(name string, labels map[string]string, v float64) {
 
 func (r *Registry) Handler() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		r.mu.Lock()
-		defer r.mu.Unlock()
-		var sb strings.Builder
-		writeFamily := func(typ, name string, m map[string]*series) {
-			if len(m) == 0 {
-				return
-			}
-			if h, ok := r.helpLines[name]; ok {
-				fmt.Fprintf(&sb, "# HELP %s %s\n", name, h)
-			}
-			fmt.Fprintf(&sb, "# TYPE %s %s\n", name, typ)
-			keys := make([]string, 0, len(m))
-			for k := range m {
-				keys = append(keys, k)
-			}
-			sort.Strings(keys)
-			for _, k := range keys {
-				s := m[k]
-				if s.labels == "" {
-					fmt.Fprintf(&sb, "%s %v\n", name, s.value)
-				} else {
-					fmt.Fprintf(&sb, "%s{%s} %v\n", name, s.labels, s.value)
-				}
-			}
-		}
-		writeFamily("counter", "panrouter_resolve_total", r.counters["panrouter_resolve_total"])
-		writeFamily("counter", "panrouter_download_route_total", r.counters["panrouter_download_route_total"])
-		writeFamily("counter", "panrouter_link_cache_hit_total", r.counters["panrouter_link_cache_hit_total"])
-		writeFamily("counter", "panrouter_driver_error_total", r.counters["panrouter_driver_error_total"])
-		writeFamily("gauge", "panrouter_breaker_open", r.gauges["panrouter_breaker_open"])
-		writeFamily("gauge", "panrouter_account_status", r.gauges["panrouter_account_status"])
+		body := r.snapshot()
 		w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
-		_, _ = w.Write([]byte(sb.String()))
+		_, _ = w.Write(body)
 	})
+}
+
+func (r *Registry) snapshot() []byte {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	var sb strings.Builder
+	writeFamily := func(typ, name string, m map[string]*series) {
+		if len(m) == 0 {
+			return
+		}
+		if h, ok := r.helpLines[name]; ok {
+			fmt.Fprintf(&sb, "# HELP %s %s\n", name, h)
+		}
+		fmt.Fprintf(&sb, "# TYPE %s %s\n", name, typ)
+		keys := make([]string, 0, len(m))
+		for k := range m {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		for _, k := range keys {
+			s := m[k]
+			if s.labels == "" {
+				fmt.Fprintf(&sb, "%s %v\n", name, s.value)
+				continue
+			}
+			fmt.Fprintf(&sb, "%s{%s} %v\n", name, s.labels, s.value)
+		}
+	}
+	writeFamily("counter", "panrouter_resolve_total", r.counters["panrouter_resolve_total"])
+	writeFamily("counter", "panrouter_download_route_total", r.counters["panrouter_download_route_total"])
+	writeFamily("counter", "panrouter_link_cache_hit_total", r.counters["panrouter_link_cache_hit_total"])
+	writeFamily("counter", "panrouter_driver_error_total", r.counters["panrouter_driver_error_total"])
+	writeFamily("gauge", "panrouter_breaker_open", r.gauges["panrouter_breaker_open"])
+	writeFamily("gauge", "panrouter_account_status", r.gauges["panrouter_account_status"])
+	return []byte(sb.String())
 }

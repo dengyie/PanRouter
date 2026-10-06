@@ -1,4 +1,4 @@
-// Aria2:下载任务推送与状态查询(设计文档 §4.4 ④)。
+// Aria2:下载任务推送与状态查询。
 // URL 由服务端按 §4.3 决策选择:CanAria2 → 直链+headers;否则 → /stream 签名 URL。
 package service
 
@@ -52,9 +52,12 @@ func (a *Aria2) Push(ctx context.Context, req PushRequest) (*PushResult, error) 
 	if req.Pan == "" || req.ShareKey == "" || req.FID == "" {
 		return nil, driver.NewErr(driver.KindNotFound, "pan/share_key/fid 必填", nil)
 	}
-	// pan 一致性校验:share 快照存在时比对(不存在则交由 /stream 签名校验兜底)
-	var sh repo.Share
-	if err := a.store.DB().Where("share_key = ?", req.ShareKey).First(&sh).Error; err == nil && sh.PanType != req.Pan {
+	// pan 一致性校验:share 快照存在时比对;DB 故障显式报错,不存在交由 /stream 签名校验兜底
+	sh, err := a.store.GetShare(req.ShareKey)
+	if err != nil {
+		return nil, fmt.Errorf("query share snapshot: %w", err)
+	}
+	if sh != nil && sh.PanType != req.Pan {
 		return nil, driver.NewErr(driver.KindNotFound, fmt.Sprintf("pan=%s 与解析结果 %s 不一致", req.Pan, sh.PanType), nil)
 	}
 	link, err := a.resolver.GetFreshLink(ctx, req.ShareKey, req.FID, req.ClientUA)
@@ -80,12 +83,12 @@ func (a *Aria2) Push(ctx context.Context, req PushRequest) (*PushResult, error) 
 		if link.Referer != "" {
 			headers = append(headers, "Referer: "+link.Referer)
 		}
-		if len(cookie) > 0 && string(cookie) != "" {
+		if len(cookie) > 0 {
 			headers = append(headers, "Cookie: "+string(cookie))
 		}
 	} else {
 		// 绑 IP 且 aria2 不同机:走中转 URL(aria2 下载 PanRouter 的 /stream)
-		sig := a.signer.Sign(req.Pan+"|"+req.ShareKey+"|"+req.FID, c.Server.SignTTL)
+		sig := a.signer.Sign(req.Pan+"|"+req.ShareKey+"|"+req.FID, c.Server.EffectiveSignTTL())
 		target = fmt.Sprintf("%s/stream/%s/%s/%s?sig=%s", c.Server.BaseURL, req.Pan, req.ShareKey, req.FID, sig)
 		route = "stream"
 	}

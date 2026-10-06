@@ -1,4 +1,4 @@
-// Resolver:解析编排(设计文档 §4.4)——识别 → 缓存 → driver → 决策 → 落库。
+// Resolver:解析编排——识别 → 缓存 → driver → 决策 → 落库。
 package service
 
 import (
@@ -42,7 +42,7 @@ type Resolver struct {
 
 	// 过期直链刷新收敛:并发 /d 请求同一过期链接只触发一次真实刷新
 	sf singleflight.Group
-	// 单网盘在途并发闸(设计文档 §7.7,capacity 来自 driver 配置 download_concurrency)
+	// 单网盘在途并发闸(capacity 来自 driver 配置 download_concurrency)
 	semMu sync.Mutex
 	sems  map[string]chan struct{}
 }
@@ -55,7 +55,7 @@ func NewResolver(cfg *config.Provider, reg *driver.Registry, store *repo.Store, 
 		sems: map[string]chan struct{}{}}
 }
 
-// acquire 获取单网盘在途并发额度(设计文档 §7.7)。
+// acquire 获取单网盘在途并发额度。
 // 满载时排队等待(保护账号不被并发拉爆),ctx 取消或超过等待上限才失败。
 func (r *Resolver) acquire(ctx context.Context, pan string) (release func(), err error) {
 	limit := int(r.driverCfg(pan).DownloadConc)
@@ -201,7 +201,12 @@ func (r *Resolver) guardKey(ctx context.Context, pan string) string {
 // 游客与已登录分桶,避免匿名刷分享把管理员提链熔断。
 func (r *Resolver) guard(ctx context.Context, pan string, fn func() error) error {
 	key := r.guardKey(ctx, pan)
+	scope := "login"
+	if key != pan {
+		scope = "guest"
+	}
 	b := r.breakers.Get(key)
+	r.met.Set("panrouter_breaker_open", map[string]string{"pan": pan, "scope": scope}, boolGauge(b.Opened()))
 	if !b.Allow() {
 		r.met.Inc("panrouter_driver_error_total", map[string]string{"pan": pan, "kind": "breaker_open"})
 		return driver.NewErr(driver.KindRiskControl, "该网盘熔断中(近期风控/异常过多),请稍后再试", nil)
@@ -216,12 +221,12 @@ func (r *Resolver) guard(ctx context.Context, pan string, fn func() error) error
 		fail = de.Kind == driver.KindRiskControl || de.Kind == driver.KindUpstream
 		r.met.Inc("panrouter_driver_error_total", map[string]string{"pan": pan, "kind": string(de.Kind)})
 		if de.Kind == driver.KindInterfaceChanged {
-			// 接口改版是高优告警:不熔断、不重试,直接通知维护者(设计文档 §4.2 禁手)
+			// 接口改版是高优告警:不熔断、不重试,直接通知维护者(禁手)
 			r.log.Errorf("[ALARM] driver interface changed: pan=%s err=%s", pan, de.Error())
 		}
 	}
 	b.Record(!fail, r.breakers.MaxFails(), r.breakers.Cooldown())
-	r.met.Set("panrouter_breaker_open", map[string]string{"pan": pan}, boolGauge(b.Opened()))
+	r.met.Set("panrouter_breaker_open", map[string]string{"pan": pan, "scope": scope}, boolGauge(b.Opened()))
 	return err
 }
 
@@ -393,14 +398,18 @@ func (r *Resolver) ResolveFile(ctx context.Context, rawURL, pwd, fid string, own
 	pan := drv.ID()
 	key := r.shareKey(pan, rawURL, pwd)
 
-	if l, _ := r.store.GetLink(key, fid); l != nil {
+	cached, err := r.store.GetLink(key, fid)
+	if err != nil {
+		return nil, fmt.Errorf("query link cache: %w", err)
+	}
+	if cached != nil {
 		// 游客不得复用或覆盖带账号 Cookie 的直链(管理员提链结果不能共享给匿名 /resolve)。
-		if !canPick(ctx) && r.linkHoldsCookie(l) {
+		if !canPick(ctx) && r.linkHoldsCookie(cached) {
 			return nil, r.mapErr(ctx, pan, nil, driver.NewErr(driver.KindAuthExpired, "该分享直链需要登录态", nil))
 		}
-		if l.ExpiresAt.After(time.Now()) {
+		if cached.ExpiresAt.After(time.Now()) {
 			r.met.Inc("panrouter_link_cache_hit_total", map[string]string{"pan": pan})
-			return r.buildResult(pan, key, l, clientUA, true), nil
+			return r.buildResult(pan, key, cached, clientUA, true), nil
 		}
 	}
 
@@ -425,7 +434,10 @@ func (r *Resolver) ResolveFile(ctx context.Context, rawURL, pwd, fid string, own
 	if err := r.mapErr(ctx, pan, acc, err); err != nil {
 		return nil, err
 	}
-	name, size, ext := r.fileMeta(key, fid, ref)
+	name, size, ext, merr := r.fileMeta(key, fid, ref)
+	if merr != nil {
+		return nil, merr
+	}
 	cookieEnc, err := r.aes.EncryptBytes([]byte(dl.Cookie))
 	if err != nil {
 		return nil, fmt.Errorf("encrypt cookie: %w", err)
@@ -436,32 +448,42 @@ func (r *Resolver) ResolveFile(ctx context.Context, rawURL, pwd, fid string, own
 		DirectLink: dl.URL, UA: dl.UA, Referer: dl.Referer, CookieEnc: cookieEnc,
 		BindIP: dl.BindIP, ExpiresAt: dl.ExpiresAt, Ext: string(extJSON),
 	}
+	// 落库失败必须报错:直链未持久化时不得返回看似成功的下载入口(P2-6)。
 	if err := r.store.UpsertLink(l); err != nil {
-		r.log.Warnf("save link: %v", err)
+		return nil, fmt.Errorf("save link: %w", err)
 	}
 	r.met.Inc("panrouter_resolve_total", map[string]string{"pan": pan, "kind": "file"})
 	return r.buildResult(pan, key, l, clientUA, false), nil
 }
 
 // buildRef 组装 FileRef:优先用已缓存 link 的 ext,其次从分享快照的节点里取。
+// DB 故障向上传播;只有记录确实不存在时才允许降级为空上下文。
 func (r *Resolver) buildRef(key, fid string, own bool) (*driver.FileRef, error) {
 	ref := &driver.FileRef{Own: own, FID: fid, ShareKey: key}
 	if own {
 		return ref, nil
 	}
-	if l, _ := r.store.GetLink(key, fid); l != nil && l.Ext != "" {
+	l, err := r.store.GetLink(key, fid)
+	if err != nil {
+		return nil, fmt.Errorf("query link cache: %w", err)
+	}
+	if l != nil && l.Ext != "" {
 		_ = json.Unmarshal([]byte(l.Ext), &ref.Ext)
 	}
 	if len(ref.Ext) == 0 {
-		var sh repo.Share
-		if err := r.store.DB().Where("share_key = ?", key).First(&sh).Error; err == nil {
-			var nodes []driver.FileNode
-			if json.Unmarshal([]byte(sh.RawTree), &nodes) == nil {
-				for _, n := range nodes {
-					if n.FID == fid {
-						ref.Ext = n.Ext
-						break
-					}
+		sh, err := r.store.GetShare(key)
+		if err != nil {
+			return nil, fmt.Errorf("query share snapshot: %w", err)
+		}
+		if sh == nil {
+			return ref, nil
+		}
+		var nodes []driver.FileNode
+		if json.Unmarshal([]byte(sh.RawTree), &nodes) == nil {
+			for _, n := range nodes {
+				if n.FID == fid {
+					ref.Ext = n.Ext
+					break
 				}
 			}
 		}
@@ -469,24 +491,32 @@ func (r *Resolver) buildRef(key, fid string, own bool) (*driver.FileRef, error) 
 	return ref, nil
 }
 
-func (r *Resolver) fileMeta(key, fid string, ref *driver.FileRef) (string, int64, map[string]string) {
-	if l, _ := r.store.GetLink(key, fid); l != nil && l.FileName != "" {
+func (r *Resolver) fileMeta(key, fid string, ref *driver.FileRef) (string, int64, map[string]string, error) {
+	l, err := r.store.GetLink(key, fid)
+	if err != nil {
+		return "", 0, nil, fmt.Errorf("query link cache: %w", err)
+	}
+	if l != nil && l.FileName != "" {
 		var ext map[string]string
 		_ = json.Unmarshal([]byte(l.Ext), &ext)
-		return l.FileName, l.Size, ext
+		return l.FileName, l.Size, ext, nil
 	}
-	var sh repo.Share
-	if err := r.store.DB().Where("share_key = ?", key).First(&sh).Error; err == nil {
-		var nodes []driver.FileNode
-		if json.Unmarshal([]byte(sh.RawTree), &nodes) == nil {
-			for _, n := range nodes {
-				if n.FID == fid {
-					return n.Name, n.Size, n.Ext
-				}
+	sh, err := r.store.GetShare(key)
+	if err != nil {
+		return "", 0, nil, fmt.Errorf("query share snapshot: %w", err)
+	}
+	if sh == nil {
+		return "文件", 0, ref.Ext, nil
+	}
+	var nodes []driver.FileNode
+	if json.Unmarshal([]byte(sh.RawTree), &nodes) == nil {
+		for _, n := range nodes {
+			if n.FID == fid {
+				return n.Name, n.Size, n.Ext, nil
 			}
 		}
 	}
-	return "文件", 0, ref.Ext
+	return "文件", 0, ref.Ext, nil
 }
 
 // buildResult 由 repo.Link 派生下载路径与签名链接。
@@ -496,11 +526,9 @@ func (r *Resolver) buildResult(pan, key string, l *repo.Link, clientUA string, c
 	cfg := r.cfg.Get()
 	env := RouteEnv{Profile: cfg.Server.DeployProfile, ClientUA: clientUA, Aria2SameHost: cfg.Aria2.SameHost}
 	route := Route(meta, env)
-	ttl := time.Until(l.ExpiresAt)
-	if ttl <= 0 {
-		ttl = time.Minute
-	}
-	sig := r.signer.Sign(pan+"|"+key+"|"+l.FID, ttl)
+	// 下载入口签名统一使用配置 sign_ttl,与上游直链剩余有效期(ExpiresAt)解耦:
+	// 短 TTL 直链过期后签名仍有效,GetFreshLink 可在入口有效期内续命(P2-5)。
+	sig := r.signer.Sign(pan+"|"+key+"|"+l.FID, cfg.Server.EffectiveSignTTL())
 	base := strings.TrimSuffix(cfg.Server.BaseURL, "/")
 	res := &ResolveFileResult{
 		Pan: pan, ShareKey: key, FID: l.FID, FileName: l.FileName, Size: l.Size,
@@ -510,39 +538,61 @@ func (r *Resolver) buildResult(pan, key string, l *repo.Link, clientUA string, c
 		DirectURL:   l.DirectLink,
 		UA:          l.UA,
 		Referer:     l.Referer,
-		NeedHeaders: len(cookie) > 0 || l.Referer != "" || (l.UA != "" && !strings.EqualFold(l.UA, clientUA)),
+		NeedHeaders: NeedHeaders(l.UA, l.Referer, string(cookie), clientUA),
 		ExpiresAt:   l.ExpiresAt,
 		CacheHit:    cacheHit,
 	}
 	// 路由计数在"实际服务决策点"记录:/d(302 或降级)与 aria2 推送,而非解析时的预测
 	return res
 }
+
+// refreshBudget 是共享刷新任务的独立期限:不跟随任何一个 HTTP 请求的生命周期,
+// 但必须有界,避免异常 driver 卡死后续所有等待者。
+const refreshBudget = 120 * time.Second
+
+// GetFreshLink 返回未过期直链;过期/缺失时经 singleflight 收敛为一次真实刷新。
+// 共享任务使用独立有界 ctx(不绑定首个调用者),首调取消不拖垮等待者(P2-12);
+// 每个等待者仍会响应自身 ctx 的取消。
 func (r *Resolver) GetFreshLink(ctx context.Context, shareKey, fid, clientUA string) (*repo.Link, error) {
-	if l, _ := r.store.GetLink(shareKey, fid); l != nil && l.ExpiresAt.After(time.Now()) {
+	l, err := r.store.GetLink(shareKey, fid)
+	if err != nil {
+		return nil, fmt.Errorf("query link cache: %w", err)
+	}
+	if l != nil && l.ExpiresAt.After(time.Now()) {
 		return l, nil
 	}
-	// singleflight:并发请求同一过期链接收敛为一次真实刷新(其余等待复用结果)。
-	// 续命是否 Pick 由库内是否已有 Link 决定,不跟第一个 HTTP 请求的游客/登录态走。
 	v, err, _ := r.sf.Do("link:"+shareKey+"|"+fid, func() (any, error) {
-		existing, _ := r.store.GetLink(shareKey, fid)
-		if existing != nil && existing.ExpiresAt.After(time.Now()) {
-			return existing, nil
+		existing, err := r.store.GetLink(shareKey, fid)
+		if err != nil {
+			return nil, fmt.Errorf("query link cache: %w", err)
 		}
-		refreshCtx := ctx
+		refreshCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), refreshBudget)
+		defer cancel()
 		if existing != nil {
-			refreshCtx = withPick(ctx)
+			refreshCtx = withPick(refreshCtx)
 		}
-		var sh repo.Share
-		if err := r.store.DB().Where("share_key = ?", shareKey).First(&sh).Error; err != nil {
+		sh, err := r.store.GetShare(shareKey)
+		if err != nil {
+			return nil, fmt.Errorf("query share snapshot: %w", err)
+		}
+		if sh == nil {
 			return nil, fmt.Errorf("share %s not found, cannot refresh link", shareKey)
 		}
 		if _, err := r.ResolveFile(refreshCtx, sh.ShareURL, sh.Pwd, fid, false, clientUA); err != nil {
 			return nil, err
 		}
-		return r.store.GetLink(shareKey, fid)
+		fresh, err := r.store.GetLink(shareKey, fid)
+		if err != nil {
+			return nil, fmt.Errorf("query link cache: %w", err)
+		}
+		return fresh, nil
 	})
 	if err != nil {
 		return nil, err
+	}
+	// 等待者在其自身 ctx 已取消时立即失败,不再消费共享结果。
+	if cerr := ctx.Err(); cerr != nil {
+		return nil, cerr
 	}
 	l, ok := v.(*repo.Link)
 	if !ok || l == nil {

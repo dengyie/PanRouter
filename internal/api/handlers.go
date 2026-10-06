@@ -3,20 +3,26 @@ package api
 import (
 	"context"
 	"encoding/json"
-	"io/fs"
 	"net/http"
 	"strconv"
-	"strings"
 	"time"
 
 	"github.com/go-chi/chi/v5"
 
 	"github.com/dengyie/panrouter/internal/driver"
+	"github.com/dengyie/panrouter/internal/driver/quark"
 	"github.com/dengyie/panrouter/internal/repo"
 	"github.com/dengyie/panrouter/internal/service"
 )
 
 // ---- 解析 ----
+
+// 批量解析预算契约(§15.3):单项预算与单请求上限。
+// 超限返回 400(unsupported 语义),部分成功——单项失败不中断批,逐项回填 error。
+const (
+	ResolvePerItemTimeout = 90 * time.Second
+	ResolveBatchMaxItems  = 50
+)
 
 type resolveReq struct {
 	URL string `json:"url"`
@@ -35,7 +41,7 @@ func clientUA(r *http.Request, explicit string) string {
 }
 
 func (d *Deps) doResolve(r *http.Request, q resolveReq) (any, error) {
-	ctx, cancel := context.WithTimeout(r.Context(), 90*time.Second)
+	ctx, cancel := context.WithTimeout(r.Context(), ResolvePerItemTimeout)
 	defer cancel()
 	ua := clientUA(r, q.UA)
 	if q.FID == "" {
@@ -81,8 +87,8 @@ func (d *Deps) handleResolveBatch(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, driver.NewErr(driver.KindNotFound, "请求格式错误", err))
 		return
 	}
-	if len(q.Items) == 0 || len(q.Items) > 50 {
-		writeErr(w, driver.NewErr(driver.KindNotFound, "items 数量须在 1-50", nil))
+	if len(q.Items) == 0 || len(q.Items) > ResolveBatchMaxItems {
+		writeErr(w, driver.NewErr(driver.KindUnsupported, "items 数量须在 1-"+strconv.Itoa(ResolveBatchMaxItems), nil))
 		return
 	}
 	out := make([]batchItem, 0, len(q.Items))
@@ -139,51 +145,99 @@ func (d *Deps) handleCreateAccount(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, driver.NewErr(driver.KindNotFound, "请求格式错误", err))
 		return
 	}
-	if _, ok := d.Resolver.Registry().Get(q.PanType); !ok {
-		writeErr(w, driver.NewErr(driver.KindNotFound, "不支持的网盘类型:"+q.PanType, nil))
-		return
-	}
-	if strings.TrimSpace(q.Cookie) == "" {
-		writeErr(w, driver.NewErr(driver.KindNotFound, "cookie 不能为空", nil))
-		return
-	}
-	enc, err := d.Accounts.EncryptCred(&driver.Credential{Cookie: q.Cookie})
+	acc, err := d.Accounts.Create(q.PanType, q.Name, q.Cookie, func(pan string) bool {
+		_, ok := d.Resolver.Registry().Get(pan)
+		return ok
+	})
 	if err != nil {
-		writeErr(w, driver.NewErr(driver.KindUpstream, "凭据加密失败", err))
+		writeErr(w, err)
 		return
 	}
-	acc := &repo.Account{PanType: q.PanType, Name: q.Name, CredEnc: enc, Status: "ok", CredVersion: 1}
-	if err := d.Store.CreateAccount(acc); err != nil {
-		writeErr(w, driver.NewErr(driver.KindUpstream, "保存账号失败", err))
-		return
-	}
-	d.Store.AddAudit("account_create", "pan="+q.PanType+" id="+strconv.FormatUint(uint64(acc.ID), 10))
 	writeJSON(w, http.StatusOK, map[string]any{"account": view(acc)})
+}
+
+// ---- 扫码登录(夸克) ----
+
+// qrDriver 取夸克 driver 的扫码能力;未启用时返回 nil。
+func (d *Deps) qrDriver() *quark.Driver {
+	drv, ok := d.Resolver.Registry().Get("quark")
+	if !ok {
+		return nil
+	}
+	qd, ok := drv.(*quark.Driver)
+	if !ok {
+		return nil
+	}
+	return qd
+}
+
+// handleQRToken POST /api/v1/accounts/quark/qr:生成扫码二维码(一次性 token,前端渲染)。
+func (d *Deps) handleQRToken(w http.ResponseWriter, r *http.Request) {
+	qd := d.qrDriver()
+	if qd == nil {
+		writeErr(w, driver.NewErr(driver.KindNotFound, "夸克 driver 未启用", nil))
+		return
+	}
+	qr, err := qd.QRToken(r.Context())
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, qr)
+}
+
+type qrPollReq struct {
+	Token string `json:"token"`
+	Name  string `json:"name"`
+}
+
+// handleQRPoll POST /api/v1/accounts/quark/qr/poll:轮询扫码状态。
+// pending 直接返回;confirmed 即以换好的 Cookie 建号入库(免手动贴 Cookie 的核心闭环)。
+func (d *Deps) handleQRPoll(w http.ResponseWriter, r *http.Request) {
+	qd := d.qrDriver()
+	if qd == nil {
+		writeErr(w, driver.NewErr(driver.KindNotFound, "夸克 driver 未启用", nil))
+		return
+	}
+	var q qrPollReq
+	if err := json.NewDecoder(r.Body).Decode(&q); err != nil || q.Token == "" {
+		writeErr(w, driver.NewErr(driver.KindNotFound, "token 必填", nil))
+		return
+	}
+	cookie, state, err := qd.QRPoll(r.Context(), q.Token)
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	if state != "confirmed" {
+		writeJSON(w, http.StatusOK, map[string]any{"status": state})
+		return
+	}
+	acc, err := d.Accounts.Create("quark", q.Name, cookie, func(pan string) bool {
+		_, ok := d.Resolver.Registry().Get(pan)
+		return ok
+	})
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"status": "confirmed", "account": view(acc)})
 }
 
 func (d *Deps) handleDeleteAccount(w http.ResponseWriter, r *http.Request) {
 	id, _ := strconv.ParseUint(chi.URLParam(r, "id"), 10, 64)
-	if err := d.Store.DeleteAccount(uint(id)); err != nil {
-		writeErr(w, driver.NewErr(driver.KindUpstream, "删除失败", err))
+	if err := d.Accounts.Delete(uint(id)); err != nil {
+		writeErr(w, err)
 		return
 	}
-	d.Store.AddAudit("account_delete", "id="+strconv.FormatUint(id, 10))
 	writeJSON(w, http.StatusOK, map[string]any{"deleted": true})
 }
 
 func (d *Deps) handleRefreshAccount(w http.ResponseWriter, r *http.Request) {
 	id, _ := strconv.ParseUint(chi.URLParam(r, "id"), 10, 64)
-	acc, err := d.Store.GetAccount(uint(id))
-	if err != nil || acc == nil {
-		writeErr(w, driver.NewErr(driver.KindNotFound, "账号不存在", nil))
-		return
-	}
-	drv, ok := d.Resolver.Registry().Get(acc.PanType)
-	if !ok {
-		writeErr(w, driver.NewErr(driver.KindNotFound, "网盘 driver 未启用", nil))
-		return
-	}
-	st, err := d.Accounts.Check(r.Context(), acc.ID, drv)
+	st, err := d.Accounts.Refresh(r.Context(), uint(id), func(pan string) (driver.Driver, bool) {
+		return d.Resolver.Registry().Get(pan)
+	})
 	if err != nil {
 		writeErr(w, err)
 		return
@@ -242,24 +296,9 @@ func (d *Deps) handleListDownloads(w http.ResponseWriter, _ *http.Request) {
 // ---- 系统 ----
 
 func (d *Deps) handleReady(w http.ResponseWriter, _ *http.Request) {
-	sqlDB, err := d.Store.DB().DB()
-	if err != nil || sqlDB.Ping() != nil {
+	if err := d.Store.Ping(); err != nil {
 		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"status": "db_unavailable"})
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"status": "ready"})
-}
-
-func (d *Deps) handleIndex(w http.ResponseWriter, _ *http.Request) {
-	if d.WebFS == nil {
-		writeJSON(w, http.StatusNotFound, map[string]any{"code": 404, "message": "web not embedded"})
-		return
-	}
-	data, err := fs.ReadFile(d.WebFS, "index.html")
-	if err != nil {
-		writeJSON(w, http.StatusNotFound, map[string]any{"code": 404, "message": "index.html missing"})
-		return
-	}
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	_, _ = w.Write(data)
 }

@@ -74,3 +74,35 @@ func TestLoadMissingExplicitPathIsError(t *testing.T) {
 		t.Fatal("explicit missing path must return error")
 	}
 }
+
+func TestLoadReloadPreservesOmittedFields(t *testing.T) {
+	current := Default()
+	current.Auth.APIToken = "stable-token"
+	current.Auth.JWTSecret = "stable-secret"
+	current.Server.BaseURL = "https://example.test"
+	p := filepath.Join(t.TempDir(), "reload.yaml")
+	if err := os.WriteFile(p, []byte("server:\n  deploy_profile: cloud\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	next, _, err := LoadReload(p, current)
+	if err != nil {
+		t.Fatalf("reload: %v", err)
+	}
+	if next.Auth != current.Auth || next.Server.BaseURL != current.Server.BaseURL {
+		t.Fatalf("reload reverted startup fields: got auth=%+v server=%+v", next.Auth, next.Server)
+	}
+	if next.Server.DeployProfile != "cloud" {
+		t.Fatalf("reloadable profile not applied: %q", next.Server.DeployProfile)
+	}
+}
+
+func TestLoadReloadRejectsStartupChanges(t *testing.T) {
+	current := Default()
+	p := filepath.Join(t.TempDir(), "reload.yaml")
+	if err := os.WriteFile(p, []byte("auth:\n  jwt_secret: rotated\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := LoadReload(p, current); err == nil {
+		t.Fatal("reload must reject startup-only auth changes")
+	}
+}
