@@ -154,7 +154,13 @@ func (d *Driver) CheckCredential(ctx context.Context, cred driver.Credential) (d
 	if _, err := d.callRaw(ctx, "GET", u, nil, &cred, &resp); err != nil {
 		return driver.CredStatus{}, err
 	}
-	if code := string(resp.Code); code != `"OK"` && code != `0` {
+	// code 缺失/null/空串说明响应形态未识别,与"凭据失效"区分开,
+	// 不得把有效 Cookie 静默记为 expired 且诊断留空。
+	code := string(resp.Code)
+	switch {
+	case len(resp.Code) == 0 || code == "null" || code == `""`:
+		return driver.CredStatus{}, driver.NewErr(driver.KindInterfaceChanged, "夸克账号信息响应缺少业务码,疑似接口改版", nil)
+	case code != `"OK"` && code != `0`:
 		return driver.CredStatus{Valid: false, Message: resp.Message}, nil
 	}
 	var data struct {

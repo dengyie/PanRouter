@@ -70,3 +70,35 @@ func TestCheckCredentialIntCodeOK(t *testing.T) {
 		t.Fatalf("status: %+v", st)
 	}
 }
+
+// 回归(review 2026-10-07):200 响应缺 code 字段(null/空)说明形态未识别,
+// 必须归类 interface_changed,不得静默把有效凭据记为 expired 且诊断留空。
+func TestCheckCredentialMissingCodeIsInterfaceChanged(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// 合法 JSON 但无 code 字段
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"success": true,
+			"data":    map[string]any{"nickname": "ghost"},
+		})
+	}))
+	t.Cleanup(ts.Close)
+
+	cl, err := httpx.New(httpx.Options{Timeout: 5 * time.Second, AllowPrivate: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	d := New(cl, "https://drive-pc.quark.cn")
+	d.QRInfoURL = ts.URL + "/account/info"
+
+	st, err := d.CheckCredential(context.Background(), driver.Credential{Cookie: "c=1"})
+	if err == nil {
+		t.Fatal("缺业务码必须报错,不得返回 Valid=false 的静默过期")
+	}
+	if st.Valid {
+		t.Fatal("不得报告 valid")
+	}
+	de, ok := err.(*driver.Error)
+	if !ok || de.Kind != driver.KindInterfaceChanged {
+		t.Fatalf("kind 应为 interface_changed, got %v", err)
+	}
+}

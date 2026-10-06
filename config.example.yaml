@@ -45,14 +45,12 @@ drivers:
     enabled: true
     limit_qps: 2                      # 本地限频,防触发风控
     download_concurrency: 3
-    upstream_allow: [".quark.cn"]
     redirect_allow: [".quark.cn", ".quarkcdn.cn", ".uc.cn"]  # 中转重定向白名单,只能加严
     proxy: ""                         # 可选:http://user:pass@host:port
   lanzou:
     enabled: true
     limit_qps: 5
     download_concurrency: 3
-    upstream_allow: [".lanzouw.com", ".lanzou.com", ".lanzouu.com", ".xlig.cn", ".lanrar.com", ".dmpdmp.com", ".bakstotre.com"]
     redirect_allow: [".lanzouw.com", ".lanzou.com", ".lanzouu.com", ".xlig.cn", ".lanrar.com", ".dmpdmp.com", ".bakstotre.com"]
 
 aria2:
