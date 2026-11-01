@@ -17,6 +17,13 @@ import com.yunx.app.data.db.LinkHistoryEntity
 import com.yunx.app.data.download.DownloadManager
 import com.yunx.app.data.download.DownloadPlatform
 import com.yunx.app.data.download.DownloadSource
+import com.yunx.app.data.panrouter.PanRouterError
+import com.yunx.app.data.panrouter.PanRouterResolveGateway
+import com.yunx.app.data.panrouter.PanRouterSettings
+import com.yunx.app.data.panrouter.RemoteBatchItem
+import com.yunx.app.data.panrouter.RemoteLinkResult
+import com.yunx.app.data.panrouter.RemoteResolveResult
+import com.yunx.app.data.panrouter.ResolveRouter
 import com.yunx.app.data.network.BaiduConstants
 import com.yunx.app.data.network.C139Constants
 import com.yunx.app.data.network.GitHubApi
@@ -31,6 +38,7 @@ import com.yunx.app.data.network.ILanzouConstants
 import com.yunx.app.data.network.LanzouConstants
 import com.yunx.app.data.network.Pan115Constants
 import com.yunx.app.data.network.Pan123Constants
+import com.yunx.app.data.network.ParsedLink
 import com.yunx.app.data.network.QuarkConstants
 import com.yunx.app.data.network.QuarkCdn
 import com.yunx.app.data.network.GitHubMirror
@@ -68,6 +76,7 @@ import com.yunx.app.data.repository.XunleiAccountRepository
 import com.yunx.app.data.repository.XunleiResolveRepository
 import com.yunx.app.ui.SnackbarController
 import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Semaphore
@@ -130,7 +139,12 @@ class ResolveViewModel(
      * （工厂侧用 `multiSourceActive()` 判断，已保证 C2 生效时 C1 也开着）。
      * 开启后同一个文件用多个账号各取一条直链，分片轮流交给不同直链下载，见 [fetchAltLinks]。
      */
-    private val multiSourceDownloadProvider: () -> Boolean = { false }
+    private val multiSourceDownloadProvider: () -> Boolean = { false },
+    /**
+     * PanRouter 服务端解析网关（null = 未启用集成）：非空且配置开启时，覆盖平台优先走服务端解析，
+     * 失败按策略回落本地链（docs/INTEGRATION-PANROUTER.md §3.2）。
+     */
+    private val panRouterGateway: PanRouterResolveGateway? = null
 ) : ViewModel() {
 
     init {
@@ -227,6 +241,11 @@ class ResolveViewModel(
 
     /** 请求转存：记录目标文件并打开目录选择弹窗 */
     fun requestSave(file: ShareFile) {
+        // 服务端解析模式：直链由服务端账号池提链，本地无需（也不该）转存
+        if (isRemote) {
+            downloadError = "云端解析模式无需转存，直接下载即可"
+            return
+        }
         // 游客模式只开放列目录：转存需要登录，直接给提示，别让用户进到空的目录选择
         if (isGuest) {
             downloadError = "转存需要先登录${platformName()}（未登录仅能浏览文件列表）"
@@ -445,6 +464,10 @@ class ResolveViewModel(
 
     /** 批量转存到网盘根目录（夸克 / 迅雷 / 百度分平台；仅支持转存的平台） */
     fun batchSaveToCloud() {
+        if (isRemote) {
+            downloadError = "云端解析模式无需转存，直接下载即可"
+            return
+        }
         val files = _selected.toList()
         val s = session ?: return
         viewModelScope.launch {
@@ -529,6 +552,53 @@ class ResolveViewModel(
 
     /** 批量下载：逐个取直链入队（选中文件夹时递归下载整个文件夹并保持目录结构，全部获取完再统一切到下载页） */
     fun batchDownload(saveDir: String = "") {
+        // 服务端解析分支：逐文件带 fid 取直链后本地分片入队。
+        // 客户端自律：串行取链 + 小间隔（服务端另有 per-pan 限频与并发闸排队兜底，规格 §8.4）
+        if (isRemote) {
+            val files = _selected.toList()
+            if (files.isEmpty()) return
+            viewModelScope.launch {
+                isBatchWorking = true
+                batchProgress = "正在取直链 0/${files.size}…"
+                batchCancelRequested = false
+                try {
+                    val gateway = panRouterGateway
+                    if (gateway == null) {
+                        downloadError = "服务端解析不可用"
+                        return@launch
+                    }
+                    var queued = 0
+                    var failed = 0
+                    var cancelled = false
+                    for (file in files) {
+                        if (batchCancelRequested) { cancelled = true; break }
+                        resolveRemoteFor(gateway, file)
+                            .onSuccess { lr ->
+                                enqueueRemote(
+                                    lr,
+                                    fileName = lr.fileName.ifBlank { file.fname },
+                                    sizeHint = file.fsize,
+                                    saveDir = saveDir
+                                )
+                                queued++
+                            }
+                            .onFailure { failed++ }
+                        batchProgress = "正在取直链 ${queued + failed}/${files.size}…"
+                        delay(150)
+                    }
+                    downloadError = when {
+                        cancelled -> "已中断批量下载：入队 $queued，失败 $failed，跳过 ${files.size - queued - failed}"
+                        failed == 0 -> "已入队 $queued 个文件"
+                        else -> "已入队 $queued 个文件，失败 $failed 个"
+                    }
+                    downloadStarted = queued > 0
+                } finally {
+                    isBatchWorking = false
+                    batchCancelRequested = false
+                }
+            }
+            return
+        }
         // GitHub 分支：无需凭证/取链 API，逐文件构造直链入队（代码文件夹递归收集 blob）
         if (currentPlatform == SharePlatform.GITHUB) {
             batchGitHubDownload(saveDir)
@@ -736,6 +806,26 @@ class ResolveViewModel(
     /** 当前解析平台（QUARK / UC / XUNLEI），由链接自动检测 */
     private var currentPlatform: SharePlatform = SharePlatform.QUARK
 
+    // ---------- PanRouter 服务端解析状态（docs/INTEGRATION-PANROUTER.md §4.3） ----------
+
+    /** 本次解析是否来自服务端（非 null = 远端模式：扁平文件列表，无目录导航/转存） */
+    private var remoteShare: RemoteResolveResult? = null
+
+    /** 最近一次取回的服务端单文件直链（含 ua/referer/route），由紧接着的 startDownload 消费后清空 */
+    private var pendingRemoteLink: RemoteLinkResult? = null
+
+    /** 批量解析（M2）：每个分享的原始请求 (url, pwd)，按服务端返回的 index 对齐 */
+    private var remoteBatchLinks: List<Pair<String, String?>> = emptyList()
+
+    /** 批量解析：合成 fid（"b<index>:<fid>"）→ 原始分享 (url, pwd)，取链时路由回所属分享 */
+    private val remoteBatchContext = HashMap<String, Pair<String, String?>>()
+
+    /** 服务端批量单批上限（panrouter ResolveBatchMaxItems = 50） */
+    private val batchChunk = 50
+
+    /** 当前是否为服务端解析模式（转存/目录导航在此模式下全部不适用；批量下载走远端分支） */
+    val isRemote: Boolean get() = remoteShare != null || remoteBatchContext.isNotEmpty()
+
     /** 当前平台凭证（夸克/UC/百度/139/115 用 cookie，迅雷/123 用 access_token；GitHub 无需凭证） */
     private suspend fun currentCredential(): String? = when (currentPlatform) {
         SharePlatform.UC -> ucAccountRepository.getAccount()?.cookie
@@ -890,6 +980,29 @@ class ResolveViewModel(
             startGitHubResolve(github)
             return
         }
+        // 多链接批量（M2 resolve/batch）：粘贴 ≥2 个分享链接且全部为服务端覆盖平台时走批量；
+        // 集成关闭或服务端不可达 → 退回单链接流程（口令转换 / 本地链照旧）
+        val batchGateway = panRouterGateway
+        val multiLinks = ShareLinkParser.parseAll(link)
+        if (batchGateway != null && multiLinks.size > 1) {
+            if (multiLinks.any { batchGateway.serverPanFor(it.share.platform) == null }) {
+                prefillRequest = lastResolveInput
+                uiState = ResolveUiState.Error("批量解析仅支持夸克 / 蓝奏云分享，其余网盘请分开粘贴解析")
+                return
+            }
+            when {
+                !PanRouterSettings().isConfigured() -> {
+                    // 集成已关闭：走单链接流程（无提示，行为与未集成时一致）
+                }
+                !batchGateway.isServerUp() -> {
+                    SnackbarController.show("PanRouter 不可达，本次仅解析第一个链接，其余请服务端恢复后重试")
+                }
+                else -> {
+                    startRemoteBatch(batchGateway, multiLinks)
+                    return
+                }
+            }
+        }
         viewModelScope.launch {
             uiState = ResolveUiState.Loading
             // 中文口令兜底（既不是分享链接、也不是 GitHub 链接）：**先迅雷，迅雷没给出可用链接再问星海**。
@@ -920,6 +1033,26 @@ class ResolveViewModel(
             // 口令已换成真实分享链接：收藏 / 复制 / 重新解析都用它，而不是原始口令
             currentLink = effectiveLink
             currentPlatform = parsed.platform
+            // 服务端解析优先（docs/INTEGRATION-PANROUTER.md §3.2）：平台被 PanRouter 覆盖且可达时
+            // 走服务端（解析 IP 固定在服务端 + 直链缓存共享），失败按策略回落本地链。
+            val gateway = panRouterGateway
+            if (gateway != null && gateway.shouldResolveRemotely(parsed.platform)) {
+                val remoteResult = gateway.resolveShare(parsed.platform, effectiveLink, parsed.pwd)
+                val remote = remoteResult.getOrNull()
+                if (remote != null) {
+                    applyRemoteResolve(remote)
+                    return@launch
+                }
+                val err = remoteResult.exceptionOrNull()
+                val canFallback = err is PanRouterError && err.shouldFallbackToLocal &&
+                    PanRouterSettings().fallbackToLocal
+                if (!canFallback) {
+                    prefillRequest = lastResolveInput
+                    uiState = ResolveUiState.Error(remoteUserMessage(err))
+                    return@launch
+                }
+                // 可回落：继续走下方本地原生链（每次解析至多回落一次，防抖）
+            }
             // 游客模式：列目录不要求登录（6 个网盘的分享列表接口都允许匿名）。
             // 凭据为空时传空串，是否放行由服务端决定；下载/转存仍在各自入口要求登录。
             val credential = currentCredential().orEmpty()
@@ -951,6 +1084,115 @@ class ResolveViewModel(
      * 记录解析历史到 link_history 表：同 URL 在 1 小时内已存在则跳过（避免重复解析污染历史）。
      * 失败静默忽略（不阻断主流程）。
      */
+    /**
+     * 服务端批量解析（M2）：结果合并为扁平列表（文件名带「[序号] 」前缀区分所属分享），
+     * 部分成功语义 —— 失败的分享计数提示，成功的照常列出。
+     * 服务端单批上限 50 项（ResolveBatchMaxItems），超出切片串行。
+     */
+    private fun startRemoteBatch(gateway: PanRouterResolveGateway, links: List<ParsedLink>) {
+        viewModelScope.launch {
+            uiState = ResolveUiState.Loading
+            remoteBatchLinks = links.map { it.url to it.share.pwd }
+            remoteBatchContext.clear()
+            val items = remoteBatchLinks
+            val all = ArrayList<RemoteBatchItem>()
+            for (chunk in items.chunked(batchChunk)) {
+                gateway.resolveBatch(chunk)
+                    .onSuccess { all.addAll(it) }
+                    .onFailure { e ->
+                        uiState = ResolveUiState.Error(remoteUserMessage(e))
+                        return@launch
+                    }
+            }
+            val failedCount = all.count { !it.ok || it.result == null }
+            val files = ArrayList<ShareFile>()
+            all.filter { it.ok && it.result != null }.sortedBy { it.index }.forEach { item ->
+                val urlPwd = items.getOrNull(item.index) ?: return@forEach
+                item.result!!.files
+                    .filter { !it.isDir && it.fid.isNotBlank() }
+                    .forEach { f ->
+                        val key = "b${item.index}:${f.fid}"
+                        remoteBatchContext[key] = urlPwd
+                        files.add(
+                            ShareFile(
+                                fid = key,
+                                fname = "[${item.index + 1}] ${f.name}",
+                                fsize = f.size,
+                                isdir = false,
+                                pdirFid = "",
+                                fidToken = ""
+                            )
+                        )
+                    }
+            }
+            if (files.isEmpty()) {
+                remoteBatchLinks = emptyList()
+                prefillRequest = lastResolveInput
+                uiState = ResolveUiState.Error("批量解析没有可用文件" + if (failedCount > 0) "（$failedCount 个分享解析失败）" else "")
+                return@launch
+            }
+            val title = "云端批量 · ${all.size - failedCount} 个分享"
+            session = ShareSession(shareId = "", stoken = "", title = title)
+            currentDirFid = ""
+            dirStack.clear()
+            pathNames = emptyList()
+            isGuest = false
+            runCatching { recordLinkHistory(title) }
+            uiState = ResolveUiState.Detail(session = session!!, files = files)
+            if (failedCount > 0) SnackbarController.show("$failedCount 个分享解析失败，其余已列出")
+        }
+    }
+
+    /**
+     * 远端单文件取链：批量模式按批次上下文路由回所属分享（fid 前缀 "b<index>:" 剥离），
+     * 普通远端模式用当前链接。
+     */
+    private suspend fun resolveRemoteFor(gateway: PanRouterResolveGateway, file: ShareFile): Result<RemoteLinkResult> {
+        val entry = remoteBatchContext[file.fid]
+        return if (entry != null) {
+            gateway.resolveLink(entry.first, entry.second, file.fid.substringAfter(':'))
+        } else {
+            gateway.resolveLink(currentLink.orEmpty(), currentPwd, file.fid)
+        }
+    }
+
+    /**
+     * 应用服务端解析结果（docs/INTEGRATION-PANROUTER.md §4.3）：
+     * 服务端返回**递归展开的扁平文件列表**（名称带相对路径，夸克 driver walkShare 语义），
+     * 直接映射为 Detail 态展示 —— 无目录导航（M1），转存/批量入口已由 isRemote 守卫拦截。
+     */
+    private suspend fun applyRemoteResolve(remote: RemoteResolveResult) {
+        remoteShare = remote
+        pendingRemoteLink = null
+        val files = remote.files
+            .filter { !it.isDir && it.fid.isNotBlank() }
+            .map { ShareFile(fid = it.fid, fname = it.name, fsize = it.size, isdir = false, pdirFid = "", fidToken = "") }
+        // 服务端不返回分享标题：单文件用文件名，多文件用聚合描述（历史记录展示用）
+        val title = when {
+            files.isEmpty() -> "云端解析"
+            files.size == 1 -> files.first().fname.substringAfterLast('/')
+            else -> "云端解析 · ${files.size} 个文件"
+        }
+        session = ShareSession(shareId = remote.shareKey, stoken = "", title = title)
+        currentDirFid = ""
+        dirStack.clear()
+        pathNames = emptyList()
+        isGuest = false
+        // 记录到链接历史（同本地链路；失败不影响解析）
+        runCatching { recordLinkHistory(title) }
+        if (files.isEmpty()) {
+            uiState = ResolveUiState.Error(remote.hint ?: "服务端未返回任何文件")
+        } else {
+            uiState = ResolveUiState.Detail(session = session!!, files = files)
+            // 自动提链截断等服务端提示用 Snackbar 呈现（不阻断列表浏览）
+            remote.hint?.takeIf { it.isNotBlank() }?.let { SnackbarController.show(it) }
+        }
+    }
+
+    /** 服务端解析失败的用户文案（网络错误补「已回落失败」上下文由调用方判断） */
+    private fun remoteUserMessage(err: Throwable?): String =
+        (err as? PanRouterError)?.userMessage() ?: err?.message ?: "服务端解析失败"
+
     private suspend fun recordLinkHistory(title: String) {
         val link = currentLink?.takeIf { it.isNotBlank() } ?: return
         val existing = linkHistoryDao.search(link).first()
@@ -1588,6 +1830,8 @@ class ResolveViewModel(
 
     /** 进入文件夹 */
     fun openFolder(file: ShareFile) {
+        // 服务端解析模式：扁平列表无目录可进（isRemote 下列表只有文件），防御性忽略
+        if (isRemote) return
         // GitHub 分支：fid 前缀分发，无需网盘凭证
         if (currentPlatform == SharePlatform.GITHUB) {
             // 「加载更多」虚拟项：原地追加分页，不入目录栈
@@ -1658,6 +1902,11 @@ class ResolveViewModel(
         downloadLink = null
         currentLink = null
         currentPwd = null
+        // 重置服务端解析状态（下次解析重新分流）
+        remoteShare = null
+        pendingRemoteLink = null
+        remoteBatchLinks = emptyList()
+        remoteBatchContext.clear()
         pathNames = emptyList()
         // 重置 GitHub 平台状态
         currentGitHubRepo = null
@@ -1738,6 +1987,34 @@ class ResolveViewModel(
     }
 
     /**
+     * 服务端直链入队（单文件弹窗与批量共用）：
+     * - 直连（302 路由）→ 分片全速，线程数跟随平台设置；
+     * - 中转（/stream，cloud 画像 BindIP 或降级）→ 任务级线程降档 ≤4（pxed 上行是多设备共享瓶颈，规格 §8.5）；
+     * - 请求头按服务端指令注入（need_headers 的 UA/Referer）。
+     */
+    private suspend fun enqueueRemote(
+        remoteLink: RemoteLinkResult,
+        fileName: String,
+        sizeHint: Long,
+        saveDir: String
+    ) {
+        val platform = ResolveRouter.downloadPlatformFor(remoteLink.pan)
+        val headers = buildMap {
+            if (remoteLink.ua.isNotBlank()) put("User-Agent", remoteLink.ua)
+            if (remoteLink.referer.isNotBlank()) put("Referer", remoteLink.referer)
+        }
+        downloadManager.enqueue(
+            url = remoteLink.effectiveUrl(),
+            fileName = fileName,
+            headers = headers,
+            size = if (remoteLink.size > 0) remoteLink.size else sizeHint,
+            platform = platform,
+            threads = if (remoteLink.isRelayRoute) PanRouterSettings().relayThreadsFor(platform) else 0,
+            saveDir = saveDir
+        )
+    }
+
+    /**
      * 登录态取分享直链：默认优先「免转存」——把分享凭证直接交给 file/download 换直链，
      * 不建临时目录、不转存（统一入口见 [ShareResolveRepository.getShareDownloadLinkWithoutSave]）。
      *
@@ -1780,6 +2057,43 @@ class ResolveViewModel(
                         downloadUrl = url,
                         size = file.fsize
                     )
+                } finally {
+                    isFetchingDownloadLink = false
+                }
+            }
+            return
+        }
+        // 服务端解析分支：带 fid 重新 resolve 换单文件直链（含 stream_url/ua/referer；签名 TTL 内服务端缓存命中）。
+        // 直链有时效，必须真正下载时才取，不能复用列表解析时那份（docs/INTEGRATION-PANROUTER.md §8.3）
+        if (isRemote) {
+            viewModelScope.launch {
+                downloadLink = null
+                downloadError = null
+                isFetchingDownloadLink = true
+                try {
+                    val link = currentLink
+                    if (link.isNullOrBlank()) {
+                        downloadError = "请先解析分享"
+                        return@launch
+                    }
+                    val gateway = panRouterGateway
+                    if (gateway == null) {
+                        downloadError = "服务端解析不可用"
+                        return@launch
+                    }
+                    resolveRemoteFor(gateway, file)
+                        .onSuccess { lr ->
+                            pendingRemoteLink = lr
+                            downloadLink = DownloadLink(
+                                fid = file.fid,
+                                filename = file.fname,
+                                downloadUrl = lr.effectiveUrl(),
+                                size = if (lr.size > 0) lr.size else file.fsize
+                            )
+                        }
+                        .onFailure { e ->
+                            downloadError = remoteUserMessage(e)
+                        }
                 } finally {
                     isFetchingDownloadLink = false
                 }
@@ -1837,6 +2151,8 @@ class ResolveViewModel(
         downloadLink = null
         // 弹窗没开始下载就关掉：预取的多源直链一并作废（下次取链会重新预取，避免用到过期直链）
         pendingAltLinks = emptyList()
+        // 服务端直链同样有时效：作废，下次取链重新 resolve（签名 TTL 内服务端缓存命中，无额外成本）
+        pendingRemoteLink = null
         pendingSaveDir = ""
         // 弹窗被关闭（用户点关闭，未开始下载）：清理当前平台的云端临时转存，避免残留
         if (link?.cleanupDirFid != null) {
@@ -2024,6 +2340,19 @@ class ResolveViewModel(
             val saveDir = pendingSaveDir
             downloadLink = null
             pendingSaveDir = ""
+            // 服务端解析分支：直链/中转 URL 进本地分片下载引擎，请求头按服务端指令注入
+            val remoteLink = pendingRemoteLink
+            if (remoteLink != null) {
+                pendingRemoteLink = null
+                try {
+                    enqueueRemote(remoteLink, remoteLink.fileName.ifBlank { link.filename }, link.size, saveDir)
+                    downloadStarted = true
+                } catch (e: Exception) {
+                    Log.e("ResolveVM", "startDownload(panrouter) failed: ${e.javaClass.simpleName}: ${e.message}", e)
+                    downloadError = "下载启动失败：${e.message ?: e.javaClass.simpleName}"
+                }
+                return@launch
+            }
             // GitHub 分支：无需网盘凭证，直链先经镜像前缀转换，带 size 和 platform=github 入队
             if (currentPlatform == SharePlatform.GITHUB) {
                 try {
@@ -2107,7 +2436,9 @@ class ResolveViewModel(
         /** 设置仓库：默认直接读偏好，MainScreen 无需改动；多账号 / 多源开关改完即时生效 */
         private val settings: SettingsRepository = SettingsRepository(),
         private val multiAccountDownloadProvider: () -> Boolean = { settings.multiAccountDownload },
-        private val multiSourceDownloadProvider: () -> Boolean = { settings.multiSourceActive() }
+        private val multiSourceDownloadProvider: () -> Boolean = { settings.multiSourceActive() },
+        /** PanRouter 服务端解析网关（null = 未启用集成）；MainScreen 传 PanRouterHub.gateway */
+        private val panRouterGateway: PanRouterResolveGateway? = null
     ) : ViewModelProvider.Factory {
         @Suppress("UNCHECKED_CAST")
         override fun <T : ViewModel> create(modelClass: KClass<T>, extras: CreationExtras): T {
@@ -2130,7 +2461,8 @@ class ResolveViewModel(
                 mirrorPrefixProvider,
                 noSaveDownloadProvider,
                 multiAccountDownloadProvider,
-                multiSourceDownloadProvider
+                multiSourceDownloadProvider,
+                panRouterGateway
             ) as T
         }
     }

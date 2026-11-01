@@ -72,6 +72,8 @@ import com.yunx.app.data.download.ChunkDownloader
 import com.yunx.app.data.download.DownloadManager
 import com.yunx.app.data.download.DownloadPlatform
 import com.yunx.app.data.gopeed.GopeedEngine
+import com.yunx.app.data.panrouter.PanRouterContribution
+import com.yunx.app.data.panrouter.PanRouterHub
 import com.yunx.app.data.network.BaiduApi
 import com.yunx.app.data.network.C139Api
 import com.yunx.app.data.network.GitHubApi
@@ -645,7 +647,9 @@ fun MainScreen(
             // GitHub 镜像前缀：自动（实测选最快）或用户手动固定，统一由 GitHubMirror 解析
             { GitHubMirror.activePrefix() },
             // 取链方式开关：设置页「免转存下载」实时生效
-            { settings.quarkNoSaveDownload }
+            { settings.quarkNoSaveDownload },
+            // PanRouter 服务端解析网关：设置/Token 实时读取，改配置即时生效（docs/INTEGRATION-PANROUTER.md §4.1）
+            panRouterGateway = PanRouterHub.gateway
         )
     )
     val downloadViewModel: DownloadViewModel = viewModel(
@@ -1089,6 +1093,10 @@ fun MainScreen(
                                     )
                                     currentTab = MainTab.Download
                                 }
+                            },
+                            // PanRouter 账号贡献（M2）：设置页枚举本机覆盖平台账号（入参 = 服务端已有名字）
+                            panRouterContributableProvider = { serverNames ->
+                                PanRouterContribution(db).list(serverNames)
                             }
                         )
                     }

@@ -12,6 +12,12 @@ data class ParsedShare(
     val platform: SharePlatform
 )
 
+/** [ShareLinkParser.parseAll] 的结果：原始 URL + 解析结果（多链接批量解析用） */
+data class ParsedLink(
+    val url: String,
+    val share: ParsedShare
+)
+
 /**
  * 从分享链接或整段分享文案中提取 share_id 与提取码。
  * 支持：pan.quark.cn/s/xxx（夸克）、drive.uc.cn/s/xxx（UC）、pan.xunlei.com/s/xxx（迅雷）
@@ -53,6 +59,26 @@ object ShareLinkParser {
     private val pwdInLanzouUrlRegex = Regex("""[?&](?:pwd|pass|passcode|password)=([A-Za-z0-9]+)""", RegexOption.IGNORE_CASE)
     private val pwdInUrlRegex = Regex("""[?&]pwd=([A-Za-z0-9]+)""")
     private val pwdInTextRegex = Regex("""(?:提取码|访问码|密码)[：:]\s*([A-Za-z0-9]{4,8})""")
+
+    /**
+     * 多链接批量解析：提取文本中**全部**分享链接（按出现顺序，platform|shareId|pwd 去重）。
+     * 提取码优先取 URL 参数，其次兜底整段文案的「提取码：xxxx」（parse 逐 URL 调用时看不到文案，
+     * 这里补齐与单链接 parse 一致的语义）。单链接场景返回 1 条；
+     * 调用方（解析页）据此在「单链接浏览」与「服务端批量解析」间分流。
+     */
+    fun parseAll(text: String): List<ParsedLink> {
+        val textPwd = pwdInTextRegex.find(text)?.groupValues?.getOrNull(1)
+        val out = ArrayList<ParsedLink>()
+        val seen = HashSet<String>()
+        for (match in urlRegex.findAll(text)) {
+            val url = match.value.trimEnd('。', '，', ',', '；', ';', ')', ']', '}', '"', '\'')
+            val parsed = parse(url) ?: continue
+            val effective = if (parsed.pwd == null && textPwd != null) parsed.copy(pwd = textPwd) else parsed
+            val key = "${effective.platform}|${effective.shareId}|${effective.pwd ?: ""}"
+            if (seen.add(key)) out.add(ParsedLink(url = url, share = effective))
+        }
+        return out
+    }
 
     fun parse(text: String): ParsedShare? {
         val url = urlRegex.find(text.trim())?.value

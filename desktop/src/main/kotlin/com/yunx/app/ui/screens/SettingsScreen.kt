@@ -71,6 +71,7 @@ import androidx.compose.ui.input.nestedscroll.nestedScroll
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
+import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import com.yunx.app.AppContext
@@ -82,6 +83,12 @@ import com.yunx.app.data.download.DownloadSaver
 import com.yunx.app.data.network.GitHubMirror
 import com.yunx.app.data.network.HttpClients
 import com.yunx.app.data.network.SystemProxy
+import com.yunx.app.data.panrouter.PanRouterClient
+import com.yunx.app.data.panrouter.PanRouterContribution
+import com.yunx.app.data.panrouter.PanRouterHub
+import com.yunx.app.data.panrouter.PanRouterResolveGateway
+import com.yunx.app.data.panrouter.PanRouterSettings
+import com.yunx.app.data.panrouter.PanRouterTokenStore
 import com.yunx.app.data.prefs.SettingsRepository
 import com.yunx.app.data.update.UpdateChecker
 import com.yunx.app.ui.SnackbarController
@@ -166,6 +173,11 @@ fun SettingsScreen(
     backupManager: AuthBackupManager,
     /** 用应用内置下载器下载更新包；fallbackUrl 非空时作为镜像下载失败后的直连回退（URL + 文件名 + 回退直连） */
     onDownloadUpdateApk: (url: String, fileName: String, fallbackUrl: String?) -> Unit,
+    /**
+     * PanRouter 账号贡献（M2）：枚举本机可贡献账号（服务端覆盖平台）。
+     * 入参 = 服务端账号池现有名字集合（去重展示）；null = 不提供（隐藏入口）。
+     */
+    panRouterContributableProvider: (suspend (serverNames: Set<String>) -> List<PanRouterContribution.Contributable>)? = null,
     modifier: Modifier = Modifier
 ) {
     var showThreadsDialog by remember { mutableStateOf(false) }
@@ -227,6 +239,11 @@ fun SettingsScreen(
     // 关闭主窗口时的行为：ask / exit / tray
     var closeBehavior by remember { mutableStateOf(settingsRepo.closeBehavior) }
     var showCloseBehaviorDialog by remember { mutableStateOf(false) }
+    // PanRouter 服务端解析（弹窗内编辑，保存即时生效；token 加密存储、不回显）
+    val panRouterSettings = remember { PanRouterSettings() }
+    var showPanRouterDialog by remember { mutableStateOf(false) }
+    // 账号贡献弹窗（仅当装配层提供了枚举能力时显示入口）
+    var showPanRouterContributeDialog by remember { mutableStateOf(false) }
 
     Column(
         modifier = modifier
@@ -461,6 +478,32 @@ fun SettingsScreen(
             description = "导出崩溃日志与应用信息，便于排查问题",
             onClick = { showLogDialog = true }
         )
+
+        Spacer(modifier = Modifier.height(24.dp))
+
+        // PanRouter 服务端解析（docs/INTEGRATION-PANROUTER.md）：覆盖平台解析走自部署服务端，
+        // 失败可回落本地；描述行实时反映开关与地址（弹窗保存后经 onDismiss 重读）
+        SectionLabel("PanRouter 服务端")
+        SettingsItem(
+            icon = Icons.Outlined.Cloud,
+            title = "PanRouter 服务端解析",
+            description = if (panRouterSettings.enabled && panRouterSettings.baseUrl.isNotBlank()) {
+                "已启用：${panRouterSettings.baseUrl.removePrefix("https://").removeSuffix("/")}"
+            } else {
+                "未启用（解析全部走本地）"
+            },
+            onClick = { showPanRouterDialog = true }
+        )
+
+        if (panRouterContributableProvider != null) {
+            Spacer(modifier = Modifier.height(8.dp))
+            SettingsItem(
+                icon = Icons.Outlined.Backup,
+                title = "贡献账号到服务端账号池",
+                description = "把本机已登录的夸克 / 蓝奏云账号上传给 PanRouter（服务端加密存储），云端解析即可用",
+                onClick = { showPanRouterContributeDialog = true }
+            )
+        }
 
         Spacer(modifier = Modifier.height(24.dp))
 
@@ -1197,6 +1240,23 @@ fun SettingsScreen(
         }
     )
 
+    // PanRouter 服务端解析设置弹窗：开关 / 地址 / api_token（加密）/ 失败回落 / 测试连接
+    PanRouterSettingsDialog(
+        visible = showPanRouterDialog,
+        settings = panRouterSettings,
+        onDismiss = { showPanRouterDialog = false }
+    )
+
+    // PanRouter 账号贡献弹窗：本机账号 → 服务端账号池（二次确认 + 服务端已有状态提示）
+    if (panRouterContributableProvider != null) {
+        PanRouterContributeDialog(
+            visible = showPanRouterContributeDialog,
+            provider = panRouterContributableProvider,
+            gateway = PanRouterHub.gateway,
+            onDismiss = { showPanRouterContributeDialog = false }
+        )
+    }
+
     // GitHub 下载镜像设置弹窗：自动（实测选最快）/ 五个内置预选 / 自定义前缀
     if (showMirrorDialog) {
         val mirrorSnapshot by GitHubMirror.snapshot.collectAsState()
@@ -1860,4 +1920,250 @@ private fun formatMirrorSpeed(bps: Long?): String {
     if (bps == null || bps <= 0L) return "未知"
     val mb = bps / 1024.0 / 1024.0
     return if (mb >= 1.0) String.format("%.1f MB/s", mb) else String.format("%.0f KB/s", bps / 1024.0)
+}
+
+/**
+ * PanRouter 服务端解析设置弹窗（docs/INTEGRATION-PANROUTER.md §4.3）：
+ * 开关 / 服务端地址 / api_token（AES-GCM 加密落盘，输入框掩码 + 明文切换）/ 失败回落本地开关。
+ * 「测试连接」用**当前输入**（尚未保存）的地址与 token 探活，改完先测再存。
+ */
+@Composable
+private fun PanRouterSettingsDialog(
+    visible: Boolean,
+    settings: PanRouterSettings,
+    onDismiss: () -> Unit
+) {
+    var enabled by remember { mutableStateOf(settings.enabled) }
+    var baseUrl by remember { mutableStateOf(settings.baseUrl) }
+    var token by remember { mutableStateOf(PanRouterTokenStore.getToken().orEmpty()) }
+    var tokenVisible by remember { mutableStateOf(false) }
+    var fallbackToLocal by remember { mutableStateOf(settings.fallbackToLocal) }
+    var testing by remember { mutableStateOf(false) }
+    var testResult by remember { mutableStateOf<String?>(null) }
+    val scope = rememberCoroutineScope()
+
+    FadeAlertDialog(
+        visible = visible,
+        onDismissRequest = onDismiss,
+        title = { Text("PanRouter 服务端解析") },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                Text(
+                    "解析优先走自部署 PanRouter：解析 IP 固定在服务端、直链缓存与账号池共享；" +
+                        "未覆盖的网盘或服务端不可达时自动走本地解析。",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text("启用服务端解析")
+                    Switch(checked = enabled, onCheckedChange = { enabled = it })
+                }
+                OutlinedTextField(
+                    value = baseUrl,
+                    onValueChange = { baseUrl = it; testResult = null },
+                    label = { Text("服务端地址") },
+                    placeholder = { Text("https://pan.example.com") },
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth()
+                )
+                OutlinedTextField(
+                    value = token,
+                    onValueChange = { token = it; testResult = null },
+                    label = { Text("api_token（长期凭证，加密存储）") },
+                    singleLine = true,
+                    visualTransformation = if (tokenVisible) VisualTransformation.None else PasswordVisualTransformation(),
+                    trailingIcon = {
+                        TextButton(onClick = { tokenVisible = !tokenVisible }) {
+                            Text(if (tokenVisible) "隐藏" else "显示")
+                        }
+                    },
+                    modifier = Modifier.fillMaxWidth()
+                )
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text("服务端失败后回落本地解析")
+                    Switch(checked = fallbackToLocal, onCheckedChange = { fallbackToLocal = it })
+                }
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    TextButton(
+                        enabled = !testing && baseUrl.isNotBlank(),
+                        onClick = {
+                            testing = true
+                            testResult = null
+                            scope.launch {
+                                // 探活用当前输入值（未保存）：专用客户端按编辑态构造
+                                val result = PanRouterClient(
+                                    baseUrlProvider = { baseUrl.trim().trimEnd('/') },
+                                    tokenProvider = { token.trim().takeIf { it.isNotBlank() } }
+                                ).health()
+                                testResult = result.fold(
+                                    onSuccess = { info ->
+                                        "连接成功 · v${info.version.ifBlank { "未知" }}（${info.status.ifBlank { "ok" }}）"
+                                    },
+                                    onFailure = { (it.message ?: "连接失败").take(200) }
+                                )
+                                testing = false
+                            }
+                        }
+                    ) { Text(if (testing) "测试中…" else "测试连接") }
+                    testResult?.let {
+                        Text(
+                            it,
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
+                }
+            }
+        },
+        confirmButton = {
+            TextButton(onClick = {
+                settings.enabled = enabled
+                settings.baseUrl = baseUrl
+                PanRouterTokenStore.setToken(token.trim().ifBlank { null })
+                settings.fallbackToLocal = fallbackToLocal
+                onDismiss()
+            }) { Text("保存") }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) { Text("取消") }
+        }
+    )
+}
+
+/**
+ * PanRouter 账号贡献弹窗（docs/INTEGRATION-PANROUTER.md §5.3 M2）：
+ * 枚举本机覆盖平台的已登录账号 → 逐个上传到服务端账号池。
+ * - **二次确认**：顶部「我已知晓」开关打开前，所有「上传」按钮禁用；
+ * - 服务端已有同名账号的行显示「已在服务端」（按名字粗匹配，仅提示不阻断）；
+ * - Cookie 不回显、不写日志，仅在上传请求里发往服务端（服务端实时校验后加密落库）。
+ */
+@Composable
+private fun PanRouterContributeDialog(
+    visible: Boolean,
+    provider: suspend (serverNames: Set<String>) -> List<PanRouterContribution.Contributable>,
+    gateway: PanRouterResolveGateway,
+    onDismiss: () -> Unit
+) {
+    var accounts by remember { mutableStateOf<List<PanRouterContribution.Contributable>>(emptyList()) }
+    var loading by remember { mutableStateOf(false) }
+    var acknowledged by remember { mutableStateOf(false) }
+    var working by remember { mutableStateOf(false) }
+    var message by remember { mutableStateOf<String?>(null) }
+    val scope = rememberCoroutineScope()
+
+    suspend fun refresh() {
+        loading = true
+        try {
+            val serverNames = gateway.listServerAccounts(null)
+                .getOrDefault(emptyList())
+                .mapTo(HashSet()) { it.name }
+            accounts = provider(serverNames)
+        } finally {
+            loading = false
+        }
+    }
+
+    LaunchedEffect(visible) {
+        if (visible) refresh()
+    }
+
+    FadeAlertDialog(
+        visible = visible,
+        onDismissRequest = { if (!working) onDismiss() },
+        title = { Text("贡献账号到服务端账号池") },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                Text(
+                    "上传后 Cookie 将加密存储于 PanRouter 服务端，供云端解析（含其他设备）使用；" +
+                        "服务端可随时删除。请勿贡献不希望存放在服务端的账号。",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text("我已知晓并同意上述存储方式")
+                    Switch(checked = acknowledged, onCheckedChange = { acknowledged = it })
+                }
+                when {
+                    loading -> Text("正在读取本机账号…", style = MaterialTheme.typography.bodySmall)
+                    accounts.isEmpty() -> Text(
+                        "本机没有可贡献的账号（需要先在「网盘」页登录夸克 / 蓝奏云）",
+                        style = MaterialTheme.typography.bodySmall
+                    )
+                    else -> Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                        accounts.forEach { account ->
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Row(
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    horizontalArrangement = Arrangement.spacedBy(6.dp),
+                                    modifier = Modifier.weight(1f, fill = false)
+                                ) {
+                                    Text(
+                                        account.displayName,
+                                        style = MaterialTheme.typography.bodyMedium,
+                                        maxLines = 1
+                                    )
+                                    Text(
+                                        buildString {
+                                            append(if (account.platform == "quark") "夸克" else "蓝奏云")
+                                            if (account.isPrimary) append(" · 主账号")
+                                            if (account.alreadyOnServer) append(" · 已在服务端")
+                                        },
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                        maxLines = 1
+                                    )
+                                }
+                                TextButton(
+                                    enabled = acknowledged && !working && !account.alreadyOnServer,
+                                    onClick = {
+                                        working = true
+                                        message = null
+                                        scope.launch {
+                                            val result = gateway.contributeAccount(
+                                                account.panType, account.displayName, account.credential
+                                            )
+                                            message = result.fold(
+                                                onSuccess = { "已上传：${it.name}（状态 ${it.status}）" },
+                                                onFailure = { e -> "上传失败：${e.message ?: e.javaClass.simpleName}" }
+                                            )
+                                            refresh()
+                                            working = false
+                                        }
+                                    }
+                                ) {
+                                    Text(if (account.alreadyOnServer) "已在服务端" else "上传")
+                                }
+                            }
+                        }
+                    }
+                }
+                message?.let {
+                    Text(it, style = MaterialTheme.typography.bodySmall)
+                }
+            }
+        },
+        confirmButton = {
+            TextButton(enabled = !working, onClick = onDismiss) { Text("关闭") }
+        }
+    )
 }
