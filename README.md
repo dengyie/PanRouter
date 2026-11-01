@@ -29,6 +29,11 @@ Range 分片并发 + 断点续传，B 站高清自动合轨。
 > **本项目使用 AGPL-3.0 开源协议。** 与安卓版 [CYQawa/YunX](https://github.com/CYQawa/YunX)
 > 同属云析项目；若你使用了本项目的代码，请同样以 AGPL-3.0 开放源代码。
 
+> **本仓库为二次开发版本**，基于 [tidain/YunX-Desktop](https://github.com/tidain/YunX-Desktop)（v1.3.3）。
+> 在上游基础上新增：**PanRouter 服务端解析整合** —— 网盘分享解析优先交由自部署的 PanRouter 服务端
+> （固定出口 IP 防风控、直链缓存、多账号池），下载仍走云析本地分片引擎；服务端未覆盖或不可达时自动回落本地原生解析链。
+> 改动范围见 [docs/INTEGRATION-PANROUTER.md](docs/INTEGRATION-PANROUTER.md)。按 AGPL-3.0 要求，本仓库完整保留上游提交历史。
+
 ## 简介
 
 云析 YunX 的 **官方 Windows 桌面版**：粘贴**网盘分享链接**或**视频作品链接**，即可浏览内容、在线预览并直接高速下载，全程在电脑上完成；

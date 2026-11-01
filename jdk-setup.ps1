@@ -2,6 +2,19 @@
 # 提供：JDK 17 定位/自动安装（Ensure-Jdk）、Gradle 调用（Invoke-Gradle，直调 wrapper jar，不再依赖 gradlew.bat）
 # 注意: 本文件必须保持 UTF-8 带 BOM 编码（PS 5.1 会把无 BOM 的 UTF-8 当 ANSI 解析，中文注释变乱码）
 
+function Test-JdkMajorVersion {
+    param([string]$JdkHome, [int]$Major = 17)
+    # 以 <home>\release 的 JAVA_VERSION 行为准；无 release 文件时不拦截（CI/特殊布局兜底）
+    $release = Join-Path $JdkHome "release"
+    if (-not (Test-Path $release)) { return $true }
+    try {
+        $line = (Get-Content $release -ErrorAction Stop |
+            Where-Object { $_ -like 'JAVA_VERSION="*' } |
+            Select-Object -First 1)
+        return ($line -match ('JAVA_VERSION="' + $Major + '\.'))
+    } catch { return $true }
+}
+
 function Find-JdkHome {
     param([switch]$RequireJPackage)
     $marker = if ($RequireJPackage) { "bin\jpackage.exe" } else { "bin\java.exe" }
@@ -14,6 +27,7 @@ function Find-JdkHome {
         "C:\Program Files\Zulu\zulu-17*",
         "C:\Program Files\Amazon Corretto\jdk-17*",
         (Join-Path $env:LOCALAPPDATA "jdk-portable\jdk-17*"),
+        (Join-Path $env:USERPROFILE ".gradle\jdks\*17*"),
         (Join-Path $PSScriptRoot ".jdk\jdk-17*")
     )
     foreach ($c in $candidates) {
@@ -25,7 +39,8 @@ function Find-JdkHome {
         } catch {}
     }
 
-    if ($env:JAVA_HOME -and (Test-Path (Join-Path $env:JAVA_HOME $marker))) {
+    if ($env:JAVA_HOME -and (Test-Path (Join-Path $env:JAVA_HOME $marker)) `
+        -and (Test-JdkMajorVersion $env:JAVA_HOME)) {
         return $env:JAVA_HOME
     }
 
@@ -36,7 +51,8 @@ function Find-JdkHome {
                 Select-String "java.home" |
                 ForEach-Object { $_.Line -replace ".*= ", "" } |
                 Select-Object -First 1)
-            if ($javaHome -and (Test-Path (Join-Path $javaHome $marker))) {
+            if ($javaHome -and (Test-Path (Join-Path $javaHome $marker)) `
+                -and (Test-JdkMajorVersion $javaHome)) {
                 return $javaHome
             }
         } catch {}
