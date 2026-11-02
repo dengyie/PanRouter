@@ -4,13 +4,13 @@ import com.yunx.app.data.network.SharePlatform
 import com.yunx.app.util.Log
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import java.io.IOException
 import java.util.concurrent.ConcurrentHashMap
-import java.util.concurrent.atomic.AtomicReference
+import java.util.concurrent.atomic.AtomicBoolean
 
 /**
  * PanRouter 解析用例编排（规格 §3.2/§4.1）：
@@ -33,8 +33,8 @@ class PanRouterResolveGateway(
     /** 会话内学习到的「服务端不支持」平台（resolve 返回 kind=unsupported 时登记，进程内有效） */
     private val uncovered: MutableSet<SharePlatform> = ConcurrentHashMap.newKeySet()
 
-    /** 探测循环单例（DOWN 期间恰好一个，回 UP 后退出清空） */
-    private val probeJob = AtomicReference<Job?>(null)
+    /** 探测循环在跑标记（原子占位：DOWN 期间并发 startHealthWatch 只放行一个） */
+    private val probeRunning = AtomicBoolean(false)
 
     /** 服务端 pan 标识；未覆盖返回 null */
     fun serverPanFor(platform: SharePlatform): String? = ResolveRouter.serverPanFor(platform)
@@ -113,24 +113,31 @@ class PanRouterResolveGateway(
         return false
     }
 
-    /** DOWN 期间拉起探测循环；已有循环在跑则不动（单实例不变量） */
+    /**
+     * DOWN 期间拉起探测循环；[probeRunning] 原子占位保证「DOWN ⇒ 恰好一个循环」（P3 修复：
+     * 原实现 check-then-act 非原子，两个硬失败并发时会拉起双循环、探测频率翻倍）。
+     * 退出时在 finally 里补判：循环判定退出的瞬间又被置 DOWN 的窄窗口，重新占位拉起，不留无循环的 DOWN。
+     */
     internal fun startHealthWatch() {
-        if (probeJob.get()?.isActive == true) return
+        if (!probeRunning.compareAndSet(false, true)) return
         watchScope.launch {
-            while (!health.up) {
-                runCatching { probeDelay(health.nextProbeDelayMs()) }
-                val ok = client.health().isSuccess
-                if (ok) {
-                    health.markSuccess()
-                    Log.i(TAG, "PanRouter 已恢复可达")
-                } else {
-                    health.markHardFailure()
-                    Log.w(TAG, "PanRouter 仍不可达（退避 ${health.nextProbeDelayMs() / 1000}s 后重试）")
+            try {
+                while (!health.up) {
+                    runCatching { probeDelay(health.nextProbeDelayMs()) }
+                    val ok = client.health().isSuccess
+                    if (ok) {
+                        health.markSuccess()
+                        Log.i(TAG, "PanRouter 已恢复可达")
+                    } else {
+                        health.markHardFailure()
+                        Log.w(TAG, "PanRouter 仍不可达（退避 ${health.nextProbeDelayMs() / 1000}s 后重试）")
+                    }
                 }
+            } finally {
+                probeRunning.set(false)
+                if (!health.up && watchScope.isActive) startHealthWatch()
             }
-            // 回 UP 后自清（仅当登记的仍是自己；探测循环期间可能已结束了）
-            probeJob.compareAndSet(coroutineContext[Job], null)
-        }.also { probeJob.set(it) }
+        }
     }
 
     companion object {

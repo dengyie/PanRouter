@@ -179,7 +179,7 @@ desktop/src/main/kotlin/com/yunx/app/
 
 | kind（HTTP） | 桌面端处理 |
 |---|---|
-| `session_expired`(401) | 静默用 api_token 重试一次；仍失败 → 提示重新登录 PanRouter |
+| `session_expired`(401) | 透出「连接已失效，请到设置重新配置 api_token」；**不清本地 token**（服务端对「token 缺失/错误/会话过期」统一返回此 kind——输错一个字符也会清空，反而丢失设置页回显；保留原值供用户修正后重试） |
 | `auth_invalid`(401) | 提示管理员口令错误（登录弹窗） |
 | `auth_expired`(401) | **服务端账号池凭据失效**：提示并在用户已登录同平台时提供「用本地账号解析」一键回落 |
 | `risk_control`(429) | 尊重退避：本次解析回落本地（若本地支持），并提示服务端该盘冷却中 |
@@ -188,7 +188,7 @@ desktop/src/main/kotlin/com/yunx/app/
 | `upstream_error`(502) | `retriable=true` 时自动重试 1 次，仍失败回落本地 |
 | `unsupported`(400) | 标记 platform 未覆盖（会话内），立即 LOCAL |
 
-> 401 三分（session/auth_invalid/auth_expired）与服务端 P2-4 修复后的语义严格对齐：**仅 `session_expired` 触发桌面端清理本地 token**，上游 Cookie 失效不动管理员会话。
+> 401 三分（session/auth_invalid/auth_expired）与服务端 P2-4 修复后的语义严格对齐（v1.5 修订）：**桌面端对 `session_expired` 不自动清本地 token**——服务端中间件（middleware.go auth/optionalAuth）对「缺 token、错 token、会话过期」一律返回 session_expired，自动清理会把「输错 api_token」误伤为「强制重新配置」，且丢失设置页回显；报错引导用户到设置页修正即可。上游 Cookie 失效（auth_expired）与桌面端 token 无关，不动。
 
 ### 5.3 M2/M3 拟新增端点（服务端小改造，另立 PR）
 
@@ -230,7 +230,7 @@ M1 目标是**零服务端改动**。需要留意（不在本仓做，登记到 
 
 ### 8.2 批量解析
 
-粘贴多链接（>1）走 `resolve/batch`（≤50/次，超出分批串行+间隔 1s）；单项 90s 预算内桌面端不重复设超时（服务端已兜底），HTTP 客户端总超时放宽为 120s/项 × 项数（封顶 10min）。
+粘贴多链接（>1）走 `resolve/batch`（服务端单批上限 50，**客户端切片取 10/次**——服务端 batch 串行逐项经 limiter，单项真实时延秒级，50 项一片必然超出 120s callTimeout，10 项 ≈ 10-30s/片，切片间自然间隔）；单项 90s 预算内桌面端不重复设超时（服务端已兜底），HTTP 客户端总超时放宽为 120s/项 × 项数（封顶 10min）。
 
 ### 8.3 直链复用与重解析
 
@@ -300,6 +300,7 @@ pxed 上行有限且多设备共享：stream 路径线程数 = `min(用户设置
 
 ## 变更记录
 
+- **v1.5（2026-11-02）**：**v0.1.0 生产级 Code Review 后的根因修复轮（8 项全修，发版 v0.1.1）**。① P1 远端会话残留：`startResolve` 入口统一 `resetRemoteSession()`（剪贴板/收藏入口会在 Detail 态直接开新解析，旧会话的 remoteShare/pendingRemoteLink/remoteBatchContext 残留会把本地解析误判为远端——无目录导航、转存禁用、startDownload 走已失效的 pendingRemoteLink）；`backToInput` 与批量空结果路径复用同一函数（后者原只清 remoteBatchLinks 不清 context）；② P2 批量超时预算失配：客户端切片 50→10（§8.2 更新；服务端 batch 串行逐项，50 项必超 120s callTimeout）；③ P2 INTERFACE_CHANGED 死路径：Client 加 `jsonBody()` 单点，2xx 非 JSON body（网关故障页/契约漂移）映射为 interface_changed（原先裸抛 JSONException，绕过 shouldFallbackToLocal，无友好文案也不回落本地），六处解析点全部收口 + 契约测试回归锁；④ P3 探活循环原子占位：probeJob check-then-act 改 `AtomicBoolean.compareAndSet`，并发硬失败不再拉起双循环，finally 补判消除「DOWN 无循环」窄窗口；⑤ P3 设置弹窗 remember 以 visible 为 key（取消后重开显示已保存值；旧测试结果不再跨会话残留）；⑥ P3 批量 shareUrl/历史语义：入队传所属分享 url（右键「复制分享链接」不再落整段粘贴文本）、历史记录存第一个分享链接、`enqueueRemote` 对空 effectiveUrl 显式拒绝（批量计失败数，单文件进 downloadError）；⑦ P3 规格修订（§5.2/决策注记）：session_expired **不自动清桌面端 token**——服务端中间件对缺/错 token 统一返回此 kind，自动清理误伤输错场景且丢失回显，报错引导设置页修正（代码行为本就更安全，文档对齐代码）；⑧ 顺手清理：defaultKindFor 冗余 else 分支、SESSION_EXPIRED 过时 KDoc。`:desktop:test` 106/106 全绿（+1 契约测试）。
 - **v1.4（2026-11-01）**：**GUI 实机验收通过，M1/M2 全部闭环；M3 部分收口**。① GUI 端到端（截图实证）：应用拉起 → 设置页 PanRouter 区块渲染 → 弹窗「测试连接」真实回读生产版本 `v0d8ba6b630d3` → token AES-GCM 加密落盘 → 解析页死链走服务端路由（401 session_expired →「连接已失效」；token 修正后 404 share_gone →「分享已失效（服务端确认）」——REMOTE 专属文案，本地链不会出现）→ 401→修 token→404 行为变化证明加密存取链正确；② 过程揪出两个真缺陷并修复：`SendKeys` 自动输入丢字符 `1` 导致坏 token（自动化手段问题，非集成代码缺陷；错误链按设计工作）；`PanRouterResolveGatewayTest` 直写 `java.util.prefs` 注册表污染真实应用配置 → 改为快照/还原隔离（回归全绿）；③ 环境坑：`run.ps1` 的 `Find-JdkHome` 拾到本机 JDK 11（`:desktop:run` 报 UnsupportedClassVersionError）——用 `~/.gradle/jdks/eclipse_adoptium-17`（toolchain 自动下载）注入 `JAVA_HOME` 启动；④ M3-2（插件链接路由）确认由架构天然满足：剪贴板/插件 hook/解析页/历史全部汇聚 `startResolve` 单漏斗，服务端路由自动生效。剩余 M3：fork 推 GitHub + 发版流水线（待建仓授权）、历史同步（依赖服务端端点定案）；aria2 维持不做。
 - **v1.3（2026-11-01）**：**M2-C 跨分享批量 + 三项验收通过，M1/M2 全部收口**。① `ShareLinkParser.parseAll`（多链接提取，文案级提取码兜底——单测抓出并修复「只传 URL 丢失提取码」缺陷）+ `Client.resolveBatch`（items 数组契约）+ `Gateway.resolveBatch` + 解析页多链接分支（≥2 条覆盖平台链接 → resolve/batch → 合并扁平列表 `[序号] 文件名`，合成 fid 路由回所属分享取链；集成关闭/服务端不可达静默或提示退回单链接流程）；② 验收 A：官方入口 `.\run.ps1 build` BUILD SUCCESSFUL（Gradle 8.13 发行包经腾讯镜像预置解决官方源卡死）；验收 B：对真实生产 pan.example.com 契约冒烟四项全过（healthz 版本回读 / api_token 认证账号池 / 死链结构化错误 kind / batch 部分成功语义），临时用例跑完即删、token 未入库；验收 C：`:desktop:test` 105/105 全绿。aria2 推送正式裁定**不做**（生产 aria2 sidecar 未部署，实现即死代码；服务端上线后按 §5.3 契约补齐）。
 - **v1.2（2026-11-01）**：**M2 主体落地**（批量 + 账号贡献）。① 远端模式批量下载：解除 M1 守卫改真实现——多选逐文件带 fid 取直链（串行 + 150ms 间隔自律，§8.4）、统一 `enqueueRemote`（单文件弹窗与批量共用）、中断/失败/入队计数反馈；② 账号贡献：`PanRouterClient.listAccounts/createAccount`（服务端契约 `{pan_type,name,cookie}`，实时校验）+ Gateway 管理面透传（不参与解析健康判定）+ `PanRouterContribution` 本机枚举（SecureAccountDaos 透明解密，仅对话框生命周期驻留内存）+ 设置页贡献弹窗（「我已知晓」二次确认门控、服务端同名去重提示、Cookie 不回显不落日志）。`:desktop:test` 101/101 全绿（+3 账号契约）。

@@ -1933,13 +1933,14 @@ private fun PanRouterSettingsDialog(
     settings: PanRouterSettings,
     onDismiss: () -> Unit
 ) {
-    var enabled by remember { mutableStateOf(settings.enabled) }
-    var baseUrl by remember { mutableStateOf(settings.baseUrl) }
-    var token by remember { mutableStateOf(PanRouterTokenStore.getToken().orEmpty()) }
+    // 以 visible 为 key：每次打开弹窗都从当前配置重读，取消后重开显示的是已保存值而非上次未保存输入
+    var enabled by remember(visible) { mutableStateOf(settings.enabled) }
+    var baseUrl by remember(visible) { mutableStateOf(settings.baseUrl) }
+    var token by remember(visible) { mutableStateOf(PanRouterTokenStore.getToken().orEmpty()) }
     var tokenVisible by remember { mutableStateOf(false) }
-    var fallbackToLocal by remember { mutableStateOf(settings.fallbackToLocal) }
+    var fallbackToLocal by remember(visible) { mutableStateOf(settings.fallbackToLocal) }
     var testing by remember { mutableStateOf(false) }
-    var testResult by remember { mutableStateOf<String?>(null) }
+    var testResult by remember(visible) { mutableStateOf<String?>(null) }
     val scope = rememberCoroutineScope()
 
     FadeAlertDialog(

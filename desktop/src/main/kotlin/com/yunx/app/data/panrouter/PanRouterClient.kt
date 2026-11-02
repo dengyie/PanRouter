@@ -39,6 +39,23 @@ class PanRouterClient(
 
     private val baseHttp: OkHttpClient = http
 
+    /**
+     * 2xx body → JSONObject。body 非 JSON（网关故障页 / 契约漂移返回了 HTML 或空体）时
+     * 映射为 [PanRouterError.Kind.INTERFACE_CHANGED]（P2 修复：原样抛 JSONException 会绕过
+     * shouldFallbackToLocal 判定，用户看到原始异常而不会回落本地链）。
+     */
+    private fun jsonBody(body: String): JSONObject =
+        try {
+            JSONObject(body)
+        } catch (e: org.json.JSONException) {
+            throw PanRouterError(
+                message = "响应结构非 JSON（${e.message?.take(120) ?: "body=${body.take(80)}"}）",
+                kind = PanRouterError.Kind.INTERFACE_CHANGED,
+                retriable = true,
+                cause = e
+            )
+        }
+
     /** `GET /healthz` → {status, version} */
     suspend fun health(): Result<RemoteServerInfo> = withContext(Dispatchers.IO) {
         request {
@@ -46,7 +63,7 @@ class PanRouterClient(
                 .url("${baseUrlProvider()}/healthz")
                 .get()
                 .build()
-        }.mapCatching { parseServerInfo(JSONObject(it)) }
+        }.mapCatching { parseServerInfo(jsonBody(it)) }
     }
 
     /**
@@ -55,7 +72,7 @@ class PanRouterClient(
      */
     suspend fun resolveShare(url: String, pwd: String?): Result<RemoteResolveResult> =
         withContext(Dispatchers.IO) {
-            resolveRequest(url, pwd, fid = null).mapCatching { parseResolveResult(JSONObject(it)) }
+            resolveRequest(url, pwd, fid = null).mapCatching { parseResolveResult(jsonBody(it)) }
         }
 
     /**
@@ -64,7 +81,7 @@ class PanRouterClient(
      */
     suspend fun resolveLink(url: String, pwd: String?, fid: String): Result<RemoteLinkResult> =
         withContext(Dispatchers.IO) {
-            resolveRequest(url, pwd, fid).mapCatching { parseLinkResult(JSONObject(it)) }
+            resolveRequest(url, pwd, fid).mapCatching { parseLinkResult(jsonBody(it)) }
         }
 
     /**
@@ -82,7 +99,7 @@ class PanRouterClient(
                 }
                 authedRequest("${baseUrlProvider()}/api/v1/resolve/batch", JSONObject().put("items", arr))
             }.mapCatching { body ->
-                val results = JSONObject(body).optJSONArray("results")
+                val results = jsonBody(body).optJSONArray("results")
                 val out = ArrayList<RemoteBatchItem>(if (results == null) 0 else results.length())
                 for (i in 0 until (results?.length() ?: 0)) {
                     out.add(parseBatchItem(results!!.optJSONObject(i) ?: JSONObject()))
@@ -111,7 +128,7 @@ class PanRouterClient(
                 tokenProvider()?.takeIf { it.isNotBlank() }?.let { builder.header("Authorization", "Bearer $it") }
                 builder.build()
             }.mapCatching { body ->
-                val arr = JSONObject(body).optJSONArray("accounts")
+                val arr = jsonBody(body).optJSONArray("accounts")
                 val out = ArrayList<RemoteAccountView>(if (arr == null) 0 else arr.length())
                 for (i in 0 until (arr?.length() ?: 0)) {
                     out.add(parseAccountView(arr!!.optJSONObject(i) ?: JSONObject()))
@@ -132,7 +149,7 @@ class PanRouterClient(
                     .put("name", name)
                     .put("cookie", cookie)
                 authedRequest("${baseUrlProvider()}/api/v1/accounts", body)
-            }.mapCatching { parseAccountView(JSONObject(it).optJSONObject("account") ?: JSONObject()) }
+            }.mapCatching { parseAccountView(jsonBody(it).optJSONObject("account") ?: JSONObject()) }
         }
 
     // ---------- 底层执行 ----------

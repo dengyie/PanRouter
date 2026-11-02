@@ -19,7 +19,7 @@ class PanRouterError(
 ) : RuntimeException(message, cause) {
 
     enum class Kind {
-        /** PanRouter 站点会话缺失或失效（桌面端此时应清理本地 token） */
+        /** PanRouter 站点会话缺失或失效（含 api_token 错误——桌面端不清 token，报错引导去设置页修正） */
         SESSION_EXPIRED,
         /** PanRouter 登录口令错误 */
         AUTH_INVALID,
@@ -97,14 +97,13 @@ class PanRouterError(
             return PanRouterError(message, kind, retriable, status)
         }
 
-        /** 无错误体时的状态码兜底映射（对齐服务端 kindStatus 表） */
+        /** 无错误体时的状态码兜底映射（对齐服务端 kindStatus 表；其余一律按上游/服务端异常处理） */
         internal fun defaultKindFor(status: Int): Kind = when (status) {
             401 -> Kind.SESSION_EXPIRED
             429 -> Kind.RISK_CONTROL
             404 -> Kind.NOT_FOUND
             400 -> Kind.UNSUPPORTED
-            502 -> Kind.UPSTREAM_ERROR
-            else -> if (status >= 500) Kind.UPSTREAM_ERROR else Kind.UPSTREAM_ERROR
+            else -> Kind.UPSTREAM_ERROR
         }
 
         /** 桌面端网络层失败统一包装（retriable=true，供退避与回落判定） */

@@ -574,13 +574,16 @@ class ResolveViewModel(
                         if (batchCancelRequested) { cancelled = true; break }
                         resolveRemoteFor(gateway, file)
                             .onSuccess { lr ->
-                                enqueueRemote(
-                                    lr,
-                                    fileName = lr.fileName.ifBlank { file.fname },
-                                    sizeHint = file.fsize,
-                                    saveDir = saveDir
-                                )
-                                queued++
+                                runCatching {
+                                    enqueueRemote(
+                                        lr,
+                                        fileName = lr.fileName.ifBlank { file.fname },
+                                        sizeHint = file.fsize,
+                                        saveDir = saveDir,
+                                        // 所属分享 url（右键「复制分享链接」语义正确，不落整段粘贴文本）
+                                        shareUrl = remoteBatchContext[file.fid]?.first.orEmpty()
+                                    )
+                                }.onSuccess { queued++ }.onFailure { failed++ }
                             }
                             .onFailure { failed++ }
                         batchProgress = "正在取直链 ${queued + failed}/${files.size}…"
@@ -820,11 +823,27 @@ class ResolveViewModel(
     /** 批量解析：合成 fid（"b<index>:<fid>"）→ 原始分享 (url, pwd)，取链时路由回所属分享 */
     private val remoteBatchContext = HashMap<String, Pair<String, String?>>()
 
-    /** 服务端批量单批上限（panrouter ResolveBatchMaxItems = 50） */
-    private val batchChunk = 50
+    /**
+     * 服务端批量单批上限（panrouter ResolveBatchMaxItems = 50）。
+     * 客户端切片取 10：服务端 batch 串行逐项经 limiter（单项真实时延秒级），
+     * 120s callTimeout 预算下 50 项一片必然超时（P2 修复），10 项 ≈ 10-30s/片。
+     */
+    private val batchChunk = 10
 
     /** 当前是否为服务端解析模式（转存/目录导航在此模式下全部不适用；批量下载走远端分支） */
     val isRemote: Boolean get() = remoteShare != null || remoteBatchContext.isNotEmpty()
+
+    /**
+     * 重置远端解析会话状态。每次 startResolve 入口必须调用：剪贴板弹窗、收藏页等入口
+     * 会在 Detail 态直接开新解析，isRemote 必须只反映当前会话（P1 修复——旧会话残留会把
+     * 新的本地解析误判为远端：无目录导航、转存禁用、startDownload 走已失效的 pendingRemoteLink）。
+     */
+    private fun resetRemoteSession() {
+        remoteShare = null
+        pendingRemoteLink = null
+        remoteBatchLinks = emptyList()
+        remoteBatchContext.clear()
+    }
 
     /** 当前平台凭证（夸克/UC/百度/139/115 用 cookie，迅雷/123 用 access_token；GitHub 无需凭证） */
     private suspend fun currentCredential(): String? = when (currentPlatform) {
@@ -972,6 +991,8 @@ class ResolveViewModel(
         currentPwd = pwd
         // 写入当前分享链接，供下载入队时兜底填充 task.shareUrl（右键菜单「复制分享链接」用）
         downloadManager.currentShareUrl = link
+        // 新解析会话：清掉上一会话的远端状态（剪贴板/收藏入口会在 Detail 态直接进来）
+        resetRemoteSession()
         // GitHub 链接统一识别：仓库 / 账号 / 文件直链 → GitHub 解析流程。
         // 放在网盘解析之前，使「收藏打开 / 剪贴板 / 解析页 / 解析历史」等所有走 startResolve
         // 的入口都能解析 GitHub 链接，无需在 UI 层各处重复判断。
@@ -1093,7 +1114,6 @@ class ResolveViewModel(
         viewModelScope.launch {
             uiState = ResolveUiState.Loading
             remoteBatchLinks = links.map { it.url to it.share.pwd }
-            remoteBatchContext.clear()
             val items = remoteBatchLinks
             val all = ArrayList<RemoteBatchItem>()
             for (chunk in items.chunked(batchChunk)) {
@@ -1126,7 +1146,7 @@ class ResolveViewModel(
                     }
             }
             if (files.isEmpty()) {
-                remoteBatchLinks = emptyList()
+                resetRemoteSession()
                 prefillRequest = lastResolveInput
                 uiState = ResolveUiState.Error("批量解析没有可用文件" + if (failedCount > 0) "（$failedCount 个分享解析失败）" else "")
                 return@launch
@@ -1137,7 +1157,9 @@ class ResolveViewModel(
             dirStack.clear()
             pathNames = emptyList()
             isGuest = false
-            runCatching { recordLinkHistory(title) }
+            // 历史记录语义修正（P3）：url 存第一个分享链接（点击历史可重新解析），
+            // 而不是整段粘贴文本；标题保留聚合描述
+            runCatching { recordLinkHistory(title, urlOverride = items.first().first) }
             uiState = ResolveUiState.Detail(session = session!!, files = files)
             if (failedCount > 0) SnackbarController.show("$failedCount 个分享解析失败，其余已列出")
         }
@@ -1193,8 +1215,10 @@ class ResolveViewModel(
     private fun remoteUserMessage(err: Throwable?): String =
         (err as? PanRouterError)?.userMessage() ?: err?.message ?: "服务端解析失败"
 
-    private suspend fun recordLinkHistory(title: String) {
-        val link = currentLink?.takeIf { it.isNotBlank() } ?: return
+    private suspend fun recordLinkHistory(title: String, urlOverride: String? = null) {
+        val link = urlOverride?.takeIf { it.isNotBlank() }
+            ?: currentLink?.takeIf { it.isNotBlank() }
+            ?: return
         val existing = linkHistoryDao.search(link).first()
         val latest = existing.maxByOrNull { it.createTime }
         if (latest != null && System.currentTimeMillis() - latest.createTime < 60 * 60 * 1000) return
@@ -1903,10 +1927,7 @@ class ResolveViewModel(
         currentLink = null
         currentPwd = null
         // 重置服务端解析状态（下次解析重新分流）
-        remoteShare = null
-        pendingRemoteLink = null
-        remoteBatchLinks = emptyList()
-        remoteBatchContext.clear()
+        resetRemoteSession()
         pathNames = emptyList()
         // 重置 GitHub 平台状态
         currentGitHubRepo = null
@@ -1990,27 +2011,34 @@ class ResolveViewModel(
      * 服务端直链入队（单文件弹窗与批量共用）：
      * - 直连（302 路由）→ 分片全速，线程数跟随平台设置；
      * - 中转（/stream，cloud 画像 BindIP 或降级）→ 任务级线程降档 ≤4（pxed 上行是多设备共享瓶颈，规格 §8.5）；
-     * - 请求头按服务端指令注入（need_headers 的 UA/Referer）。
+     * - 请求头按服务端指令注入（need_headers 的 UA/Referer）；
+     * - [shareUrl] 传该文件所属的分享链接（批量模式下从 remoteBatchContext 取），不再落整段粘贴文本。
      */
     private suspend fun enqueueRemote(
         remoteLink: RemoteLinkResult,
         fileName: String,
         sizeHint: Long,
-        saveDir: String
+        saveDir: String,
+        shareUrl: String = ""
     ) {
+        val url = remoteLink.effectiveUrl()
+        // 服务端契约保证 302 直链或 /stream 中转至少有一个；空 = 契约漂移，入队必失败且不可诊断，
+        // 显式拒绝并把原因带出去（批量路径计入失败数，单文件路径进 downloadError）（P3 修复）
+        if (url.isBlank()) throw IllegalStateException("服务端未返回可用下载入口（route=${remoteLink.route}）")
         val platform = ResolveRouter.downloadPlatformFor(remoteLink.pan)
         val headers = buildMap {
             if (remoteLink.ua.isNotBlank()) put("User-Agent", remoteLink.ua)
             if (remoteLink.referer.isNotBlank()) put("Referer", remoteLink.referer)
         }
         downloadManager.enqueue(
-            url = remoteLink.effectiveUrl(),
+            url = url,
             fileName = fileName,
             headers = headers,
             size = if (remoteLink.size > 0) remoteLink.size else sizeHint,
             platform = platform,
             threads = if (remoteLink.isRelayRoute) PanRouterSettings().relayThreadsFor(platform) else 0,
-            saveDir = saveDir
+            saveDir = saveDir,
+            shareUrl = shareUrl
         )
     }
 
@@ -2345,7 +2373,14 @@ class ResolveViewModel(
             if (remoteLink != null) {
                 pendingRemoteLink = null
                 try {
-                    enqueueRemote(remoteLink, remoteLink.fileName.ifBlank { link.filename }, link.size, saveDir)
+                    // shareUrl：批量模式按 fid 路由回所属分享，单文件远端模式用当前链接
+                    enqueueRemote(
+                        remoteLink,
+                        remoteLink.fileName.ifBlank { link.filename },
+                        link.size,
+                        saveDir,
+                        shareUrl = remoteBatchContext[link.fid]?.first ?: currentLink.orEmpty()
+                    )
                     downloadStarted = true
                 } catch (e: Exception) {
                     Log.e("ResolveVM", "startDownload(panrouter) failed: ${e.javaClass.simpleName}: ${e.message}", e)

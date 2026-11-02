@@ -188,6 +188,19 @@ class PanRouterClientTest {
         assertTrue(ne.retriable)
     }
 
+    @Test
+    fun `non-json 200 body maps to interface_changed and is fallback-eligible`() = runBlocking {
+        // 网关故障页 / 契约漂移：2xx 但 body 是 HTML——必须映射为 INTERFACE_CHANGED
+        // （而非裸 JSONException），否则既无友好文案也不触发回落本地（P2 修复的回归锁）
+        server.enqueue(MockResponse().setBody("<html>502 Bad Gateway</html>"))
+        val e = client.health().exceptionOrNull()
+        assertTrue("expected PanRouterError but got ${e?.javaClass}", e is PanRouterError)
+        val err = e as PanRouterError
+        assertEquals(PanRouterError.Kind.INTERFACE_CHANGED, err.kind)
+        assertTrue(err.shouldFallbackToLocal)
+        assertTrue(err.cause is org.json.JSONException)
+    }
+
     // ---------- 账号池（M2 账号贡献） ----------
 
     @Test
