@@ -5,7 +5,7 @@
       "title": "PanRouter 桌面端 v0.1.3：公告源自有化",
       "summary": "从本版本起，应用内公告改由 PanRouter 仓库直接发布，不再请求任何原作者的个人服务器。",
       "content": "## 公告源自有化\n\n应用内公告不再请求上游作者的个人服务器（原为明文 HTTP 的个人虚拟主机），改为直接读取本仓库的 `app-announcements.json` 静态文件，经 GitHub 镜像加速、raw 直连兜底。\n\n今后发布公告 = 往仓库里加一条 JSON，无需任何服务端。\n\n## 同版本其他变化\n\n- 移除「支持开发」打赏页与原作者 QQ 群入口（属于上游作者的推广内容，不属于本项目）\n- 关于页/引导页仓库入口统一指向本仓库\n- 打包元数据（公司/版权）改为本项目维护者\n\n下载见 GitHub Releases。项目基于 YunX-Desktop（AGPL-3.0）整合 PanRouter 服务端解析，感谢上游项目。",
-      "publishAt": "2026-11-03T20:00:00+08:00",
+      "publishAt": "2026-11-03T00:00:00+08:00",
       "author": "PanRouter",
       "publisher": {
         "name": "PanRouter",

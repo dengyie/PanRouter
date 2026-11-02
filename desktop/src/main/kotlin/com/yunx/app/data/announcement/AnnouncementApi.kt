@@ -101,18 +101,10 @@ object AnnouncementApi {
         data class Failure(val message: String) : Result<Nothing>
     }
 
-    /** 内存缓存：一次会话里列表/详情/翻页共用同一份快照，避免重复下载 */
-    @Volatile
-    private var cache: List<Announcement>? = null
-
-    /** 清空缓存（测试用；运行时刷新走重新 fetch 即可覆盖） */
-    internal fun clearCacheForTest() {
-        cache = null
-    }
-
-    /** 获取公告列表。[page]/[pageSize] 仅保留签名兼容，静态源恒返回第 1 页全量 */
+    /** 获取公告列表。**每次调用都重新下载**（与上游「列表请求永远打服务端」的契约一致，
+     *  手动刷新/列表页重开靠它拿到最新数据）；[page]/[pageSize] 仅保留签名兼容，静态源恒返回第 1 页全量 */
     suspend fun fetchPage(page: Int = 1, pageSize: Int = PAGE_SIZE): Result<Page> {
-        val list = when (val r = loadAll()) {
+        val list = when (val r = reloadFromSource()) {
             is Result.Success -> r.data
             is Result.Failure -> return r
         }
@@ -129,23 +121,52 @@ object AnnouncementApi {
     }
 
     /**
-     * 获取公告详情（含正文）。静态源没有单独详情接口：从同一份缓存数据按 id 查；
-     * 缓存为空时先拉一次。查不到（下架/写错 id）返回 Failure，message 可直接展示。
+     * 获取公告详情（含正文）。静态源没有单独详情接口：**缓存优先**（与上游「详情按 id 缓存、
+     * 不重复请求」的契约一致），缓存里没有这条 id 时才重新下载一份再查；
+     * 查不到（下架/写错 id）返回 Failure，message 可直接展示。
      */
     suspend fun fetchDetail(id: String): Result<Announcement> {
-        val list = when (val r = loadAll()) {
+        val wanted = id.trim()
+        var list = when (val r = peekCache()) {
             is Result.Success -> r.data
             is Result.Failure -> return r
         }
-        val hit = list.firstOrNull { it.id == id.trim() }
+        if (list.firstOrNull { it.id == wanted } == null) {
+            list = when (val r = reloadFromSource()) {
+                is Result.Success -> r.data
+                is Result.Failure -> return r
+            }
+        }
+        val hit = list.firstOrNull { it.id == wanted }
         return if (hit != null) Result.Success(hit)
         else Result.Failure("公告不存在或已下架")
     }
 
-    /** 拉取 + 解析 + 过滤排序，命中内存缓存时直接返回 */
-    private suspend fun loadAll(): Result<List<Announcement>> {
+    /**
+     * 内存缓存：详情查找优先走它，避免每次进详情页都下载；
+     * 列表（[fetchPage]）每次成功下载后覆盖它。失败时**不清空**——断网时刷新列表
+     * 返回失败，但已加载的公告在详情页/未读角标口径里仍然可用。
+     */
+    @Volatile
+    private var cache: List<Announcement>? = null
+
+    /** 仅供测试注入：文档加载器（默认走网络镜像链路） */
+    internal var documentLoader: suspend () -> Result<JSONObject> = { fetchDocument() }
+
+    /** 清空缓存（测试用；运行时刷新走重新 fetch 即可覆盖） */
+    internal fun clearCacheForTest() {
+        cache = null
+    }
+
+    /** 缓存快照；无缓存时（详情首开且列表尚未拉过）下载一份填充 */
+    private suspend fun peekCache(): Result<List<Announcement>> {
         cache?.let { return Result.Success(it) }
-        return when (val r = fetchDocument()) {
+        return reloadFromSource()
+    }
+
+    /** 强制从数据源重新下载 → 过滤排序 → 覆盖缓存 */
+    private suspend fun reloadFromSource(): Result<List<Announcement>> {
+        return when (val r = documentLoader()) {
             is Result.Failure -> r
             is Result.Success -> {
                 val visible = visibleAnnouncements(r.data)
@@ -156,8 +177,9 @@ object AnnouncementApi {
     }
 
     /** 下载公告 JSON：先走 GitHub 镜像前缀（国内直连 raw 常不可达），失败回落 raw 直连 */
-    private suspend fun fetchDocument(): Result<JSONObject> = withContext(Dispatchers.IO) {
+    internal suspend fun fetchDocument(): Result<JSONObject> = withContext(Dispatchers.IO) {
         val prefixes = listOf(GitHubMirror.activePrefix(), "").filter { it.isNotEmpty() }.distinct()
+        // 记录最后一次尝试的失败原因（而非第一条）：两个源都失败时，用户看到的应是最末次直连的失败原因
         var lastMessage = "网络异常"
         for (prefix in prefixes) {
             val url = prefix + ANNOUNCEMENTS_RAW_URL
@@ -172,23 +194,22 @@ object AnnouncementApi {
                     val text = resp.body?.string().orEmpty()
                     if (!resp.isSuccessful || text.isBlank()) {
                         Log.e(TAG, "公告数据请求失败（HTTP ${resp.code}，$url）")
-                        return@use null
+                        return@use null to "响应为空（HTTP ${resp.code}）"
                     }
                     try {
-                        JSONObject(text)
+                        JSONObject(text) to ""
                     } catch (e: Exception) {
                         Log.e(TAG, "公告数据不是合法 JSON（$url，前 200 字=${text.take(200)}）", e)
-                        null
+                        null to "响应格式异常"
                     }
                 }
             }.getOrElse { e ->
                 Log.e(TAG, "公告请求异常（$url）：${e.javaClass.simpleName}: ${e.message}", e)
-                null
+                null to "${e.javaClass.simpleName}: ${e.message ?: "网络异常"}"
             }
-            when {
-                outcome != null -> return@withContext Result.Success(outcome)
-                lastMessage == "网络异常" -> lastMessage = "响应无效（$url）"
-            }
+            val json = outcome.first
+            if (json != null) return@withContext Result.Success(json)
+            lastMessage = outcome.second
         }
         Result.Failure(lastMessage)
     }
