@@ -55,12 +55,8 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.yunx.app.APP_IS_PREVIEW
 import com.yunx.app.ui.BackHandler
-import com.yunx.app.ui.SnackbarController
 import com.yunx.app.data.update.UpdateChecker
 import com.yunx.app.util.DesktopActions
-
-/** QQ 交流群群号（关于页入口；桌面端无 mqqapi scheme 保证，点击复制群号供用户在 QQ 中搜索） */
-private const val QQ_GROUP = "635207650"
 
 /**
  * 关于云析页：应用介绍、支持平台、功能特性、技术栈与免责声明。
@@ -141,12 +137,7 @@ fun AboutScreen(
             PreviewOnboardingCard(onClick = onPreviewOnboarding)
 
             // ---------- 开源仓库 ----------
-            GitHubCard()
-            Spacer(modifier = Modifier.height(8.dp))
             DesktopRepoCard()
-
-            Spacer(modifier = Modifier.height(8.dp))
-            QQGroupCard()
 
             Spacer(modifier = Modifier.height(8.dp))
             Text(
@@ -537,68 +528,12 @@ private fun CardIcon(icon: ImageVector) {
     }
 }
 
-/** 安卓版仓库入口卡片 */
-@Composable
-private fun GitHubCard() {
-    Card(
-        onClick = {
-            DesktopActions.openUrl("https://github.com/CYQawa/YunX")
-        },
-        modifier = Modifier.fillMaxWidth(),
-        shape = MaterialTheme.shapes.large,
-        colors = CardDefaults.cardColors(
-            containerColor = MaterialTheme.colorScheme.surfaceContainerLow
-        )
-    ) {
-        Row(
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(16.dp),
-            verticalAlignment = Alignment.CenterVertically
-        ) {
-            Surface(
-                modifier = Modifier.size(40.dp),
-                shape = CircleShape,
-                color = MaterialTheme.colorScheme.primaryContainer
-            ) {
-                Box(contentAlignment = Alignment.Center) {
-                    Icon(
-                        imageVector = Icons.Outlined.Code,
-                        contentDescription = null,
-                        modifier = Modifier.size(20.dp),
-                        tint = MaterialTheme.colorScheme.onPrimaryContainer
-                    )
-                }
-            }
-            Spacer(modifier = Modifier.width(14.dp))
-            Column(modifier = Modifier.weight(1f)) {
-                Text(
-                    text = "安卓版仓库",
-                    style = MaterialTheme.typography.titleMedium,
-                    fontWeight = FontWeight.Medium
-                )
-                Text(
-                    text = "github.com/CYQawa/YunX",
-                    style = MaterialTheme.typography.bodyMedium,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant
-                )
-            }
-            Icon(
-                imageVector = Icons.Outlined.OpenInNew,
-                contentDescription = null,
-                modifier = Modifier.size(18.dp),
-                tint = MaterialTheme.colorScheme.outline
-            )
-        }
-    }
-}
-
 /** PC 版仓库入口卡片 */
 @Composable
 private fun DesktopRepoCard() {
     Card(
         onClick = {
-            // fork（PanRouter 整合版）自己的仓库；上游项目见 SupportScreen 的开源主页
+            // fork（PanRouter 整合版）自己的仓库；上游项目致谢见 README 许可节
             DesktopActions.openUrl("https://github.com/dengyie/PanRouter")
         },
         modifier = Modifier.fillMaxWidth(),
@@ -636,63 +571,6 @@ private fun DesktopRepoCard() {
                 )
                 Text(
                     text = "github.com/dengyie/PanRouter",
-                    style = MaterialTheme.typography.bodyMedium,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant
-                )
-            }
-            Icon(
-                imageVector = Icons.Outlined.OpenInNew,
-                contentDescription = null,
-                modifier = Modifier.size(18.dp),
-                tint = MaterialTheme.colorScheme.outline
-            )
-        }
-    }
-}
-
-/** QQ 交流群入口：点击复制群号（桌面端无 mqqapi scheme 保证，复制后在 QQ 中搜索加群） */
-@Composable
-private fun QQGroupCard() {
-    Card(
-        onClick = {
-            DesktopActions.copyToClipboard(QQ_GROUP)
-            SnackbarController.show("QQ 群号已复制：$QQ_GROUP")
-        },
-        modifier = Modifier.fillMaxWidth(),
-        shape = MaterialTheme.shapes.large,
-        colors = CardDefaults.cardColors(
-            containerColor = MaterialTheme.colorScheme.surfaceContainerLow
-        )
-    ) {
-        Row(
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(16.dp),
-            verticalAlignment = Alignment.CenterVertically
-        ) {
-            Surface(
-                modifier = Modifier.size(40.dp),
-                shape = CircleShape,
-                color = MaterialTheme.colorScheme.primaryContainer
-            ) {
-                Box(contentAlignment = Alignment.Center) {
-                    Icon(
-                        imageVector = Icons.Outlined.Forum,
-                        contentDescription = null,
-                        modifier = Modifier.size(20.dp),
-                        tint = MaterialTheme.colorScheme.onPrimaryContainer
-                    )
-                }
-            }
-            Spacer(modifier = Modifier.width(14.dp))
-            Column(modifier = Modifier.weight(1f)) {
-                Text(
-                    text = "QQ 交流群",
-                    style = MaterialTheme.typography.titleMedium,
-                    fontWeight = FontWeight.Medium
-                )
-                Text(
-                    text = "群号：$QQ_GROUP（点击复制）",
                     style = MaterialTheme.typography.bodyMedium,
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )

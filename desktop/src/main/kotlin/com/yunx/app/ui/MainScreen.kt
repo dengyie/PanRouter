@@ -160,7 +160,6 @@ import com.yunx.app.ui.screens.ResolveScreen
 import com.yunx.app.ui.screens.VideoResolveScreen
 import com.yunx.app.ui.screens.VideoStreamMode
 import com.yunx.app.ui.screens.SettingsScreen
-import com.yunx.app.ui.screens.SupportScreen
 import com.yunx.app.ui.screens.ThemeScreen
 import com.yunx.app.ui.screens.UpdateDialog
 import com.yunx.app.ui.viewmodel.AnnouncementViewModel
@@ -235,7 +234,6 @@ fun MainScreen(
     var showILanzouLogin by rememberSaveable { mutableStateOf(false) }
     var showLanzouLogin by rememberSaveable { mutableStateOf(false) }
     var showAbout by rememberSaveable { mutableStateOf(false) }
-    var showSupport by rememberSaveable { mutableStateOf(false) }
     var showTheme by rememberSaveable { mutableStateOf(false) }
     var showBookmarks by rememberSaveable { mutableStateOf(false) }
     var showExperimental by rememberSaveable { mutableStateOf(false) }
@@ -1078,7 +1076,6 @@ fun MainScreen(
                             scrollBehavior = scrollBehavior,
                             onThemeClick = { showTheme = true },
                             onAboutClick = { showAbout = true },
-                            onSupportClick = { showSupport = true },
                             onExperimentalClick = { showExperimental = true },
                             onDownloadEngineClick = { showDownloadEngine = true },
                             onStorageClick = { showStorage = true },
@@ -1157,18 +1154,6 @@ fun MainScreen(
                     showAbout = false
                     showOnboarding = true
                 }
-            )
-        }
-
-        // 支持开发：叠加覆盖层
-        AnimatedVisibility(
-            visible = showSupport,
-            enter = fadeIn(tween(220)) + scaleIn(tween(220), initialScale = 0.96f),
-            exit = fadeOut(tween(160)) + scaleOut(tween(160), targetScale = 0.96f),
-            modifier = Modifier.fillMaxSize()
-        ) {
-            SupportScreen(
-                onBack = { showSupport = false }
             )
         }
 

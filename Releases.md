@@ -1,9 +1,8 @@
-<img src="https://capsule-render.vercel.app/api?type=waving&color=gradient&height=300&section=header&text=YunX-Desktop&desc=%E4%BA%91%E6%9E%90%20%C2%B7%20%E7%BD%91%E7%9B%98%E5%88%86%E4%BA%AB%E9%93%BE%E6%8E%A5%E8%A7%A3%E6%9E%90%E4%B8%8E%E9%AB%98%E9%80%9F%E4%B8%8B%E8%BD%BD&fontSize=64&fontColor=ffffff&descSize=16&animation=fadeIn&fontAlignY=40&descAlignY=55" />
-
-# 云析桌面版 v1.3.3
+# 云析桌面版 v1.3.3（fork 基线）
 
 > 发布日期：2026-10-31
-> 安卓版：CYQawa/YunX ｜ 桌面版：tidain/YunX-Desktop
+> 本节为 fork 时上游 [tidain/YunX-Desktop](https://github.com/tidain/YunX-Desktop) v1.3.3 的发布说明存档（基线参考）。
+> 本 fork（PanRouter 桌面端）的版本发布见 <https://github.com/dengyie/PanRouter/releases>。
 
 ## 新增：P2P 下载（磁力 / BT 种子 / ed2k）
 
@@ -43,9 +42,9 @@
 
 - Windows 10 / 11 x64
 
-## 下载
+## 下载（fork 版本）
 
-<https://github.com/tidain/YunX-Desktop/releases>
+<https://github.com/dengyie/PanRouter/releases>
 
 - **便携版**：解压即用
 
@@ -55,8 +54,8 @@
 
 ## 反馈
 
-<https://github.com/tidain/YunX-Desktop/issues>
+<https://github.com/dengyie/PanRouter/issues>
 
 ***
 
-*CYQawa/YunX 的官方电脑端，GNU AGPL-3.0 开源。*
+*基于 tidain/YunX-Desktop（CYQawa/YunX 安卓版的 Windows 移植）二次开发，GNU AGPL-3.0 开源。*

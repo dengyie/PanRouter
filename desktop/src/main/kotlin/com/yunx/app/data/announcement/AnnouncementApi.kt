@@ -1,5 +1,6 @@
 package com.yunx.app.data.announcement
 
+import com.yunx.app.data.network.GitHubMirror
 import com.yunx.app.data.network.HttpClients
 import com.yunx.app.util.Log
 import kotlinx.coroutines.Dispatchers
@@ -7,59 +8,58 @@ import kotlinx.coroutines.withContext
 import okhttp3.Request
 import org.json.JSONArray
 import org.json.JSONObject
-import java.net.URLEncoder
 
 /**
- * 应用内公告客户端（远程公告系统 v1.0.0）。
+ * 应用内公告客户端（PanRouter 整合版自有数据源）。
  *
- * 只用到两个**公开**接口（管理端 `/api/v1/admin/` 系列接口需要 ADMIN_TOKEN，客户端一律不碰）：
- * - `GET /api/v1/announcements?page=&pageSize=`：列表，**不含正文**；
- * - `GET /api/v1/announcements/{id}`：详情，含正文，且会让 `viewCount` +1（属于预期行为）。
+ * **数据源 = 本仓库根目录的 `app-announcements.json` 静态文件**
+ * （`raw.githubusercontent.com/dengyie/PanRouter/main/app-announcements.json`，
+ * 经 [GitHubMirror] 镜像前缀访问，失败回落 raw 直连）。
  *
- * 三条硬约定（接口文档 §1.1 / §4 / §6）：
- * 1. 成功与否看响应体的 `success` 字段，**不要只看 HTTP 状态码**（业务失败与 HTTP 错误码是分离的）；
- * 2. 列表接口有副作用：每次成功调用都计入服务端当日「客户端启动数」，所以**不要轮询** ——
- *    只在启动检查与用户手动刷新/翻页时调用；
- * 3. 详情会让浏览量 +1，因此详情结果在 ViewModel 里按 id 缓存，避免重组 / 返回时重复请求。
+ * 为什么不用上游作者的公告服务器：那是安卓原作者的个人虚拟主机（明文 HTTP），
+ * fork 的公告数据源必须自有化——发布一条公告 = 往仓库根的 JSON 里加一个对象并提交，
+ * 无需任何服务端。**没有分页/浏览量统计**这些服务端能力，对应简化：
+ * - 列表一次全量返回（[fetchPage] 忽略 page/pageSize，恒 `hasMore=false`）；
+ * - 详情不再单独请求（也不再有 viewCount +1 副作用），直接从同一份数据里按 id 查。
  *
- * `content` 支持 Markdown / HTML（渲染交给 mikepenz 的 GFM 渲染器，与 README 预览同一套，
- * 不注入 WebView ⇒ 不存在脚本执行面）。
+ * 文件格式（字段名与原服务端契约保持一致，客户端其余层零改动）：
+ * ```json
+ * { "announcements": [ { "id", "title", "summary", "content", "publishAt",
+ *     "author", "publisher": {"name","avatarUrl"}, "isPinned", "targets": ["desktop"] } ] }
+ * ```
+ * - `content` 支持 Markdown（渲染与 README 预览同一套 GFM 渲染器，不注入 WebView）；
+ * - `targets` 缺省/为空 = 全平台可见；只发给电脑端的公告写 `["desktop"]`；
+ * - 发布时间未到的公告对用户不可见（定时发布语义与原服务端一致，只是改在客户端判）。
  *
- * 桌面差异：上游 Android 依赖 `network_security_config.xml` 为该域名单独放行明文 HTTP；
- * 桌面 JVM（OkHttp）默认允许明文，无需该配置。日志改走项目自带的 [Log]（替代 android.util.Log）。
- * 另见 `API-PC.md`：服务端按请求头 `X-Client-Platform` 分流（缺省 / 未知值一律回落手机端），
- * 电脑端**每个请求都必须带** [CLIENT_PLATFORM_HEADER]，否则会静默拿到手机端公告。
+ * 日志统一走 [Log]，失败原因一律 E 级打印，方便直接看日志定位。
  */
 object AnnouncementApi {
 
     /**
-     * 公告服务地址（PHP + SQLite 虚拟主机版；接口契约与原 Cloudflare Workers 版完全一致，只有域名与协议变了）。
-     * 与上游保持同一个后端：后端切 HTTPS 时这里同步改即可，桌面无需其它配置。
+     * 公告数据文件在本仓库的 raw 地址。**测试守卫**：[com.yunx.app.data.update.UpdateChecker]
+     * 所在更新通道测试同样断言这里必须指向 dengyie/PanRouter、不得回落上游作者域名。
      */
-    const val BASE_URL = "http://yunx.cyqawa.os.kg"
-
-    /** 客户端平台标识请求头：服务端据此只返回「发电脑端」的公告（见 API-PC.md §1） */
-    private const val CLIENT_PLATFORM_HEADER = "X-Client-Platform"
-
-    /** 电脑端标识值；服务端大小写不敏感，写错值不会报错、只会静默回落手机端 */
-    private const val CLIENT_PLATFORM_DESKTOP = "desktop"
+    const val ANNOUNCEMENTS_RAW_URL =
+        "https://raw.githubusercontent.com/dengyie/PanRouter/main/app-announcements.json"
 
     /**
-     * 列表分页大小 = 接口上限 100。
-     * 启动时一次取满，于是「未读角标」「启动弹窗候选」的口径就是**全部公告**，而不是前 20 条；
-     * 只有公告总数超过 100 条时列表页才需要「加载更多」翻第二页（仍用同一个 pageSize，分页口径一致）。
+     * 列表分页大小（保留常量：ViewModel 的启动检查/刷新调用点都带着它）。
+     * 静态源一次全量返回，这个值不再限制实际条数。
      */
     const val PAGE_SIZE = 100
 
-    /** 公告相关日志统一走这个标签，失败原因一律 E 级打印，方便直接看日志定位 */
+    /** 公告相关日志统一走这个标签 */
     private const val TAG = "YunX-Announce"
 
-    /** 发布者（服务端 `publisher` 对象） */
+    /** targets 数组里表示电脑端的值 */
+    private const val TARGET_DESKTOP = "desktop"
+
+    /** 发布者（`publisher` 对象） */
     data class Publisher(val name: String, val avatarUrl: String?)
 
     /**
-     * 公告对象（公开字段，见接口文档 §2.4）。
-     * [content] 只有详情接口返回；[coverImage] / [images] / [publisher.avatarUrl] 都是**完整直链**，可直接加载。
+     * 公告对象（字段名与上游公告系统契约一致）。
+     * [content] 在静态源里**始终随列表返回**（没有单独的详情接口）。
      */
     data class Announcement(
         val id: String,
@@ -78,12 +78,14 @@ object AnnouncementApi {
         val sortOrder: Int,
         val createdAt: String,
         val updatedAt: String,
+        /** 可见平台；空 = 全平台。只发给电脑端的公告为 ["desktop"]（静态源新增字段，上游契约没有） */
+        val targets: List<String> = emptyList(),
     ) {
         /** 生效时间（毫秒）：`publishAt` 为空表示「立即发布」，退回 createdAt；两者都解析不出来才是 0 */
         val effectiveMillis: Long get() = parseIsoMillis(publishAt) ?: parseIsoMillis(createdAt) ?: 0L
     }
 
-    /** 分页结果（接口文档 §1.3）：`hasMore` 等价于 `page * pageSize < total` */
+    /** 分页结果（静态源恒为单页全量） */
     data class Page(
         val total: Int,
         val page: Int,
@@ -93,84 +95,123 @@ object AnnouncementApi {
         val list: List<Announcement>,
     )
 
-    /** 请求结果：失败带上可直接展示的原因（服务端 `message` / HTTP 码 / 异常信息） */
+    /** 请求结果：失败带上可直接展示的原因（HTTP 码 / 异常信息 / 解析失败） */
     sealed interface Result<out T> {
         data class Success<T>(val data: T) : Result<T>
         data class Failure(val message: String) : Result<Nothing>
     }
 
-    /** 获取公告列表（不含正文）；[page] 从 1 开始 */
-    suspend fun fetchPage(page: Int = 1, pageSize: Int = PAGE_SIZE): Result<Page> =
-        request("/api/v1/announcements?page=$page&pageSize=$pageSize") { data ->
-            Page(
-                total = data.optInt("total"),
-                page = data.optInt("page", page),
-                pageSize = data.optInt("pageSize", pageSize),
-                totalPages = data.optInt("totalPages"),
-                hasMore = data.optBoolean("hasMore"),
-                list = data.optJSONArray("list")?.let { parseAnnouncementArray(it) } ?: emptyList()
-            )
+    /** 内存缓存：一次会话里列表/详情/翻页共用同一份快照，避免重复下载 */
+    @Volatile
+    private var cache: List<Announcement>? = null
+
+    /** 清空缓存（测试用；运行时刷新走重新 fetch 即可覆盖） */
+    internal fun clearCacheForTest() {
+        cache = null
+    }
+
+    /** 获取公告列表。[page]/[pageSize] 仅保留签名兼容，静态源恒返回第 1 页全量 */
+    suspend fun fetchPage(page: Int = 1, pageSize: Int = PAGE_SIZE): Result<Page> {
+        val list = when (val r = loadAll()) {
+            is Result.Success -> r.data
+            is Result.Failure -> return r
         }
+        return Result.Success(
+            Page(
+                total = list.size,
+                page = 1,
+                pageSize = list.size.coerceAtLeast(1),
+                totalPages = 1,
+                hasMore = false,
+                list = list
+            )
+        )
+    }
 
     /**
-     * 获取公告详情（含正文）。
-     * 公告不存在 / 草稿 / 已下架 / 定时未到统一是 `404` + `code 40401`，服务端 message 可直接展示。
+     * 获取公告详情（含正文）。静态源没有单独详情接口：从同一份缓存数据按 id 查；
+     * 缓存为空时先拉一次。查不到（下架/写错 id）返回 Failure，message 可直接展示。
      */
-    suspend fun fetchDetail(id: String): Result<Announcement> =
-        request("/api/v1/announcements/${encodeId(id)}") { data -> parseAnnouncement(data) }
+    suspend fun fetchDetail(id: String): Result<Announcement> {
+        val list = when (val r = loadAll()) {
+            is Result.Success -> r.data
+            is Result.Failure -> return r
+        }
+        val hit = list.firstOrNull { it.id == id.trim() }
+        return if (hit != null) Result.Success(hit)
+        else Result.Failure("公告不存在或已下架")
+    }
 
-    /** 发 GET 请求并解析统一响应结构；所有失败路径都返回 [Result.Failure]（不抛异常） */
-    private suspend fun <T> request(path: String, fromData: (JSONObject) -> T): Result<T> =
-        withContext(Dispatchers.IO) {
-            val url = BASE_URL + path
-            val body = try {
+    /** 拉取 + 解析 + 过滤排序，命中内存缓存时直接返回 */
+    private suspend fun loadAll(): Result<List<Announcement>> {
+        cache?.let { return Result.Success(it) }
+        return when (val r = fetchDocument()) {
+            is Result.Failure -> r
+            is Result.Success -> {
+                val visible = visibleAnnouncements(r.data)
+                cache = visible
+                Result.Success(visible)
+            }
+        }
+    }
+
+    /** 下载公告 JSON：先走 GitHub 镜像前缀（国内直连 raw 常不可达），失败回落 raw 直连 */
+    private suspend fun fetchDocument(): Result<JSONObject> = withContext(Dispatchers.IO) {
+        val prefixes = listOf(GitHubMirror.activePrefix(), "").filter { it.isNotEmpty() }.distinct()
+        var lastMessage = "网络异常"
+        for (prefix in prefixes) {
+            val url = prefix + ANNOUNCEMENTS_RAW_URL
+            val outcome = runCatching {
                 val call = Request.Builder()
                     .url(url)
                     .header("Accept", "application/json")
                     .header("User-Agent", "YunX-Desktop")
-                    // 关键：不带这个头服务端按手机端处理，会返回手机端专属公告（见 API-PC.md）
-                    .header(CLIENT_PLATFORM_HEADER, CLIENT_PLATFORM_DESKTOP)
                     .get()
                     .build()
                 HttpClients.apiClient().newCall(call).execute().use { resp ->
                     val text = resp.body?.string().orEmpty()
-                    if (text.isBlank()) {
-                        // 服务端异常时可能连 JSON 都没有：这里只留 HTTP 码，够定位
-                        Log.e(TAG, "公告响应为空（HTTP ${resp.code}，$url）")
-                        return@withContext Result.Failure("响应为空（HTTP ${resp.code}）")
+                    if (!resp.isSuccessful || text.isBlank()) {
+                        Log.e(TAG, "公告数据请求失败（HTTP ${resp.code}，$url）")
+                        return@use null
                     }
-                    // 非 2xx 也可能带合法 JSON（业务失败），所以先取 body 再交给 parseEnvelope 判 success
-                    text
+                    try {
+                        JSONObject(text)
+                    } catch (e: Exception) {
+                        Log.e(TAG, "公告数据不是合法 JSON（$url，前 200 字=${text.take(200)}）", e)
+                        null
+                    }
                 }
-            } catch (e: Exception) {
+            }.getOrElse { e ->
                 Log.e(TAG, "公告请求异常（$url）：${e.javaClass.simpleName}: ${e.message}", e)
-                return@withContext Result.Failure("${e.javaClass.simpleName}: ${e.message ?: "网络异常"}")
+                null
             }
-            parseEnvelope(body, url, fromData)
+            when {
+                outcome != null -> return@withContext Result.Success(outcome)
+                lastMessage == "网络异常" -> lastMessage = "响应无效（$url）"
+            }
         }
-
-    /** 解析统一响应结构：`success` 为 false 时把服务端 message 原样带回（接口文档 §1.2） */
-    private fun <T> parseEnvelope(body: String, url: String, fromData: (JSONObject) -> T): Result<T> {
-        val json = try {
-            JSONObject(body)
-        } catch (e: Exception) {
-            Log.e(TAG, "公告响应不是合法 JSON（前 200 字=${body.take(200)}）", e)
-            return Result.Failure("响应格式异常")
-        }
-        if (!json.optBoolean("success")) {
-            val code = json.optInt("code")
-            val message = json.stringOrNull("message") ?: "请求失败"
-            Log.e(TAG, "公告接口业务失败：[$code] $message（$url）")
-            return Result.Failure(message)
-        }
-        val data = json.optJSONObject("data") ?: return Result.Failure("响应数据为空")
-        return try {
-            Result.Success(fromData(data))
-        } catch (e: Exception) {
-            Log.e(TAG, "公告数据解析失败（$url）：${e.message}", e)
-            Result.Failure("数据解析失败")
-        }
+        Result.Failure(lastMessage)
     }
+
+    /**
+     * 从整份文档得出「用户可见」的公告列表：过滤未发布/定时未到/非本平台，
+     * 置顶（未过期）在前，其余按生效时间倒序——静态文件里随便写顺序，展示顺序在这里定。
+     */
+    internal fun visibleAnnouncements(document: JSONObject): List<Announcement> {
+        val now = System.currentTimeMillis()
+        val all = parseAnnouncementArray(document.optJSONArray("announcements") ?: JSONArray())
+        return all
+            .filter { it.effectiveMillis <= now || it.effectiveMillis == 0L }
+            .filter { it.targets.isEmpty() || TARGET_DESKTOP in it.targets }
+            .sortedWith(
+                compareByDescending<Announcement> { it.isPinned && !pinExpired(it, now) }
+                    .thenByDescending { it.effectiveMillis }
+            )
+    }
+
+    /** 置顶过期：pinExpireAt 已过 → 不再算置顶（与原服务端语义一致，改在客户端判） */
+    private fun pinExpired(item: Announcement, nowMs: Long): Boolean =
+        parseIsoMillis(item.pinExpireAt)?.let { it <= nowMs } == true
 
     private fun parseAnnouncementArray(arr: JSONArray): List<Announcement> {
         val out = ArrayList<Announcement>(arr.length())
@@ -219,16 +260,22 @@ object AnnouncementApi {
         pinExpireAt = json.stringOrNull("pinExpireAt"),
         sortOrder = json.optInt("sortOrder"),
         createdAt = json.stringOrNull("createdAt").orEmpty(),
-        updatedAt = json.stringOrNull("updatedAt").orEmpty()
+        updatedAt = json.stringOrNull("updatedAt").orEmpty(),
+        targets = json.optJSONArray("targets")?.let { parseStringArray(it) } ?: emptyList()
     )
 
-    /** 公告 ID 长度 <= 128 且允许客户端自定义，进路径前统一编码（正常 ann_xxx 编码后原样） */
-    private fun encodeId(id: String): String = URLEncoder.encode(id.trim(), "UTF-8")
+    /** ISO-8601 → 毫秒；解析失败返回 null（调用方退回 createdAt / 0） */
+    internal fun parseIsoMillis(iso: String?): Long? {
+        if (iso.isNullOrBlank()) return null
+        return runCatching {
+            java.time.OffsetDateTime.parse(iso.trim()).toInstant().toEpochMilli()
+        }.getOrNull()
+    }
 }
 
 /**
  * `optString` 遇到 JSON null 会返回字符串 `"null"`（不是空串），可空字段一律走这里。
- * 「字段缺失」与「字段为 null」在接口里是两种含义（如 publishAt = null 表示立即发布），
+ * 「字段缺失」与「字段为 null」在数据文件里是两种含义（如 publishAt = null 表示立即发布），
  * 所以这里只做「取不到 / 为 null ⇒ null」，空串也算没值（避免把 "" 当时间/图片地址用）。
  */
 private fun JSONObject.stringOrNull(key: String): String? =

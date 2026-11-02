@@ -89,8 +89,6 @@ import kotlin.math.abs
 import kotlin.math.cos
 import kotlin.math.sin
 
-/** QQ 交流群群号（桌面端无 mqqapi scheme 保证，点击复制群号供用户在 QQ 中搜索） */
-private const val QQ_GROUP = "635207650"
 
 /** 引导页总页数：欢迎 / 功能特性 / 协议与声明 / 存储与安全 */
 private const val PAGE_COUNT = 4
@@ -104,7 +102,7 @@ private const val FADE_OUT_MS = 140
 
 /**
  * 首次启动引导页（四页式，参照上游安卓端重做）：
- * - 第 1 页：简洁欢迎 —— 图标 / 名称 / 版本 / 一句话 / 标签胶囊 / 开源仓库 / QQ 群；
+ * - 第 1 页：简洁欢迎 —— 图标 / 名称 / 版本 / 一句话 / 标签胶囊 / 开源仓库；
  * - 第 2 页：功能特性 + 「完全免费」卡；
  * - 第 3 页：用户协议 + 免责声明 + 开源协议（长文，页内可滚动）；
  * - 第 4 页：存储与安全 —— 下载保存位置 / 数据库位置 / 数据库加密等级（复用设置里的储存面板）；
@@ -175,7 +173,7 @@ fun OnboardingScreen(
             }
 
             // ★ 引导页自己渲染一个 Snackbar 宿主：MainScreen 的宿主在这页 early-return 之后才组合，
-            //   没有它「QQ 群号已复制」之类的气泡根本没地方显示（点击复制会毫无反馈）。
+            //   没有它 Snackbar 气泡根本没地方显示（各类点击反馈会毫无提示）。
             GlobalSnackbarHost()
         }
     }
@@ -326,9 +324,6 @@ private fun WelcomePage() {
 
         Spacer(modifier = Modifier.height(30.dp))
         GitHubCard()
-
-        Spacer(modifier = Modifier.height(12.dp))
-        QQGroupPill()
     }
 }
 
@@ -353,7 +348,7 @@ private fun FactChip(text: String) {
 private fun GitHubCard() {
     Card(
         onClick = {
-            DesktopActions.openUrl("https://github.com/tidain/YunX-Desktop")
+            DesktopActions.openUrl("https://github.com/dengyie/PanRouter")
         },
         modifier = Modifier.fillMaxWidth(),
         shape = MaterialTheme.shapes.large,
@@ -388,7 +383,7 @@ private fun GitHubCard() {
                     color = MaterialTheme.colorScheme.onSurface
                 )
                 Text(
-                    text = "github.com/tidain/YunX-Desktop",
+                    text = "github.com/dengyie/PanRouter",
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
@@ -398,51 +393,6 @@ private fun GitHubCard() {
                 contentDescription = null,
                 modifier = Modifier.size(18.dp),
                 tint = MaterialTheme.colorScheme.outline
-            )
-        }
-    }
-}
-
-/**
- * QQ 交流群入口（胶囊）：点击复制群号（桌面端无法可靠拉起 QQ）。
- *
- * ★ 做成胶囊而不是卡片：与上面的 GitHub 卡片形成主次，小屏/矮窗口下也不会把图标区挤掉。
- * ★ 反馈用全局 Snackbar —— 引导页自己渲染了 GlobalSnackbarHost（见 OnboardingScreen）。
- */
-@Composable
-private fun QQGroupPill() {
-    Card(
-        onClick = {
-            DesktopActions.copyToClipboard(QQ_GROUP)
-            SnackbarController.show("QQ 群号已复制：$QQ_GROUP")
-        },
-        shape = CircleShape,
-        colors = CardDefaults.cardColors(
-            containerColor = MaterialTheme.colorScheme.primaryContainer
-        )
-    ) {
-        Row(
-            modifier = Modifier.padding(horizontal = 16.dp, vertical = 9.dp),
-            verticalAlignment = Alignment.CenterVertically
-        ) {
-            Icon(
-                imageVector = Icons.Outlined.Forum,
-                contentDescription = null,
-                modifier = Modifier.size(16.dp),
-                tint = MaterialTheme.colorScheme.onPrimaryContainer
-            )
-            Spacer(modifier = Modifier.width(8.dp))
-            Text(
-                text = "QQ 群 $QQ_GROUP",
-                style = MaterialTheme.typography.labelLarge,
-                color = MaterialTheme.colorScheme.onPrimaryContainer
-            )
-            Spacer(modifier = Modifier.width(6.dp))
-            Icon(
-                imageVector = Icons.Outlined.OpenInNew,
-                contentDescription = "复制群号",
-                modifier = Modifier.size(14.dp),
-                tint = MaterialTheme.colorScheme.onPrimaryContainer
             )
         }
     }
@@ -640,7 +590,7 @@ private fun TermsPage() {
             icon = Icons.Outlined.Code,
             title = "开源协议",
             paragraphs = listOf(
-                "本项目基于 GNU AGPL-3.0 协议开源，源码公开于 github.com/tidain/YunX-Desktop。"
+                "本项目基于 GNU AGPL-3.0 协议开源，源码公开于 github.com/dengyie/PanRouter（基于 tidain/YunX-Desktop 上游项目二次开发，一并致谢）。"
             )
         )
 

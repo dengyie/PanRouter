@@ -19,8 +19,8 @@
 ## 命令
 
 ```powershell
-git clone https://github.com/tidain/YunX-Desktop.git
-cd YunX-Desktop
+git clone https://github.com/dengyie/PanRouter.git
+cd PanRouter
 
 .\run.ps1 run        # 编译并启动（开发，含 darkmode.dll）
 .\run.ps1 build      # 仅编译 Kotlin（不需要 C++ 编译器）
@@ -43,7 +43,7 @@ Beta=0           ← 第二行：Beta=1 预览版 / Beta=0 正式版（缺省 = 
 第二行写 `Beta=1` 时，构建出的 `APP_IS_PREVIEW = true`，关于页版本号旁会显示**黄色 Beta 标记**。
 打包脚本只取第一行作为版本号，第二行不参与文件名 / jpackage 版本。
 
-启动器 exe 的版本资源（公司 `tidain`、版权 `Copyright (C) 2026 tidain`）也在打包时由该版本号生成。
+启动器 exe 的版本资源（公司 `dengyie`、版权 `Copyright (C) 2026 dengyie`）也在打包时由该版本号生成。
 
 ### 发布说明里的强制更新字段
 

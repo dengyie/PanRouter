@@ -25,7 +25,7 @@ try {
 $mb = [math]::Round((Get-Item "$name.zip").Length / 1MB, 1)
 Write-Host "[OK] release asset: $name.zip ($mb MB)"
 
-$notes = "YunX-Desktop $Tag 便携版（免安装，解压即用）。`n`n基于 [tidain/YunX-Desktop](https://github.com/tidain/YunX-Desktop) 二次开发，新增 PanRouter 服务端解析整合。"
+$notes = "PanRouter 桌面端 $Tag 便携版（免安装，解压即用）。`n`n基于 YunX-Desktop（[tidain/YunX-Desktop](https://github.com/tidain/YunX-Desktop)，AGPL-3.0）二次开发，整合 PanRouter 服务端解析。源码与更新：https://github.com/dengyie/PanRouter"
 gh release create $Tag "$name.zip" --title $Tag --notes $notes
 if ($LASTEXITCODE -ne 0) { throw "gh release create failed with exit $LASTEXITCODE" }
 Write-Host "[OK] Release $Tag published" -ForegroundColor Green

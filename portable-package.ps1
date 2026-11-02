@@ -274,8 +274,8 @@ using System.Reflection;
 
 [assembly: AssemblyTitle("云析 YunX-Desktop")]
 [assembly: AssemblyProduct("云析 YunX-Desktop")]
-[assembly: AssemblyCompany("tidain")]
-[assembly: AssemblyCopyright("Copyright (C) 2026 tidain")]
+[assembly: AssemblyCompany("dengyie")]
+[assembly: AssemblyCopyright("Copyright (C) 2026 dengyie (based on YunX-Desktop by tidain, AGPL-3.0)")]
 [assembly: AssemblyDescription("网盘分享链接解析与高速下载器")]
 [assembly: AssemblyVersion("$AppVersion")]
 [assembly: AssemblyFileVersion("$AppVersion")]
