@@ -26,6 +26,9 @@ Write-Host "[OK] App version: $AppVersion" -ForegroundColor Green
 $pickerSrc = Join-Path $root "picker\PositionPicker.cs"
 $pickerExeOut = Join-Path $root "build\YunX-PositionPicker.exe"
 if (-not (Test-Path $pickerSrc)) { throw "picker source not found: $pickerSrc" }
+# csc 不自建输出目录：全新 checkout（CI）没有 build\，会以 CS1567（Win32 资源临时文件写不进）失败
+$pickerOutDir = Split-Path -Parent $pickerExeOut
+if (-not (Test-Path $pickerOutDir)) { New-Item -ItemType Directory -Force -Path $pickerOutDir | Out-Null }
 $csc = "$env:WINDIR\Microsoft.NET\Framework64\v4.0.30319\csc.exe"
 if (-not (Test-Path $csc)) { throw "csc.exe not found at $csc" }
 & $csc /nologo /target:winexe /platform:x64 /optimize+ `
