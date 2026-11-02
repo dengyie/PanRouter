@@ -1,7 +1,8 @@
 name: Release 发版
 
 # 目的：推送 v* tag（或手动触发）时构建免安装便携包并发布 GitHub Release。
-# 构建流程完全复用 portable-package.ps1，与本地打包 / pr-portable.yml 同一套逻辑。
+# 构建流程完全复用 portable-package.ps1，与本地打包 / pr-portable.yml 同一套逻辑；
+# 打 zip 与发 Release 逻辑在 release-package.ps1（内联 run 块保持纯 ASCII，规避 PS5.1 无 BOM 解析问题）。
 
 on:
   push:
@@ -26,7 +27,7 @@ jobs:
         uses: actions/checkout@v4
 
       - name: 安装 JDK 17
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: '17'
@@ -45,29 +46,11 @@ jobs:
         shell: powershell
         run: .\portable-package.ps1
 
-      - name: 打包为 zip
-        shell: powershell
-        run: |
-          $tag = "${{ github.ref_name }}"
-          if (-not $tag.StartsWith("v")) { $tag = "v0.0.0-manual$([int]$env:GITHUB_RUN_NUMBER)" }
-          $name = "YunX-Desktop-portable-$tag"
-          Push-Location .\release
-          try {
-            & 7z a -tzip -mx=5 "..\$name.zip" "YunX-Desktop" | Out-Null
-            if ($LASTEXITCODE -ne 0) { throw "7z 打包失败" }
-          } finally {
-            Pop-Location
-          }
-          $mb = [math]::Round((Get-Item "$name.zip").Length / 1MB, 1)
-          Write-Host "release asset: $name.zip ($mb MB)"
-          "asset=$name.zip" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
-
-      - name: 发布 Release
+      - name: Package and publish release
         shell: powershell
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          $tag = "${{ github.ref_name }}"
-          $asset = $env:asset
-          $notes = "YunX-Desktop $tag 便携版（免安装，解压即用）。`n`n基于 [tidain/YunX-Desktop](https://github.com/tidain/YunX-Desktop) 二次开发，新增 PanRouter 服务端解析整合。"
-          gh release create $tag $asset --title $tag --notes $notes
+          $tag = $env:GITHUB_REF_NAME
+          if (-not $tag.StartsWith("v")) { $tag = "v0.0.0-manual$($env:GITHUB_RUN_NUMBER)" }
+          .\release-package.ps1 -Tag $tag
