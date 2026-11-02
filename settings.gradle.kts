@@ -19,5 +19,11 @@ dependencyResolutionManagement {
     }
 }
 
+// 工具链自动下载仓库（foojay）：`updateDaemonJvm` / daemon JVM criteria（gradle-daemon-jvm.properties）
+// 生成与解析时要用 —— 本机与 CI 都已装 JDK 17（走本地探测），这里只是兜底下载通道。
+plugins {
+    id("org.gradle.toolchains.foojay-resolver-convention") version "0.8.0"
+}
+
 rootProject.name = "YunX-Desktop"
 include(":desktop")

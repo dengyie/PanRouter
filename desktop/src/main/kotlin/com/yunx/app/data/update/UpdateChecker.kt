@@ -11,17 +11,22 @@ import org.json.JSONObject
 
 /**
  * GitHub Release 更新检测。
- * 正式版通道（默认）：GET https://api.github.com/repos/tidain/YunX-Desktop/releases/latest
+ *
+ * ★ 检查的是**本 fork 自己的发布通道**（dengyie/PanRouter，PanRouter 整合版独立版本线 0.1.x），
+ *   不是上游 tidain/YunX-Desktop（1.3.x）：上游号永远大于 fork 号，指上游会导致每次启动都弹
+ *   「发现新版本」，且用户点更新会装上**没有 PanRouter 整合的上游版**。
+ * 正式版通道（默认）：GET https://api.github.com/repos/dengyie/PanRouter/releases/latest
  * 预发布通道（设置页开启「接受预发布版更新」后）：GET .../releases
  */
 object UpdateChecker {
 
-    private const val RELEASES_LATEST_URL =
-        "https://api.github.com/repos/tidain/YunX-Desktop/releases/latest"
+    /** 通道端点用 internal：UpdateChannelTest 守卫「不得指回上游」（曾真实发生） */
+    internal const val RELEASES_LATEST_URL =
+        "https://api.github.com/repos/dengyie/PanRouter/releases/latest"
 
     /** Release 列表（按发布时间倒序，含 Pre-release）：开启「接受预发布版更新」时用它取最新一条 */
-    private const val RELEASES_LIST_URL =
-        "https://api.github.com/repos/tidain/YunX-Desktop/releases"
+    internal const val RELEASES_LIST_URL =
+        "https://api.github.com/repos/dengyie/PanRouter/releases"
 
     private const val TAG = "YunX-Update"
 

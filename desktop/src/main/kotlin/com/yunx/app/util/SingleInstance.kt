@@ -32,26 +32,40 @@ object SingleInstance {
     /**
      * 尝试成为唯一实例。
      * @return true = 本进程是第一个实例，继续启动；false = 已有实例在跑，调用方应退出
+     *
+     * ★ tryLock 失败后短暂重试（约 6s）：**白屏看门狗自重启**时旧进程退出与新进程起步几乎同时
+     *   （relaunch.log 实测：旧进程 08.97 打退出日志、新进程 10.68 试锁仍撞锁退出）——
+     *   文件锁要等旧进程完全终结才释放，重试窗口正是给这个交接用的。
+     *   真正的长期占用（用户双开了应用）重试 6s 后照样退出，不影响保护语义。
      */
     fun acquire(): Boolean {
         val file = File(AppContext.dataDir, "yunx-instance.lock")
-        return try {
-            file.parentFile?.mkdirs()
-            val raf = RandomAccessFile(file, "rw")
-            val acquired = raf.channel.tryLock()
-            if (acquired == null) {
-                raf.close()
-                false
-            } else {
+        repeat(7) { attempt ->
+            val raf = try {
+                file.parentFile?.mkdirs()
+                RandomAccessFile(file, "rw")
+            } catch (t: Throwable) {
+                // 锁文件不可用（权限 / 被占用）时宁可放行：不能因为保护机制让应用起不来
+                Log.w(TAG, "单实例锁不可用，按多实例放行: ${t.message}")
+                return true
+            }
+            val acquired = try { raf.channel.tryLock() } catch (t: Throwable) {
+                Log.w(TAG, "单实例锁不可用，按多实例放行: ${t.message}")
+                runCatching { raf.close() }
+                return true
+            }
+            if (acquired != null) {
                 holder = raf
                 lock = acquired
-                true
+                return true
             }
-        } catch (t: Throwable) {
-            // 锁文件不可用（权限 / 被占用）时宁可放行：不能因为保护机制让应用起不来
-            Log.w(TAG, "单实例锁不可用，按多实例放行: ${t.message}")
-            true
+            runCatching { raf.close() }
+            if (attempt < 6) {
+                Log.i(TAG, "已有实例运行中（第 ${attempt + 1} 次抢锁失败，可能正在退出交接），1s 后重试")
+                Thread.sleep(1_000L)
+            }
         }
+        return false
     }
 
     /**

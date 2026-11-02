@@ -49,15 +49,16 @@ fun main(args: Array<String>) {
     }
 
     // ★ 老旧 / 基础显示适配器（如 ATI Radeon 3000）上，OPENGL(ANGLE) 会出现「界面有形状、
-    //   但一个文字都不渲染」，这类设备由 [RenderApiChooser] 自动退到 SOFTWARE。
-    //   必须在创建任何窗口 / Skiko 初始化之前设置；环境变量 YUNXPC_RENDER_API 优先级更高。
+    //   但一个文字都不渲染」；此外还有一类**间歇性**白屏（虚拟显示适配器活动时首帧永不绘制）。
+    //   前者由静态名单兜住，后者靠首帧看门狗（窗口出现后采样确认白屏 → 自动重启切 SOFTWARE）。
+    //   必须在创建任何窗口 / Skiko 初始化之前设置；环境变量 YUNXPC_RENDER_API 优先级最高（且不挂看门狗）。
     var softwareRendering = false
+    var renderDecision: com.yunx.app.util.RenderApiPolicy.Decision? = null
     if (osName.contains("win")) {
-        val renderApi = System.getenv("YUNXPC_RENDER_API")?.takeIf { it.isNotBlank() }
-            ?: RenderApiChooser.chooseWindows()
-        com.yunx.app.util.Log.i("YunX-Render", "渲染后端：$renderApi")
-        System.setProperty("skiko.renderApi", renderApi)
-        softwareRendering = renderApi.equals("SOFTWARE", true)
+        val decision = com.yunx.app.util.RenderApiChooser.resolveWindows()
+        renderDecision = decision
+        System.setProperty("skiko.renderApi", decision.api)
+        softwareRendering = decision.api.equals("SOFTWARE", true)
     }
     // 动效降级：软件渲染时每帧 CPU 光栅化，位移动画/列表增删只会更卡（§3.7）
     runCatching { com.yunx.app.ui.theme.MotionPolicy.install(softwareRendering) }
@@ -204,6 +205,14 @@ fun main(args: Array<String>) {
             androidx.compose.runtime.LaunchedEffect(Unit) {
                 if (splashMode) {
                     (window as? java.awt.Frame)?.let { WindowFx.scheduleFadeIn(it) }
+                }
+            }
+            // 首帧看门狗：OPENGL 间歇性白屏（窗口出现但首帧永不绘制）→ 确认后自动重启切 SOFTWARE。
+            // 策略与守卫见 RenderApiPolicy / RenderApiChooser.startFirstFrameWatchdog。
+            androidx.compose.runtime.LaunchedEffect(Unit) {
+                val decision = renderDecision ?: return@LaunchedEffect
+                (window as? java.awt.Frame)?.let {
+                    com.yunx.app.util.RenderApiChooser.startFirstFrameWatchdog(it, decision)
                 }
             }
             // 系统托盘：JNA 调 Win32 TrackPopupMenu（原生菜单，中文正常，暗色跟随系统）
