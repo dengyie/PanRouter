@@ -15,6 +15,7 @@
   label { display:block; color:var(--sub); font-size:12px; margin:10px 0 4px; }
   input { width:100%; background:#0c0e13; border:1px solid var(--line); color:var(--txt); border-radius:6px; padding:9px 12px; font-size:14px; }
   input:focus { outline:none; border-color:var(--acc); }
+  select { background:#0c0e13; border:1px solid var(--line); color:var(--txt); border-radius:6px; padding:9px 12px; font-size:14px; }
   button { background:var(--acc); border:none; color:#fff; border-radius:6px; padding:9px 18px; font-size:14px; cursor:pointer; margin-top:12px; }
   button.ghost { background:transparent; border:1px solid var(--line); color:var(--sub); }
   button:disabled { opacity:.5; cursor:default; }
@@ -76,6 +77,21 @@
     <button class="ghost" onclick="addAccount()">Cookie 手动添加</button>
     <div id="accList"></div>
   </div>
+
+  <div class="card hide" id="syncCard">
+    <label>设备同步数据(桌面端上报的收藏 / 解析历史 / 下载记录,只读浏览)</label>
+    <div class="row" style="align-items:center">
+      <select id="syncKind" style="flex:0 0 140px">
+        <option value="">全部类型</option>
+        <option value="bookmark">收藏</option>
+        <option value="link_history">解析历史</option>
+        <option value="download_record">下载记录</option>
+      </select>
+      <input id="syncSearch" placeholder="过滤:标题 / 链接 / 设备">
+      <button class="ghost" style="flex:0 0 auto;margin-top:0" onclick="loadSync()">刷新</button>
+    </div>
+    <div id="syncList"></div>
+  </div>
 </div>
 
 <script>
@@ -107,6 +123,7 @@ function logout() {
   localStorage.removeItem('panrouter_token'); TOKEN = '';
   stopQr(true); // 退出登录同时停掉在途扫码轮询
   $('accCard').classList.add('hide');
+  $('syncCard').classList.add('hide');
   $('logoutBtn').classList.add('hide');
   $('loginForm').classList.remove('hide');
 }
@@ -122,8 +139,10 @@ async function login() {
 function enter() {
   $('loginForm').classList.add('hide');
   $('accCard').classList.remove('hide');
+  $('syncCard').classList.remove('hide');
   $('logoutBtn').classList.remove('hide');
   loadAccounts();
+  loadSync();
 }
 
 async function resolve() {
@@ -195,6 +214,54 @@ async function addAccount() {
 }
 async function refreshAcc(id) { try { await api(`/accounts/${id}/refresh`, {method:'POST'}); loadAccounts(); } catch(e){ alert(e.message); } }
 async function delAcc(id) { try { await api(`/accounts/${id}`, {method:'DELETE'}); loadAccounts(); } catch(e){ alert(e.message); } }
+
+// ---- 设备同步数据浏览(M3) ----
+// pull 端点按 id 游标翻页;浏览页直接循环拉全量(个人规模,设硬上限防失控)。
+const SYNC_PAGE = 500, SYNC_MAX_ITEMS = 5000;
+const SYNC_KIND_NAME = {bookmark:'收藏', link_history:'解析历史', download_record:'下载记录'};
+
+async function loadSync() {
+  $('syncList').innerHTML = '<div class="msg info">加载中…</div>';
+  try {
+    const kindFilter = $('syncKind').value;
+    const kw = $('syncSearch').value.trim().toLowerCase();
+    let since = 0, all = [];
+    for (let i = 0; i < SYNC_MAX_ITEMS / SYNC_PAGE; i++) {
+      const d = await api(`/sync?since=${since}&limit=${SYNC_PAGE}`);
+      all = all.concat(d.items || []);
+      if (!d.last_seq || d.last_seq <= since || (d.items||[]).length === 0) break;
+      since = d.last_seq;
+    }
+    // 过滤:类型 + 关键词(标题/链接/设备);payload 解析失败的原样展示
+    const rows = all
+      .filter(it => !kindFilter || it.kind === kindFilter)
+      .filter(it => {
+        if (!kw) return true;
+        const hay = [it.device_id, it.payload].join(' ').toLowerCase();
+        return hay.includes(kw);
+      })
+      .sort((a,b) => b.client_updated_at - a.client_updated_at)
+      .map(it => {
+        let p = {};
+        try { p = JSON.parse(it.payload || '{}'); } catch(_) {}
+        const main = esc(p.title || p.file_name || p.url || p.share_url || '(空)');
+        const sub = esc(p.link || p.url || p.share_url || '');
+        const extra = [p.platform && esc('平台:'+p.platform), p.category && esc('分类:'+p.category),
+          p.total_size ? fmtSize(Number(p.total_size)) : '', p.status && esc('状态:'+p.status)]
+          .filter(Boolean).join(' · ');
+        const when = it.client_updated_at ? new Date(it.client_updated_at).toLocaleString() : '-';
+        const tomb = it.deleted ? '<span class="badge baria2">已删除</span>' : '';
+        return `<tr><td>${esc(SYNC_KIND_NAME[it.kind]||it.kind)}</td><td>${esc(it.device_id)}</td>`+
+          `<td>${tomb} <b>${main}</b>${sub?`<br><code>${sub}</code>`:''}${extra?`<br><span style="color:var(--sub);font-size:12px">${extra}</span>`:''}</td>`+
+          `<td style="white-space:nowrap">${esc(when)}</td></tr>`;
+      }).join('');
+    $('syncList').innerHTML = rows
+      ? `<table><tr><th>类型</th><th>设备</th><th>内容</th><th>时间</th></tr>${rows}</table>`
+      : '<div class="msg info">暂无同步数据(桌面端开启「历史同步」并完成一轮同步后,这里会显示各设备上报的收藏/历史/下载记录)</div>';
+  } catch(e) { $('syncList').innerHTML = `<div class="msg err">${esc(e.message)}</div>`; }
+}
+$('syncKind')?.addEventListener('change', loadSync);
+$('syncSearch')?.addEventListener('change', loadSync);
 
 // 扫码添加:qr/token 直出 PNG data URI → <img> 渲染;2s 轮询到 confirmed/expired 停止。
 let qrTimer = null;

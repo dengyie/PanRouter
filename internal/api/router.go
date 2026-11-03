@@ -72,6 +72,8 @@ func Router(d Deps) http.Handler {
 			pr.Post("/downloads", d.handlePushDownload)
 			pr.Get("/downloads", d.handleListDownloads)
 			pr.Get("/downloads/{gid}", d.handleDownloadStatus)
+			pr.Post("/sync", d.handlePushSync)
+			pr.Get("/sync", d.handlePullSync)
 		})
 	})
 
