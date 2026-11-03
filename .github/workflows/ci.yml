@@ -2,9 +2,9 @@ name: CI
 
 on:
   push:
-    branches: ["main"]
+    branches: ["server"]
   pull_request:
-    branches: ["main"]
+    branches: ["server"]
   workflow_dispatch:
 
 concurrency:
@@ -32,7 +32,7 @@ jobs:
   deploy:
     name: Deploy to pxed
     needs: test
-    if: github.repository == 'dengyie/PanRouter' && github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+    if: github.repository == 'dengyie/PanRouter' && github.ref == 'refs/heads/server' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
