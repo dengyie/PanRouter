@@ -10,6 +10,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -614,5 +615,157 @@ func TestE2ESystemEndpoints(t *testing.T) {
 	// 未知路径 → 404 JSON
 	if st, _ := e.do(t, "GET", "/nope", "", ""); st != http.StatusNotFound {
 		t.Fatal("404 route")
+	}
+}
+
+// ---- 设备历史同步(M3) ----
+
+// syncPush 构造一条推送条目的 JSON。
+func syncPush(deviceID, kind, uid string, deleted bool, updatedAt int64, payload string) string {
+	return `{"device_id":"` + deviceID + `","items":[{"kind":"` + kind + `","uid":"` + uid +
+		`","deleted":` + boolJSON(deleted) + `,"updated_at":` + strconvI64(updatedAt) +
+		`,"payload":` + payload + `}]}`
+}
+
+func boolJSON(b bool) string {
+	if b {
+		return "true"
+	}
+	return "false"
+}
+
+func strconvI64(v int64) string { return strconv.FormatInt(v, 10) }
+
+func TestE2ESyncPushPullRoundtrip(t *testing.T) {
+	e := newE2E(t, true)
+
+	// 推三类条目
+	push := func(body string) (int, map[string]any) {
+		return e.do(t, "POST", "/api/v1/sync", e.token, body)
+	}
+	if st, b := push(syncPush("pc-1", "bookmark", "u-bm", false, 1000, `{"link":"https://pan.quark.cn/s/abc","title":"资源","platform":"quark"}`)); st != http.StatusOK || b["accepted"].(float64) != 1 {
+		t.Fatalf("push bookmark: status=%d body=%v", st, b)
+	}
+	if st, b := push(syncPush("pc-1", "link_history", "u-lh", false, 1100, `{"url":"https://pan.quark.cn/s/def","title":"历史","platform":"quark"}`)); st != http.StatusOK || b["accepted"].(float64) != 1 {
+		t.Fatalf("push link_history: status=%d body=%v", st, b)
+	}
+	if st, b := push(syncPush("pc-2", "download_record", "u-dl", false, 1200, `{"share_url":"https://pan.quark.cn/s/ghi","file_name":"a.zip","platform":"quark","total_size":123}`)); st != http.StatusOK || b["accepted"].(float64) != 1 {
+		t.Fatalf("push download_record: status=%d body=%v", st, b)
+	}
+
+	// 全量拉回:按 id 升序,payload 原样保留
+	st, b := e.do(t, "GET", "/api/v1/sync?since=0", e.token, "")
+	if st != http.StatusOK {
+		t.Fatalf("pull: status=%d body=%v", st, b)
+	}
+	items := b["items"].([]any)
+	if len(items) != 3 {
+		t.Fatalf("want 3 items, got %d: %v", len(items), b)
+	}
+	lastSeq := b["last_seq"].(float64)
+	if lastSeq < 3 {
+		t.Fatalf("last_seq should be >=3, got %v", lastSeq)
+	}
+	first := items[0].(map[string]any)
+	if first["kind"].(string) != "bookmark" || first["uid"].(string) != "u-bm" ||
+		first["device_id"].(string) != "pc-1" || first["deleted"].(bool) {
+		t.Fatalf("first item mismatch: %v", first)
+	}
+	if first["client_updated_at"].(float64) != 1000 {
+		t.Fatalf("client_updated_at mismatch: %v", first)
+	}
+	var pl map[string]any
+	if err := json.Unmarshal([]byte(first["payload"].(string)), &pl); err != nil || pl["title"] != "资源" {
+		t.Fatalf("payload roundtrip broken: %v err=%v", first["payload"], err)
+	}
+
+	// 游标之后无新数据
+	if st, b2 := e.do(t, "GET", "/api/v1/sync?since="+strconvI64(int64(lastSeq)), e.token, ""); st != http.StatusOK || len(b2["items"].([]any)) != 0 {
+		t.Fatalf("pull since=last_seq should be empty: %d %v", st, b2)
+	}
+
+	// 墓碑传播
+	if st, b := push(syncPush("pc-1", "bookmark", "u-bm", true, 2000, `{}`)); st != http.StatusOK || b["accepted"].(float64) != 1 {
+		t.Fatalf("tombstone push: %d %v", st, b)
+	}
+	_, b = e.do(t, "GET", "/api/v1/sync?since="+strconvI64(int64(lastSeq)), e.token, "")
+	items = b["items"].([]any)
+	if len(items) != 1 || !items[0].(map[string]any)["deleted"].(bool) {
+		t.Fatalf("tombstone not propagated: %v", b)
+	}
+}
+
+func TestE2ESyncLWWArbitration(t *testing.T) {
+	e := newE2E(t, true)
+	push := func(body string) (int, map[string]any) {
+		return e.do(t, "POST", "/api/v1/sync", e.token, body)
+	}
+	// 先推 v2(较新)
+	if st, b := push(syncPush("pc-1", "bookmark", "u-1", false, 2000, `{"title":"v2"}`)); st != http.StatusOK || b["accepted"].(float64) != 1 {
+		t.Fatalf("push v2: %d %v", st, b)
+	}
+	// 再推 v1(较旧)→ 被 LWW 拒绝
+	st, b := push(syncPush("pc-1", "bookmark", "u-1", false, 1000, `{"title":"v1"}`))
+	if st != http.StatusOK || b["skipped"].(float64) != 1 {
+		t.Fatalf("stale push should be skipped: %d %v", st, b)
+	}
+	// 服务端仍是 v2
+	_, b = e.do(t, "GET", "/api/v1/sync?since=0", e.token, "")
+	item := b["items"].([]any)[0].(map[string]any)
+	if item["client_updated_at"].(float64) != 2000 || !strings.Contains(item["payload"].(string), "v2") {
+		t.Fatalf("LWW failed, server kept wrong version: %v", item)
+	}
+	// 相同 uid 的新版本被接受且拿到新序号(游标推进)
+	oldSeq := item["id"].(float64)
+	if st, b := push(syncPush("pc-1", "bookmark", "u-1", false, 3000, `{"title":"v3"}`)); st != http.StatusOK || b["accepted"].(float64) != 1 {
+		t.Fatalf("push v3: %d %v", st, b)
+	}
+	_, b = e.do(t, "GET", "/api/v1/sync?since="+strconvI64(int64(oldSeq)), e.token, "")
+	items := b["items"].([]any)
+	if len(items) != 1 || items[0].(map[string]any)["id"].(float64) <= oldSeq {
+		t.Fatalf("updated item must get a new larger seq: %v", b)
+	}
+}
+
+func TestE2ESyncValidation(t *testing.T) {
+	e := newE2E(t, true)
+	cases := []struct {
+		name string
+		body string
+	}{
+		{"bad kind", syncPush("pc-1", "bookmark2", "u-1", false, 1, `{}`)},
+		{"empty uid", `{"device_id":"pc-1","items":[{"kind":"bookmark","uid":"","deleted":false,"updated_at":1,"payload":{}}]}`},
+		{"empty device", `{"device_id":"","items":[{"kind":"bookmark","uid":"u","deleted":false,"updated_at":1,"payload":{}}]}`},
+		{"empty items", `{"device_id":"pc-1","items":[]}`},
+	}
+	for _, c := range cases {
+		if st, b := e.do(t, "POST", "/api/v1/sync", e.token, c.body); st != http.StatusBadRequest {
+			t.Fatalf("%s: want 400 got %d body=%v", c.name, st, b)
+		}
+	}
+	// payload 超限
+	big := `{"pad":"` + strings.Repeat("x", 17*1024) + `"}`
+	if st, _ := e.do(t, "POST", "/api/v1/sync", e.token, syncPush("pc-1", "bookmark", "u-big", false, 1, big)); st != http.StatusBadRequest {
+		t.Fatal("oversized payload should 400")
+	}
+	// 非法 since
+	if st, _ := e.do(t, "GET", "/api/v1/sync?since=abc", e.token, ""); st != http.StatusBadRequest {
+		t.Fatal("bad since should 400")
+	}
+	// 非法 limit
+	if st, _ := e.do(t, "GET", "/api/v1/sync?since=0&limit=99999", e.token, ""); st != http.StatusBadRequest {
+		t.Fatal("bad limit should 400")
+	}
+}
+
+func TestE2ESyncAuthRequired(t *testing.T) {
+	e := newE2E(t, true)
+	st, b := e.do(t, "POST", "/api/v1/sync", "", syncPush("pc-1", "bookmark", "u-1", false, 1, `{}`))
+	if st != http.StatusUnauthorized || b["kind"] != "session_expired" {
+		t.Fatalf("unauthenticated push: %d %v", st, b)
+	}
+	st, b = e.do(t, "GET", "/api/v1/sync?since=0", "", "")
+	if st != http.StatusUnauthorized || b["kind"] != "session_expired" {
+		t.Fatalf("unauthenticated pull: %d %v", st, b)
 	}
 }

@@ -75,6 +75,19 @@ type AuditLog struct {
 	Detail string    `gorm:"type:text"`
 }
 
+// SyncItem 设备同步条目:桌面端把收藏/解析历史/下载记录以不透明 JSON payload 上报,
+// 服务端只做存储与 LWW 仲裁,不解析 payload 语义(两仓零共享代码边界)。
+type SyncItem struct {
+	ID              uint      `gorm:"primaryKey" json:"id"` // 全局变更序号:每次变更 DELETE+INSERT 产生新 rowid,pull 游标严格单调
+	Kind            string    `gorm:"size:24;uniqueIndex:idx_kind_uid" json:"kind"` // bookmark | link_history | download_record
+	UID             string    `gorm:"size:64;uniqueIndex:idx_kind_uid" json:"uid"`  // 客户端生成的稳定 UUID
+	DeviceID        string    `gorm:"size:64;index" json:"device_id"`
+	Payload         string    `gorm:"type:text" json:"payload"`
+	Deleted         bool      `json:"deleted"`           // 墓碑:删除也要传播
+	ClientUpdatedAt int64     `json:"client_updated_at"` // 客户端时钟毫秒,LWW 仲裁键
+	ServerUpdatedAt time.Time `json:"server_updated_at"`
+}
+
 // ---- Store ----
 
 type Store struct {
@@ -92,7 +105,7 @@ func Open(path string) (*Store, error) {
 	if err := db.Exec("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;").Error; err != nil {
 		return nil, fmt.Errorf("sqlite pragmas: %w", err)
 	}
-	if err := db.AutoMigrate(&Account{}, &Share{}, &Link{}, &Download{}, &Setting{}, &AuditLog{}); err != nil {
+	if err := db.AutoMigrate(&Account{}, &Share{}, &Link{}, &Download{}, &Setting{}, &AuditLog{}, &SyncItem{}); err != nil {
 		return nil, fmt.Errorf("migrate: %w", err)
 	}
 	return &Store{db: db}, nil
@@ -323,3 +336,56 @@ func (s *Store) ListDownloads() ([]Download, error) {
 }
 
 func (s *Store) UpdateDownload(d *Download) error { return s.db.Save(d).Error }
+
+// ---- SyncItem ----
+
+// UpsertSyncItem 同步条目落库:LWW 仲裁——库内 client_updated_at 更新则跳过(返回 applied=false);
+// 否则事务内 DELETE+INSERT,保证每次生效的变更都产生新 rowid(=全局变更序号,pull 游标用)。
+// applied 时 item.ID 被回填为落库后的新序号;跳过时回填为现有行 id,便于调用方对账。
+func (s *Store) UpsertSyncItem(item *SyncItem) (applied bool, err error) {
+	err = s.db.Transaction(func(tx *gorm.DB) error {
+		var old SyncItem
+		e := tx.Where("kind = ? AND uid = ?", item.Kind, item.UID).First(&old).Error
+		if errors.Is(e, gorm.ErrRecordNotFound) {
+			item.ID = 0
+			item.ServerUpdatedAt = time.Now()
+			if e = tx.Create(item).Error; e != nil {
+				return e
+			}
+			applied = true
+			return nil
+		}
+		if e != nil {
+			return e
+		}
+		if old.ClientUpdatedAt > item.ClientUpdatedAt {
+			item.ID = old.ID // 旧记录胜出,丢弃来条(仲裁结果回填)
+			return nil
+		}
+		item.ServerUpdatedAt = time.Now()
+		if e = tx.Delete(&SyncItem{}, old.ID).Error; e != nil {
+			return e
+		}
+		item.ID = 0
+		if e = tx.Create(item).Error; e != nil {
+			return e
+		}
+		applied = true
+		return nil
+	})
+	return applied, err
+}
+
+// ListSyncItemsAfter 按 pull 游标取变更(id > since,升序)。
+func (s *Store) ListSyncItemsAfter(since uint, limit int) ([]SyncItem, error) {
+	var out []SyncItem
+	err := s.db.Where("id > ?", since).Order("id ASC").Limit(limit).Find(&out).Error
+	return out, err
+}
+
+// MaxSyncItemID 当前最大变更序号(客户端游标越过服务端时对齐用)。
+func (s *Store) MaxSyncItemID() (uint, error) {
+	var maxID uint
+	err := s.db.Model(&SyncItem{}).Select("COALESCE(MAX(id),0)").Scan(&maxID).Error
+	return maxID, err
+}

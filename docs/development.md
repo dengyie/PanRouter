@@ -1,4 +1,4 @@
-# PanRouter 开发文档 v2.0(2026-10-05)
+# PanRouter 开发文档 v2.1(2026-11-04)
 
 > 本文以当前实现为基准重写,取代原《方案设计》(docs/design.md v1.1.x,已删除)。
 > 编写原则:**已实现行为、已知问题、接口契约、重构计划分开表述**——旧方案中未实现的规划统一移入 §17 路线图,不再与现状混排;代码注释不再引用本文档章节号。
@@ -207,6 +207,15 @@ Relay.Serve:验签 → GetFreshLink → 解密 Cookie → 构造上游请求(UA/
 
 `POST /api/v1/downloads {pan, share_key, fid, dest?}`(登录):pan 与 share 快照一致性校验 → GetFreshLink → `CanAria2`? 直链 + headers(UA/Referer/Cookie) : stream URL(sign_ttl) → `aria2.addUri`(RPC secret)→ 落 `downloads` + 计数。任务状态 `GET /downloads/{gid}`。
 
+### 7.6 设备历史同步(M3,POST/GET /api/v1/sync)
+
+桌面端(PanRouter Desktop)把收藏/解析历史/下载记录推到服务端做多设备双向同步。**payload 是客户端语义的不透明 JSON,服务端不解析**(两仓零共享代码边界);删除以墓碑(`deleted=true`)传播;冲突按客户端时间戳 LWW 仲裁(`client_updated_at` 较新者胜,相同后来者胜)。
+
+- `POST /api/v1/sync`(登录):`{device_id, items:[{kind, uid, deleted, updated_at, payload}]}` → `{accepted, skipped, server_time}`。kind ∈ `bookmark | link_history | download_record`;单批 ≤500 条,单条 payload ≤16KB;`(kind,uid)` 唯一,生效变更以 DELETE+INSERT 重写行 → `id` 即全局变更序号,严格单调
+- `GET /api/v1/sync?since=<seq>&limit=500`(登录):`{items, last_seq}`,按 `id` 升序返回 `id > since` 的变更;`since=0` 全量,`last_seq` 作为下一页游标
+- 管理页「设备同步数据」区块只读浏览全部上报数据(类型/关键词过滤)
+- 隐私边界:同步默认关闭,桌面端用户显式开启;下载记录脱敏(不含本机路径/请求头),数据仅存自部署服务端
+
 ---
 
 ## 8. 错误契约
@@ -241,6 +250,7 @@ Relay.Serve:验签 → GetFreshLink → 解密 Cookie → 构造上游请求(UA/
 | downloads | gid, fid, dest, route, status | aria2 任务记录 |
 | settings | key, value | 预留 |
 | audit_logs | ts, action, detail | login_ok / login_failed / cred_check / account_create / account_delete |
+| sync_items | kind, uid((kind,uid) 唯一), device_id, payload(不透明 JSON), deleted, client_updated_at, server_updated_at | 设备历史同步条目(M3 §7.6);id 即全局变更序号(pull 游标) |
 
 单管理员不建用户表,凭据来自 config。
 已知(P1-3):账号检查整对象 `Save` 存在删除复活/冷却覆盖竞争。
@@ -311,7 +321,7 @@ iframe / modern / 密码分享三条流;最终 CDN 对非浏览器客户端先 a
 
 ### 12.2 前端依赖的稳定契约(重构前端时的边界)
 
-- 端点:`POST /api/v1/auth/login`、`POST /api/v1/resolve(/batch)`、`GET|POST|DELETE /api/v1/accounts*`、`POST|GET /api/v1/downloads*`、`GET /api/v1/json/{pan}/{key}/{fid}`
+- 端点:`POST /api/v1/auth/login`、`POST /api/v1/resolve(/batch)`、`GET|POST|DELETE /api/v1/accounts*`、`POST|GET /api/v1/downloads*`、`GET /api/v1/json/{pan}/{key}/{fid}`、`POST|GET /api/v1/sync`
 - 探活:`GET /healthz → {status, version}`、`GET /readyz`
 - 错误体:`{code, kind, message, retriable}`;401 按 `kind` 区分站点会话、登录口令和上游凭据错误，前端只对 `session_expired` 清理 Token
 - 下载:`download_url` 浏览器直接打开(302 或降级);`stream_url`/`ua`/`referer`/`need_headers` 供 aria2
@@ -443,4 +453,5 @@ iframe / modern / 密码分享三条流;最终 CDN 对非浏览器客户端先 a
 
 ## 变更记录
 
+- **v2.1(2026-11-04)**:新增设备历史同步端点 `POST|GET /api/v1/sync`(M3,§7.6)+ `sync_items` 表(§9)+ 管理页「设备同步数据」浏览区块;payload 不透明存储,服务端只做 LWW 仲裁与墓碑传播,两仓零共享代码边界不破
 - **v2.0(2026-10-05)**:以实际实现为基准重写,取代《方案设计》v1.1.x(已删除);现状/已知问题/契约/路线图分开表述;新增 §15 深度评审结论与分阶段重构计划;代码注释不再引用章节号
