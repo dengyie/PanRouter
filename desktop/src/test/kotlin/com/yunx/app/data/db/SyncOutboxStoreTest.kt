@@ -183,6 +183,20 @@ class SyncOutboxStoreTest {
         assertEquals(setOf("dl-i1", "dl-i2"), pendings.map { it.uid }.toSet())
     }
 
+    // ---- 同链接行提取：重复归一的确定性裁决依赖排序口径 ----
+
+    @Test
+    fun `listByLinkForSync returns same-link rows ordered by createTime`() = runBlocking {
+        val (db, _) = newDb()
+        val bookmarks = db.bookmarkDao()
+        bookmarks.insert(BookmarkEntity(link = "https://x/same", title = "b", syncUid = "u-b", createTime = 200))
+        bookmarks.insert(BookmarkEntity(link = "https://x/same", title = "a", syncUid = "u-a", createTime = 100))
+        bookmarks.insert(BookmarkEntity(link = "https://x/other", title = "o", syncUid = "u-o", createTime = 50))
+        val rows = bookmarks.listByLinkForSync("https://x/same")
+        assertEquals(listOf("u-a", "u-b"), rows.map { it.syncUid })
+        assertEquals(listOf("a", "b"), rows.map { it.title })
+    }
+
     // ---- 远端落地 SQL：按 uid 幂等覆盖、不记账、墓碑删行 ----
 
     @Test

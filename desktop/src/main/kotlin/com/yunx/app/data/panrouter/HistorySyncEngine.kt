@@ -28,6 +28,9 @@ import java.util.concurrent.atomic.AtomicBoolean
  * - **download_record 只上行不回填**：别设备的下载记录不落本地 download_task（避免假任务污染下载列表），
  *   服务端管理页可查；本机删除下载任务也不传播墓碑（日志语义）；
  * - **pull 合并规则**：本地有同 uid 待推送意图且不旧于远端 → 跳过（等推送反压）；否则远端落地、旧意图作废；
+ * - **重复归一**：同一 link/url 在多设备开启同步前各自产生异 uid 实体时，按「createTime 最早者胜，
+ *   并列取 uid 字典序小者」收敛到一行（确定性规则，各设备独立裁决出同一赢家），
+ *   败者以墓碑上传、双端删行——收藏按 link、解析历史按 url 判定；
  * - **幂等**：重推同 uid 由服务端 LWW skip；pull 游标（[PanRouterSettings.syncCursor]）断点续拉。
  *
  * 触发：启动后常驻循环（30s 一轮，未开启时是廉价 early-return）+ 设置页「立即同步」。
@@ -301,29 +304,55 @@ object HistorySyncEngine {
                 KIND_BOOKMARK -> {
                     val p = SyncBookmarkPayload.parse(payload)
                     if (p.link.isEmpty()) return
-                    stores.bookmarkDao.applyFromRemote(
-                        BookmarkEntity(
-                            link = p.link, title = p.title, platform = p.platform, pwd = p.pwd,
-                            category = p.category.ifEmpty { BookmarkEntity.DEFAULT_CATEGORY },
-                            syncUid = item.uid, createTime = p.createdAt
-                        )
+                    val remoteRow = BookmarkEntity(
+                        link = p.link, title = p.title, platform = p.platform, pwd = p.pwd,
+                        category = p.category.ifEmpty { BookmarkEntity.DEFAULT_CATEGORY },
+                        syncUid = item.uid, createTime = p.createdAt
                     )
+                    // 同链接异 uid = 多设备开启同步前各自收藏的重复实体，先归一再落地
+                    val dups = stores.bookmarkDao.listByLinkForSync(p.link)
+                        .filter { it.syncUid != item.uid && it.syncUid.isNotEmpty() }
+                    val winner = (dups + remoteRow).minWithOrNull(compareBy({ it.createTime }, { it.syncUid }))!!
+                    if (winner.syncUid != item.uid) {
+                        reconcileLose(outbox, item.kind, item.uid, item.clientUpdatedAt)
+                        return
+                    }
+                    dups.forEach { stores.bookmarkDao.delete(it.id) }
+                    stores.bookmarkDao.applyFromRemote(remoteRow)
                 }
                 KIND_LINK_HISTORY -> {
                     val p = SyncLinkHistoryPayload.parse(payload)
                     if (p.url.isEmpty()) return
-                    stores.linkHistoryDao.applyFromRemote(
-                        LinkHistoryEntity(
-                            url = p.url, title = p.title, platform = p.platform, pwd = p.pwd,
-                            syncUid = item.uid, createTime = p.createdAt
-                        )
+                    val remoteRow = LinkHistoryEntity(
+                        url = p.url, title = p.title, platform = p.platform, pwd = p.pwd,
+                        syncUid = item.uid, createTime = p.createdAt
                     )
+                    val dups = stores.linkHistoryDao.listByUrlForSync(p.url)
+                        .filter { it.syncUid != item.uid && it.syncUid.isNotEmpty() }
+                    val winner = (dups + remoteRow).minWithOrNull(compareBy({ it.createTime }, { it.syncUid }))!!
+                    if (winner.syncUid != item.uid) {
+                        reconcileLose(outbox, item.kind, item.uid, item.clientUpdatedAt)
+                        return
+                    }
+                    dups.forEach { stores.linkHistoryDao.delete(it.id) }
+                    stores.linkHistoryDao.applyFromRemote(remoteRow)
                 }
             }
         }
         // 记录「本机现在持有的版本」= 该次远端变更的时间戳（后续更旧的远端/推送都以它仲裁）
         outbox.deleteForUid(item.kind, item.uid)
         outbox.enqueue(item.kind, item.uid, deleted = item.deleted, updatedAt = item.clientUpdatedAt, pushed = true)
+    }
+
+    /**
+     * 重复实体归一的败者处置：本机保留旧实体、远端 uid 墓碑掉（或反之）。
+     * 墓碑时间戳取 max(now, 对方时间戳+1)——必须严格新于对方才能赢服务端 LWW；
+     * 记为待推送意图（不留记忆：被顶掉的实体并非「已同步的本机版本」），
+     * 推送后各设备收到墓碑删行，全网收敛到同一个赢家行。
+     */
+    private suspend fun reconcileLose(outbox: SyncOutboxDao, kind: String, uid: String, opponentTs: Long) {
+        outbox.deleteForUid(kind, uid)
+        outbox.enqueue(kind, uid, deleted = true, updatedAt = maxOf(System.currentTimeMillis(), opponentTs + 1), pushed = false)
     }
 
     private fun newUid(prefix: String): String = "$prefix-" + java.util.UUID.randomUUID().toString()

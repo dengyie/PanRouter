@@ -1593,6 +1593,21 @@ private class JdbcBookmarkDao(private val conn: Connection) : BookmarkDao {
         }
     }
 
+    override suspend fun listByLinkForSync(link: String): List<BookmarkEntity> = dbIo {
+        synchronized(conn) {
+            conn.prepareStatement(
+                "SELECT * FROM bookmark WHERE link = ? ORDER BY createTime ASC, id ASC"
+            ).use { ps ->
+                ps.setString(1, link)
+                ps.executeQuery().use { rs ->
+                    val out = mutableListOf<BookmarkEntity>()
+                    while (rs.next()) out += readBookmark(rs)
+                    out
+                }
+            }
+        }
+    }
+
     override suspend fun listBySyncUids(uids: List<String>): List<BookmarkEntity> = dbIo {
         queryBySyncUids(conn, "bookmark", uids) { readBookmark(it) }
     }
@@ -1761,6 +1776,21 @@ private class JdbcLinkHistoryDao(private val conn: Connection) : LinkHistoryDao 
     override suspend fun listWithEmptySyncUid(): List<LinkHistoryEntity> = dbIo {
         synchronized(conn) {
             conn.prepareStatement("SELECT * FROM link_history WHERE syncUid = ''").use { ps ->
+                ps.executeQuery().use { rs ->
+                    val out = mutableListOf<LinkHistoryEntity>()
+                    while (rs.next()) out += readLinkHistory(rs)
+                    out
+                }
+            }
+        }
+    }
+
+    override suspend fun listByUrlForSync(url: String): List<LinkHistoryEntity> = dbIo {
+        synchronized(conn) {
+            conn.prepareStatement(
+                "SELECT * FROM link_history WHERE url = ? ORDER BY createTime ASC, id ASC"
+            ).use { ps ->
+                ps.setString(1, url)
                 ps.executeQuery().use { rs ->
                     val out = mutableListOf<LinkHistoryEntity>()
                     while (rs.next()) out += readLinkHistory(rs)

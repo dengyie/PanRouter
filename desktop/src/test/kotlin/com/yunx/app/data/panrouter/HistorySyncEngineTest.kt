@@ -108,6 +108,8 @@ class HistorySyncEngineTest {
         }
         override suspend fun listWithEmptySyncUid(): List<BookmarkEntity> =
             rows.values.filter { it.syncUid.isEmpty() }
+        override suspend fun listByLinkForSync(link: String): List<BookmarkEntity> =
+            rows.values.filter { it.link == link }.sortedWith(compareBy({ it.createTime }, { it.id }))
         override suspend fun listBySyncUids(uids: List<String>): List<BookmarkEntity> =
             if (uids.isEmpty()) emptyList() else rows.values.filter { it.syncUid in uids.toSet() }
         override suspend fun applyFromRemote(bookmark: BookmarkEntity) {
@@ -160,6 +162,8 @@ class HistorySyncEngineTest {
         }
         override suspend fun listWithEmptySyncUid(): List<LinkHistoryEntity> =
             rows.values.filter { it.syncUid.isEmpty() }
+        override suspend fun listByUrlForSync(url: String): List<LinkHistoryEntity> =
+            rows.values.filter { it.url == url }.sortedWith(compareBy({ it.createTime }, { it.id }))
         override suspend fun listBySyncUids(uids: List<String>): List<LinkHistoryEntity> =
             if (uids.isEmpty()) emptyList() else rows.values.filter { it.syncUid in uids.toSet() }
         override suspend fun applyFromRemote(entity: LinkHistoryEntity) {
@@ -623,13 +627,121 @@ class HistorySyncEngineTest {
         assertEquals("HTTP 403", failed.payload?.optString("error"))
     }
 
+    // ---------- 重复归一（跨设备同实体异 uid 收敛） ----------
+
+    @Test
+    fun `remote older duplicate bookmark wins and local duplicate is tombstoned`() = runBlocking {
+        val bmId = bookmarks.insert(BookmarkEntity(link = "https://x/dup", title = "本地收藏", createTime = 500))
+        val localUid = bookmarks.rows.getValue(bmId).syncUid
+
+        // 远端同一链接、createTime 更早（真正的原始收藏）→ 远端胜：本地行删除、远端落地、本地 uid 墓碑上传
+        transport.pullResponses += Result.success(
+            SyncPullResult(
+                items = listOf(
+                    remoteItem(
+                        id = 10, kind = HistorySyncEngine.KIND_BOOKMARK, uid = "bm-r-older", clientUpdatedAt = 600,
+                        payload = org.json.JSONObject().put("link", "https://x/dup").put("title", "远端原始收藏").put("created_at", 100)
+                    )
+                ),
+                lastSeq = 10
+            )
+        )
+        assertEquals(HistorySyncEngine.SyncOutcome.DONE, HistorySyncEngine.syncOnce("test"))
+
+        val rows = bookmarks.rows.values.toList()
+        assertEquals(1, rows.size) // 归一成一行
+        assertEquals("bm-r-older", rows[0].syncUid)
+        assertEquals("远端原始收藏", rows[0].title)
+        assertEquals(100L, rows[0].createTime)
+        // 本地旧 uid：推送时的插入意图已变成版本记忆，删除裁决另记一笔**待推送墓碑**
+        val tombstone = outbox.entries.values.single { it.uid == localUid && !it.pushed }
+        assertTrue(tombstone.deleted)
+        assertTrue(!tombstone.pushed)
+
+        // 第二轮把墓碑推出去
+        transport.pullResponses += Result.success(SyncPullResult(emptyList(), lastSeq = 10))
+        assertEquals(HistorySyncEngine.SyncOutcome.DONE, HistorySyncEngine.syncOnce("test"))
+        val pushedTombstone = transport.pushed.last().second.single { it.uid == localUid }
+        assertTrue(pushedTombstone.deleted)
+    }
+
+    @Test
+    fun `remote newer duplicate bookmark loses to local original`() = runBlocking {
+        val bmId = bookmarks.insert(BookmarkEntity(link = "https://x/dup", title = "本地原始收藏", createTime = 100))
+        bookmarks.updateCategory(bmId, "视频")
+
+        // 远端同一链接、createTime 更晚（后来才收藏的）→ 本地胜：远端 uid 被墓碑顶掉，本地行不动
+        transport.pullResponses += Result.success(
+            SyncPullResult(
+                items = listOf(
+                    remoteItem(
+                        id = 11, kind = HistorySyncEngine.KIND_BOOKMARK, uid = "bm-r-newer", clientUpdatedAt = 6000,
+                        payload = org.json.JSONObject().put("link", "https://x/dup").put("title", "远端重复收藏").put("created_at", 5000)
+                    )
+                ),
+                lastSeq = 11
+            )
+        )
+        assertEquals(HistorySyncEngine.SyncOutcome.DONE, HistorySyncEngine.syncOnce("test"))
+
+        val rows = bookmarks.rows.values.toList()
+        assertEquals(1, rows.size) // 不落地重复行
+        assertEquals("本地原始收藏", rows[0].title)
+        assertTrue(rows[0].syncUid != "bm-r-newer")
+        // 远端 uid 有待推送墓碑且时间戳严格新于远端（保证赢服务端 LWW）
+        val tombstone = outbox.entries.values.single { it.uid == "bm-r-newer" }
+        assertTrue(tombstone.deleted)
+        assertTrue(tombstone.updatedAt > 6000)
+        // 再次拉到同一远端条目会被本地版本记忆挡住（幂等，不再反复裁决）
+        transport.pullResponses += Result.success(
+            SyncPullResult(
+                items = listOf(
+                    remoteItem(
+                        id = 11, kind = HistorySyncEngine.KIND_BOOKMARK, uid = "bm-r-newer", clientUpdatedAt = 6000,
+                        payload = org.json.JSONObject().put("link", "https://x/dup").put("title", "远端重复收藏").put("created_at", 5000)
+                    )
+                ),
+                lastSeq = 11
+            )
+        )
+        assertEquals(HistorySyncEngine.SyncOutcome.DONE, HistorySyncEngine.syncOnce("test"))
+        assertEquals(1, bookmarks.rows.values.count())
+    }
+
+    @Test
+    fun `duplicate link history converges by url with same rule`() = runBlocking {
+        val lhId = histories.insert(LinkHistoryEntity(url = "https://x/h", title = "本地历史", createTime = 500))
+        val localUid = histories.rows.getValue(lhId).syncUid
+
+        transport.pullResponses += Result.success(
+            SyncPullResult(
+                items = listOf(
+                    remoteItem(
+                        id = 12, kind = HistorySyncEngine.KIND_LINK_HISTORY, uid = "lh-r-old", clientUpdatedAt = 600,
+                        payload = org.json.JSONObject().put("url", "https://x/h").put("title", "远端历史").put("created_at", 100)
+                    )
+                ),
+                lastSeq = 12
+            )
+        )
+        assertEquals(HistorySyncEngine.SyncOutcome.DONE, HistorySyncEngine.syncOnce("test"))
+
+        val rows = histories.rows.values.toList()
+        assertEquals(1, rows.size)
+        assertEquals("lh-r-old", rows[0].syncUid)
+        assertTrue(outbox.entries.values.single { it.uid == localUid && !it.pushed }.deleted)
+    }
+
     // ---------- 前提判定 ----------
 
     @Test
     fun `not ready settings short circuit without touching transport`() = runBlocking {
+        // 前面用例可能已推进游标（注册表全局共享）：NOT_READY 的语义是「什么都不动」，
+        // 故断言游标保持进入时的值，而非硬编码 0
+        val cursorBefore = PanRouterSettings().syncCursor
         PanRouterSettings().historySyncEnabled = false
         assertEquals(HistorySyncEngine.SyncOutcome.NOT_READY, HistorySyncEngine.syncOnce("test")) // 未执行
         assertTrue(transport.pushed.isEmpty())
-        assertEquals(0L, PanRouterSettings().syncCursor)
+        assertEquals(cursorBefore, PanRouterSettings().syncCursor)
     }
 }

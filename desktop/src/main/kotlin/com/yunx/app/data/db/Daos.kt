@@ -189,6 +189,8 @@ interface BookmarkDao {
     suspend fun updateSyncUid(id: Long, uid: String)
     /** 取 syncUid 为空的行（旧数据回填专用，走 sync_uid 索引——回填每轮都跑，不能全表物化） */
     suspend fun listWithEmptySyncUid(): List<BookmarkEntity>
+    /** 同链接全部行（跨设备重复实体归一用；createTime 升序、并列取小 id，保证双端裁决一致） */
+    suspend fun listByLinkForSync(link: String): List<BookmarkEntity>
     /** 按 syncUid 批量取行（推送组包用） */
     suspend fun listBySyncUids(uids: List<String>): List<BookmarkEntity>
     /** 远端合并：按 syncUid 存在则整行覆盖，不存在则插入；**不触发 outbox**（远端数据不回推） */
@@ -208,6 +210,8 @@ interface LinkHistoryDao {
     suspend fun updateSyncUid(id: Long, uid: String)
     /** 取 syncUid 为空的行（旧数据回填专用，走 sync_uid 索引——回填每轮都跑，不能全表物化） */
     suspend fun listWithEmptySyncUid(): List<LinkHistoryEntity>
+    /** 同 URL 全部行（跨设备重复实体归一用；排序口径同 [BookmarkDao.listByLinkForSync]） */
+    suspend fun listByUrlForSync(url: String): List<LinkHistoryEntity>
     suspend fun applyFromRemote(entity: LinkHistoryEntity)
     suspend fun deleteBySyncUid(uid: String)
     /** 按 syncUid 批量取行（推送组包用） */
