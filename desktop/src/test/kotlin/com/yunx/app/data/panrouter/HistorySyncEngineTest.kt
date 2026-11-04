@@ -14,7 +14,6 @@ import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.runBlocking
 import org.junit.After
 import org.junit.Assert.assertEquals
-import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Before
@@ -107,6 +106,8 @@ class HistorySyncEngineTest {
         override suspend fun updateSyncUid(id: Long, uid: String) {
             rows[id] = rows.getValue(id).copy(syncUid = uid); reload()
         }
+        override suspend fun listWithEmptySyncUid(): List<BookmarkEntity> =
+            rows.values.filter { it.syncUid.isEmpty() }
         override suspend fun listBySyncUids(uids: List<String>): List<BookmarkEntity> =
             if (uids.isEmpty()) emptyList() else rows.values.filter { it.syncUid in uids.toSet() }
         override suspend fun applyFromRemote(bookmark: BookmarkEntity) {
@@ -157,6 +158,8 @@ class HistorySyncEngineTest {
         override suspend fun updateSyncUid(id: Long, uid: String) {
             rows[id] = rows.getValue(id).copy(syncUid = uid); reload()
         }
+        override suspend fun listWithEmptySyncUid(): List<LinkHistoryEntity> =
+            rows.values.filter { it.syncUid.isEmpty() }
         override suspend fun listBySyncUids(uids: List<String>): List<LinkHistoryEntity> =
             if (uids.isEmpty()) emptyList() else rows.values.filter { it.syncUid in uids.toSet() }
         override suspend fun applyFromRemote(entity: LinkHistoryEntity) {
@@ -170,8 +173,11 @@ class HistorySyncEngineTest {
         }
     }
 
-    /** 引擎只用 listAll / updateSyncUid / listBySyncUids，其余方法不应被触达 */
-    private class FakeDownloadTaskDao : DownloadTaskDao {
+    /** 引擎只用 listWithEmptySyncUid / updateSyncUid / listBySyncUids 与终态落库；其余方法不应被触达 */
+    private class FakeDownloadTaskDao(
+        private val outbox: FakeOutboxDao,
+        private val clock: java.util.concurrent.atomic.AtomicLong
+    ) : DownloadTaskDao {
         val rows = LinkedHashMap<Long, DownloadTaskEntity>()
         override fun observeAll(): Flow<List<DownloadTaskEntity>> = MutableStateFlow(rows.values.toList())
         override suspend fun insert(task: DownloadTaskEntity): Long = TODO("unused in engine test")
@@ -182,9 +188,29 @@ class HistorySyncEngineTest {
         override suspend fun updatePlan(id: Long, chunkCount: Int, totalSize: Long) = TODO("unused")
         override suspend fun updateRequestHeaders(id: Long, encryptedHeaders: String) = TODO("unused")
         override suspend fun markInterruptedAsPaused() = TODO("unused")
-        override suspend fun updateStatus(id: Long, status: Int) = TODO("unused")
-        override suspend fun updateError(id: Long, errorMsg: String) = TODO("unused")
-        override suspend fun complete(id: Long, status: Int, savePath: String, avgSpeed: Long) = TODO("unused")
+        override suspend fun updateStatus(id: Long, status: Int) {
+            // 与生产 JdbcDownloadTaskDao 对齐：仅 FAILED 终态记 download_record 意图
+            rows[id] = rows.getValue(id).copy(status = status)
+            if (status == DownloadTaskEntity.STATUS_FAILED) {
+                rows.getValue(id).syncUid.takeIf { it.isNotEmpty() }?.let {
+                    outbox.enqueue(HistorySyncEngine.KIND_DOWNLOAD_RECORD, it, deleted = false, updatedAt = clock.incrementAndGet())
+                }
+            }
+        }
+        override suspend fun updateError(id: Long, errorMsg: String) {
+            // 与生产 updateError 对齐：错误信息总在 updateStatus(FAILED) 之后写入，这里再记一笔
+            rows[id] = rows.getValue(id).copy(errorMsg = errorMsg)
+            rows.getValue(id).syncUid.takeIf { it.isNotEmpty() }?.let {
+                outbox.enqueue(HistorySyncEngine.KIND_DOWNLOAD_RECORD, it, deleted = false, updatedAt = clock.incrementAndGet())
+            }
+        }
+        override suspend fun complete(id: Long, status: Int, savePath: String, avgSpeed: Long) {
+            // 与生产 complete 对齐：COMPLETED 终态记 download_record 意图
+            rows[id] = rows.getValue(id).copy(status = status, savePath = savePath, avgSpeed = avgSpeed)
+            rows.getValue(id).syncUid.takeIf { it.isNotEmpty() }?.let {
+                outbox.enqueue(HistorySyncEngine.KIND_DOWNLOAD_RECORD, it, deleted = false, updatedAt = clock.incrementAndGet())
+            }
+        }
         override suspend fun delete(id: Long) { rows.remove(id) }
         override suspend fun updateEngineTaskId(id: Long, engineTaskId: String) = TODO("unused")
         override suspend fun updateDirect(id: Long, partPath: String, mode: Int) = TODO("unused")
@@ -193,6 +219,8 @@ class HistorySyncEngineTest {
         override suspend fun updateSyncUid(id: Long, uid: String) {
             rows[id] = rows.getValue(id).copy(syncUid = uid)
         }
+        override suspend fun listWithEmptySyncUid(): List<DownloadTaskEntity> =
+            rows.values.filter { it.syncUid.isEmpty() }
         override suspend fun listBySyncUids(uids: List<String>): List<DownloadTaskEntity> =
             if (uids.isEmpty()) emptyList() else rows.values.filter { it.syncUid in uids.toSet() }
     }
@@ -223,7 +251,7 @@ class HistorySyncEngineTest {
     private val outbox = FakeOutboxDao()
     private val bookmarks = FakeBookmarkDao(outbox, clock)
     private val histories = FakeLinkHistoryDao(outbox, clock)
-    private val tasks = FakeDownloadTaskDao()
+    private val tasks = FakeDownloadTaskDao(outbox, clock)
     private val transport = FakeTransport()
 
     private var savedEnabled = false
@@ -560,6 +588,39 @@ class HistorySyncEngineTest {
         assertEquals(HistorySyncEngine.SyncOutcome.DONE, HistorySyncEngine.syncOnce("test"))
         assertEquals(1, transport.pullResponses.size) // 只消费了一页
         assertEquals(0L, PanRouterSettings().syncCursor)
+    }
+
+    @Test
+    fun `download record terminal states push payload with status and error`() = runBlocking {
+        // 完成链：complete 落终态 → 意图 → 推送组包带 share_url/file_name/total_size/status
+        tasks.rows[1L] = DownloadTaskEntity(
+            id = 1, url = "https://x", fileName = "a.zip", shareUrl = "https://pan.quark.cn/s/d1",
+            platform = "QUARK", totalSize = 123, status = DownloadTaskEntity.STATUS_PENDING, syncUid = "dl-t1"
+        )
+        tasks.complete(1L, DownloadTaskEntity.STATUS_COMPLETED, "C:/a.zip", 999)
+        transport.pullResponses += Result.success(SyncPullResult(emptyList(), lastSeq = 0))
+        assertEquals(HistorySyncEngine.SyncOutcome.DONE, HistorySyncEngine.syncOnce("test"))
+        val done = transport.pushed.last().second.single { it.kind == HistorySyncEngine.KIND_DOWNLOAD_RECORD }
+        assertEquals("dl-t1", done.uid)
+        assertEquals("a.zip", done.payload?.optString("file_name"))
+        assertEquals("https://pan.quark.cn/s/d1", done.payload?.optString("share_url"))
+        assertEquals("QUARK", done.payload?.optString("platform"))
+        assertEquals(123L, done.payload?.optLong("total_size"))
+        assertEquals(DownloadTaskEntity.STATUS_COMPLETED, done.payload?.optInt("status"))
+
+        // 失败链：updateStatus(FAILED) → updateError 写错误 → 推送带上 status=FAILED 与 error
+        tasks.rows[2L] = DownloadTaskEntity(
+            id = 2, url = "https://x", fileName = "b.zip", shareUrl = "https://pan.quark.cn/s/d2",
+            platform = "QUARK", status = DownloadTaskEntity.STATUS_PENDING, syncUid = "dl-t2"
+        )
+        tasks.updateStatus(2L, DownloadTaskEntity.STATUS_FAILED)
+        tasks.updateError(2L, "HTTP 403")
+        transport.pullResponses += Result.success(SyncPullResult(emptyList(), lastSeq = 0))
+        assertEquals(HistorySyncEngine.SyncOutcome.DONE, HistorySyncEngine.syncOnce("test"))
+        val failed = transport.pushed.last().second.single { it.kind == HistorySyncEngine.KIND_DOWNLOAD_RECORD }
+        assertEquals("dl-t2", failed.uid)
+        assertEquals(DownloadTaskEntity.STATUS_FAILED, failed.payload?.optInt("status"))
+        assertEquals("HTTP 403", failed.payload?.optString("error"))
     }
 
     // ---------- 前提判定 ----------

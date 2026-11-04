@@ -12,7 +12,6 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.delay
-import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
 import java.util.concurrent.atomic.AtomicBoolean
 
@@ -158,17 +157,18 @@ object HistorySyncEngine {
      */
     private suspend fun backfillSyncUids(stores: SyncStores) {
         val outbox = stores.outboxDao
-        stores.bookmarkDao.observeAll().first().filter { it.syncUid.isEmpty() }.forEach { b ->
+        // 常驻循环每 30s 都会跑这里：只取 syncUid 为空的行（走索引），稳态时零全表物化
+        stores.bookmarkDao.listWithEmptySyncUid().forEach { b ->
             val uid = newUid("bm")
             stores.bookmarkDao.updateSyncUid(b.id, uid)
             outbox.enqueue(KIND_BOOKMARK, uid, deleted = false, updatedAt = b.createTime)
         }
-        stores.linkHistoryDao.observeAll().first().filter { it.syncUid.isEmpty() }.forEach { h ->
+        stores.linkHistoryDao.listWithEmptySyncUid().forEach { h ->
             val uid = newUid("lh")
             stores.linkHistoryDao.updateSyncUid(h.id, uid)
             outbox.enqueue(KIND_LINK_HISTORY, uid, deleted = false, updatedAt = h.createTime)
         }
-        stores.downloadTaskDao.listAll().filter { it.syncUid.isEmpty() }.forEach { t ->
+        stores.downloadTaskDao.listWithEmptySyncUid().forEach { t ->
             stores.downloadTaskDao.updateSyncUid(t.id, newUid("dl"))
         }
     }

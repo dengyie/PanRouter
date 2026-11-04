@@ -84,10 +84,14 @@ class AppDatabase private constructor(private val conn: Connection) {
             instance?.checkpoint()
         }
 
-        private fun open(): AppDatabase {
+        /**
+         * 打开生产库（schema + 迁移 + WAL 全套）。生产走 [get] 单例；
+         * 测试可传 [targetDir] 在临时目录开独立真库（不触碰单例实例），验证真实 DAO/SQL 行为。
+         */
+        internal fun open(targetDir: File = AppContext.dbDir): AppDatabase {
             Class.forName("org.sqlite.JDBC")
             // 数据库目录可在「设置 → 储存目录」改（默认＝数据根目录）；启动时已由 AppContext 解析好
-            val dbFile = File(AppContext.dbDir, "yunx.db")
+            val dbFile = File(targetDir, "yunx.db")
             dbFile.parentFile?.mkdirs()
 
             // 自愈：进程被强杀/崩溃后，WAL 的 -shm（共享内存索引）可能损坏或 mmap 失败
@@ -415,7 +419,7 @@ private class JdbcAccountTable<T : Any>(
 private suspend fun <T> dbIo(block: () -> T): T = withContext(Dispatchers.IO) { block() }
 
 /**
- * 按 syncUid 批量取行：分块拼 IN（SQLite 单语句变量数有上限，500 条一批正好压在安全区），
+ * 按 syncUid 批量取行：分块拼 IN（SQLite 单语句变量上限 999，400 条一批留足安全余量），
  * 供推送组包按批回读——避免每批都整表加载（大历史库首次同步会是 O(N×批数)）。
  */
 private inline fun <T> queryBySyncUids(
@@ -1452,6 +1456,18 @@ private class JdbcDownloadTaskDao(private val conn: Connection) : DownloadTaskDa
         reload()
     }
 
+    override suspend fun listWithEmptySyncUid(): List<DownloadTaskEntity> = dbIo {
+        synchronized(conn) {
+            conn.prepareStatement("SELECT * FROM download_task WHERE syncUid = ''").use { ps ->
+                ps.executeQuery().use { rs ->
+                    val out = mutableListOf<DownloadTaskEntity>()
+                    while (rs.next()) out += readTask(rs)
+                    out
+                }
+            }
+        }
+    }
+
     override suspend fun listBySyncUids(uids: List<String>): List<DownloadTaskEntity> = dbIo {
         queryBySyncUids(conn, "download_task", uids) { readTask(it) }
     }
@@ -1563,6 +1579,18 @@ private class JdbcBookmarkDao(private val conn: Connection) : BookmarkDao {
             }
         }
         reload()
+    }
+
+    override suspend fun listWithEmptySyncUid(): List<BookmarkEntity> = dbIo {
+        synchronized(conn) {
+            conn.prepareStatement("SELECT * FROM bookmark WHERE syncUid = ''").use { ps ->
+                ps.executeQuery().use { rs ->
+                    val out = mutableListOf<BookmarkEntity>()
+                    while (rs.next()) out += readBookmark(rs)
+                    out
+                }
+            }
+        }
     }
 
     override suspend fun listBySyncUids(uids: List<String>): List<BookmarkEntity> = dbIo {
@@ -1728,6 +1756,18 @@ private class JdbcLinkHistoryDao(private val conn: Connection) : LinkHistoryDao 
             }
         }
         reload()
+    }
+
+    override suspend fun listWithEmptySyncUid(): List<LinkHistoryEntity> = dbIo {
+        synchronized(conn) {
+            conn.prepareStatement("SELECT * FROM link_history WHERE syncUid = ''").use { ps ->
+                ps.executeQuery().use { rs ->
+                    val out = mutableListOf<LinkHistoryEntity>()
+                    while (rs.next()) out += readLinkHistory(rs)
+                    out
+                }
+            }
+        }
     }
 
     override suspend fun listBySyncUids(uids: List<String>): List<LinkHistoryEntity> = dbIo {

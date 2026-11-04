@@ -2015,23 +2015,27 @@ private fun PanRouterSettingsDialog(
                             syncMsg = null
                             scope.launch {
                                 // 先落当前编辑值（与保存按钮同口径），再跑一轮完整同步
-                                settings.enabled = enabled
-                                settings.baseUrl = baseUrl
-                                PanRouterTokenStore.setToken(token.trim().ifBlank { null })
-                                settings.fallbackToLocal = fallbackToLocal
-                                settings.historySyncEnabled = historySync
-                                syncMsg = when (HistorySyncEngine.syncOnce("settings")) {
-                                    HistorySyncEngine.SyncOutcome.NOT_READY ->
-                                        "未执行：需开启服务端解析、填好地址与 api_token 并勾选历史同步"
-                                    HistorySyncEngine.SyncOutcome.BUSY ->
-                                        "已有一轮同步在进行中，稍后自动重试"
-                                    HistorySyncEngine.SyncOutcome.DONE -> {
-                                        val backlog = runCatching {
-                                            AppDatabase.get().syncOutboxDao().count()
-                                        }.getOrDefault(0)
-                                        "同步完成 · 待推送积压 $backlog 条"
+                                // 整段兜底：DAO/prefs 的 IO 异常若裸抛会崩掉 UI 协程且 syncingNow 永远卡 true
+                                //（本文件其他网络/IO 动作均走 runCatching，同口径）
+                                syncMsg = runCatching {
+                                    settings.enabled = enabled
+                                    settings.baseUrl = baseUrl
+                                    PanRouterTokenStore.setToken(token.trim().ifBlank { null })
+                                    settings.fallbackToLocal = fallbackToLocal
+                                    settings.historySyncEnabled = historySync
+                                    when (HistorySyncEngine.syncOnce("settings")) {
+                                        HistorySyncEngine.SyncOutcome.NOT_READY ->
+                                            "未执行：需开启服务端解析、填好地址与 api_token 并勾选历史同步"
+                                        HistorySyncEngine.SyncOutcome.BUSY ->
+                                            "已有一轮同步在进行中，稍后自动重试"
+                                        HistorySyncEngine.SyncOutcome.DONE -> {
+                                            val backlog = runCatching {
+                                                AppDatabase.get().syncOutboxDao().count()
+                                            }.getOrDefault(0)
+                                            "同步完成 · 待推送积压 $backlog 条"
+                                        }
                                     }
-                                }
+                                }.getOrElse { e -> "同步失败：${e.message ?: e.javaClass.simpleName}" }
                                 syncingNow = false
                             }
                         }
