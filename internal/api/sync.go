@@ -140,5 +140,12 @@ func (d *Deps) handlePullSync(w http.ResponseWriter, r *http.Request) {
 			lastSeq = uint64(rows[i].ID)
 		}
 	}
+	// 空页仍回报库内真实最大序号:库从备份回档后,客户端游标可能停在比真实最大值更靠前的位置,
+	// 若此处只回显 since,该设备会认为「已追平」而永久脱离同步(只能清设置恢复)。
+	if len(rows) == 0 && lastSeq == since {
+		if maxID, e := d.Store.MaxSyncItemID(); e == nil && uint64(maxID) < since {
+			lastSeq = uint64(maxID)
+		}
+	}
 	writeJSON(w, http.StatusOK, map[string]any{"items": items, "last_seq": lastSeq})
 }

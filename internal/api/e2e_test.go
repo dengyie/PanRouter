@@ -758,6 +758,33 @@ func TestE2ESyncValidation(t *testing.T) {
 	}
 }
 
+// TestE2ESyncPullCursorRewind 覆盖「服务端库回档后客户端游标超前」的收敛路径:
+// 空页必须回报库内真实最大序号,否则客户端会认为已追平而永久脱离同步。
+func TestE2ESyncPullCursorRewind(t *testing.T) {
+	e := newE2E(t, true)
+	if st, b := e.do(t, "POST", "/api/v1/sync", e.token, syncPush("pc-1", "bookmark", "u-1", false, 1000, `{"title":"v1"}`)); st != http.StatusOK {
+		t.Fatalf("push: %d %v", st, b)
+	}
+	_, b := e.do(t, "GET", "/api/v1/sync?since=0", e.token, "")
+	maxID := b["last_seq"].(float64)
+	if maxID <= 0 {
+		t.Fatalf("last_seq should be > 0, got %v", b)
+	}
+	// 客户端游标远超前(模拟库回档/换机迁移误带游标):必须回落真实最大值
+	st, b2 := e.do(t, "GET", "/api/v1/sync?since=999999", e.token, "")
+	if st != http.StatusOK || len(b2["items"].([]any)) != 0 {
+		t.Fatalf("pull beyond max should be empty: %d %v", st, b2)
+	}
+	if got := b2["last_seq"].(float64); got != maxID {
+		t.Fatalf("empty page must report real max seq %v (rewind), got %v", maxID, got)
+	}
+	// 游标收敛后再拉:仍为空且保持稳定(不振荡)
+	_, b3 := e.do(t, "GET", "/api/v1/sync?since="+strconvI64(int64(maxID)), e.token, "")
+	if got := b3["last_seq"].(float64); got != maxID {
+		t.Fatalf("cursor should stay at max seq, got %v", got)
+	}
+}
+
 func TestE2ESyncAuthRequired(t *testing.T) {
 	e := newE2E(t, true)
 	st, b := e.do(t, "POST", "/api/v1/sync", "", syncPush("pc-1", "bookmark", "u-1", false, 1, `{}`))

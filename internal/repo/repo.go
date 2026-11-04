@@ -78,7 +78,7 @@ type AuditLog struct {
 // SyncItem 设备同步条目:桌面端把收藏/解析历史/下载记录以不透明 JSON payload 上报,
 // 服务端只做存储与 LWW 仲裁,不解析 payload 语义(两仓零共享代码边界)。
 type SyncItem struct {
-	ID              uint      `gorm:"primaryKey" json:"id"` // 全局变更序号:每次变更 DELETE+INSERT 产生新 rowid,pull 游标严格单调
+	ID              uint      `gorm:"primaryKey" json:"id"`                         // 全局变更序号:每次变更 DELETE+INSERT 产生新 rowid,pull 游标严格单调
 	Kind            string    `gorm:"size:24;uniqueIndex:idx_kind_uid" json:"kind"` // bookmark | link_history | download_record
 	UID             string    `gorm:"size:64;uniqueIndex:idx_kind_uid" json:"uid"`  // 客户端生成的稳定 UUID
 	DeviceID        string    `gorm:"size:64;index" json:"device_id"`
