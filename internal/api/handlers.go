@@ -143,8 +143,7 @@ func (d *Deps) handleListAccounts(w http.ResponseWriter, r *http.Request) {
 
 func (d *Deps) handleCreateAccount(w http.ResponseWriter, r *http.Request) {
 	var q accountReq
-	if err := json.NewDecoder(r.Body).Decode(&q); err != nil {
-		writeErr(w, driver.NewErr(driver.KindNotFound, "请求格式错误", err))
+	if !decodeBoundedBody(w, r, &q) {
 		return
 	}
 	acc, err := d.Accounts.Create(q.PanType, q.Name, q.Cookie, func(pan string) bool {

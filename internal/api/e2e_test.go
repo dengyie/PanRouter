@@ -785,6 +785,25 @@ func TestE2ESyncPullCursorRewind(t *testing.T) {
 	}
 }
 
+// TestE2ESyncPushBodyCap 请求体上限:解码是全量缓冲,失控/恶意客户端灌大 body 必须
+// 被 4xx 按内容拒绝(而非缓冲到内存或按 404 让客户端无限重试)。
+func TestE2ESyncPushBodyCap(t *testing.T) {
+	e := newE2E(t, true)
+	item := `{"kind":"bookmark","uid":"u","deleted":false,"updated_at":1,"payload":{"a":"` + strings.Repeat("x", 1024) + `"}},`
+	big := `{"device_id":"pc-1","items":[` + strings.Repeat(item, 11000) + `]}`
+	st, b := e.do(t, "POST", "/api/v1/sync", e.token, big)
+	if st != http.StatusBadRequest {
+		t.Fatalf("oversize body should be 400, got %d %v", st, b)
+	}
+	if k, _ := b["kind"].(string); k != "unsupported" {
+		t.Fatalf("oversize body kind should be unsupported, got %v", b)
+	}
+	// 正常体不受影响
+	if st, b := e.do(t, "POST", "/api/v1/sync", e.token, syncPush("pc-1", "bookmark", "u-1", false, 1, `{"title":"v1"}`)); st != http.StatusOK {
+		t.Fatalf("normal push after cap: %d %v", st, b)
+	}
+}
+
 func TestE2ESyncAuthRequired(t *testing.T) {
 	e := newE2E(t, true)
 	st, b := e.do(t, "POST", "/api/v1/sync", "", syncPush("pc-1", "bookmark", "u-1", false, 1, `{}`))

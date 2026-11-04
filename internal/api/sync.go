@@ -2,6 +2,7 @@ package api
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
 	"strconv"
 	"time"
@@ -32,6 +33,27 @@ const (
 // 合法 kind:服务端只认这三种;payload 内容本身不校验(不透明)。
 var syncKinds = map[string]bool{"bookmark": true, "link_history": true, "download_record": true}
 
+// maxAPIBodyBytes 写端点请求体上限:sync 合法上限 ≈500 条×16KB ≈ 8MB,留余量;
+// 解码是全量缓冲,不给失控/恶意客户端无上限灌内存的口子。
+const maxAPIBodyBytes = 10 << 20
+
+// decodeBoundedBody 施加字节上限后解码 JSON 请求体。
+// 超限按内容拒绝(KindUnsupported→400,客户端识别为毒丸批可丢弃收敛);
+// 其余解码失败保持「请求格式错误」原语义。返回 false 时响应已写出。
+func decodeBoundedBody(w http.ResponseWriter, r *http.Request, v any) bool {
+	r.Body = http.MaxBytesReader(w, r.Body, maxAPIBodyBytes)
+	if err := json.NewDecoder(r.Body).Decode(v); err != nil {
+		var mbe *http.MaxBytesError
+		if errors.As(err, &mbe) {
+			writeErr(w, driver.NewErr(driver.KindUnsupported, "请求体超限", err))
+		} else {
+			writeErr(w, driver.NewErr(driver.KindNotFound, "请求格式错误", err))
+		}
+		return false
+	}
+	return true
+}
+
 type syncPushReq struct {
 	DeviceID string      `json:"device_id"`
 	Items    []syncEntry `json:"items"`
@@ -59,8 +81,7 @@ type syncItemView struct {
 // handlePushSync POST /api/v1/sync
 func (d *Deps) handlePushSync(w http.ResponseWriter, r *http.Request) {
 	var q syncPushReq
-	if err := json.NewDecoder(r.Body).Decode(&q); err != nil {
-		writeErr(w, driver.NewErr(driver.KindNotFound, "请求格式错误", err))
+	if !decodeBoundedBody(w, r, &q) {
 		return
 	}
 	if q.DeviceID == "" || len(q.Items) == 0 {
@@ -143,7 +164,9 @@ func (d *Deps) handlePullSync(w http.ResponseWriter, r *http.Request) {
 	// 空页仍回报库内真实最大序号:库从备份回档后,客户端游标可能停在比真实最大值更靠前的位置,
 	// 若此处只回显 since,该设备会认为「已追平」而永久脱离同步(只能清设置恢复)。
 	if len(rows) == 0 && lastSeq == since {
-		if maxID, e := d.Store.MaxSyncItemID(); e == nil && uint64(maxID) < since {
+		if maxID, e := d.Store.MaxSyncItemID(); e != nil {
+			d.Log.Warnw("同步空页回退查询失败,客户端游标保持不变", "err", e)
+		} else if uint64(maxID) < since {
 			lastSeq = uint64(maxID)
 		}
 	}
