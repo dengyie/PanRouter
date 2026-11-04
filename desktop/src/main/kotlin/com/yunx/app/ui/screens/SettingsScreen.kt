@@ -79,9 +79,11 @@ import com.yunx.app.data.backup.AuthCrypto
 import com.yunx.app.data.download.DownloadDebugLog
 import com.yunx.app.data.download.DownloadPlatform
 import com.yunx.app.data.download.DownloadSaver
+import com.yunx.app.data.db.AppDatabase
 import com.yunx.app.data.network.GitHubMirror
 import com.yunx.app.data.network.HttpClients
 import com.yunx.app.data.network.SystemProxy
+import com.yunx.app.data.panrouter.HistorySyncEngine
 import com.yunx.app.data.panrouter.PanRouterClient
 import com.yunx.app.data.panrouter.PanRouterContribution
 import com.yunx.app.data.panrouter.PanRouterHub
@@ -1929,8 +1931,11 @@ private fun PanRouterSettingsDialog(
     var token by remember(visible) { mutableStateOf(PanRouterTokenStore.getToken().orEmpty()) }
     var tokenVisible by remember { mutableStateOf(false) }
     var fallbackToLocal by remember(visible) { mutableStateOf(settings.fallbackToLocal) }
+    var historySync by remember(visible) { mutableStateOf(settings.historySyncEnabled) }
     var testing by remember { mutableStateOf(false) }
     var testResult by remember(visible) { mutableStateOf<String?>(null) }
+    var syncingNow by remember { mutableStateOf(false) }
+    var syncMsg by remember(visible) { mutableStateOf<String?>(null) }
     val scope = rememberCoroutineScope()
 
     FadeAlertDialog(
@@ -1987,6 +1992,68 @@ private fun PanRouterSettingsDialog(
                     horizontalArrangement = Arrangement.SpaceBetween,
                     verticalAlignment = Alignment.CenterVertically
                 ) {
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text("历史同步（收藏 · 解析历史 · 下载记录）")
+                        Text(
+                            "多设备经自部署服务端双向同步，数据仅存你自己的服务器；默认关闭。" +
+                                "下载记录不含本机路径与请求头。",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
+                    Switch(checked = historySync, onCheckedChange = { historySync = it })
+                }
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    TextButton(
+                        enabled = !syncingNow,
+                        onClick = {
+                            syncingNow = true
+                            syncMsg = null
+                            scope.launch {
+                                // 先落当前编辑值（与保存按钮同口径），再跑一轮完整同步
+                                settings.enabled = enabled
+                                settings.baseUrl = baseUrl
+                                PanRouterTokenStore.setToken(token.trim().ifBlank { null })
+                                settings.fallbackToLocal = fallbackToLocal
+                                settings.historySyncEnabled = historySync
+                                syncMsg = if (!HistorySyncEngine.syncOnce("settings")) {
+                                    "未执行：需开启服务端解析、填好地址与 api_token 并勾选历史同步"
+                                } else {
+                                    val backlog = runCatching {
+                                        AppDatabase.get().syncOutboxDao().count()
+                                    }.getOrDefault(0)
+                                    "同步完成 · 待推送积压 $backlog 条"
+                                }
+                                syncingNow = false
+                            }
+                        }
+                    ) { Text(if (syncingNow) "同步中…" else "立即同步") }
+                    Text(
+                        if (settings.syncLastAt > 0L) {
+                            "上次同步 " + java.text.SimpleDateFormat(
+                                "MM-dd HH:mm", java.util.Locale.getDefault()
+                            ).format(java.util.Date(settings.syncLastAt))
+                        } else "从未同步",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
+                syncMsg?.let {
+                    Text(
+                        it,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
                     TextButton(
                         enabled = !testing && baseUrl.isNotBlank(),
                         onClick = {
@@ -2024,6 +2091,7 @@ private fun PanRouterSettingsDialog(
                 settings.baseUrl = baseUrl
                 PanRouterTokenStore.setToken(token.trim().ifBlank { null })
                 settings.fallbackToLocal = fallbackToLocal
+                settings.historySyncEnabled = historySync
                 onDismiss()
             }) { Text("保存") }
         },

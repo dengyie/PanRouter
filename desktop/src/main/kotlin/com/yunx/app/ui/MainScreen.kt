@@ -72,6 +72,7 @@ import com.yunx.app.data.download.ChunkDownloader
 import com.yunx.app.data.download.DownloadManager
 import com.yunx.app.data.download.DownloadPlatform
 import com.yunx.app.data.gopeed.GopeedEngine
+import com.yunx.app.data.panrouter.HistorySyncEngine
 import com.yunx.app.data.panrouter.PanRouterContribution
 import com.yunx.app.data.panrouter.PanRouterHub
 import com.yunx.app.data.network.BaiduApi
@@ -858,6 +859,9 @@ fun MainScreen(
 
     // 启动时按需刷新 GitHub 镜像测速（结果过期或从未测过才跑，避免每次启动都测速）
     LaunchedEffect(Unit) { GitHubMirror.ensureFresh() }
+
+    // 启动挂载 PanRouter 历史同步常驻循环（未开启/未配置时是廉价 early-return，见 HistorySyncEngine）
+    LaunchedEffect(Unit) { HistorySyncEngine.ensureStarted() }
 
     /**
      * 启动自动检查更新（整个会话只跑一次）。

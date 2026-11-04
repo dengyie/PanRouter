@@ -1,0 +1,285 @@
+package com.yunx.app.data.panrouter
+
+import com.yunx.app.data.db.AppDatabase
+import com.yunx.app.data.db.BookmarkDao
+import com.yunx.app.data.db.BookmarkEntity
+import com.yunx.app.data.db.DownloadTaskDao
+import com.yunx.app.data.db.LinkHistoryDao
+import com.yunx.app.data.db.LinkHistoryEntity
+import com.yunx.app.data.db.SyncOutboxDao
+import com.yunx.app.util.Log
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.launch
+import java.util.concurrent.atomic.AtomicBoolean
+
+/**
+ * PanRouter 历史同步引擎（M3）：把本机收藏/解析历史/下载记录与自部署服务端做多设备双向同步。
+ *
+ * 数据流（outbox 模式）：
+ * 1. 业务 DAO 在增/删/改的同一数据库写里把「变更意图」记进 `sync_outbox`（零漏事件，见 AppDatabase）；
+ * 2. 本引擎每轮：回填旧数据 uid → 消费 outbox 推送（payload 推送时回读业务行当前值，多次修改自然合并）
+ *    → 按游标拉取其他设备的变更合并进本地（LWW：client_updated_at 新者胜，墓碑传播删除）；
+ * 3. 服务端把 payload 当不透明 JSON 存储（两仓零共享代码边界），仲裁与游标全部由服务端 sync_items 表承担。
+ *
+ * 语义约定：
+ * - **download_record 只上行不回填**：别设备的下载记录不落本地 download_task（避免假任务污染下载列表），
+ *   服务端管理页可查；本机删除下载任务也不传播墓碑（日志语义）；
+ * - **pull 合并规则**：本地有同 uid 待推送意图且不旧于远端 → 跳过（等推送反压）；否则远端落地、旧意图作废；
+ * - **幂等**：重推同 uid 由服务端 LWW skip；pull 游标（[PanRouterSettings.syncCursor]）断点续拉。
+ *
+ * 触发：启动后常驻循环（30s 一轮，未开启时是廉价 early-return）+ 设置页「立即同步」。
+ */
+object HistorySyncEngine {
+
+    private const val TAG = "YunX-PanRouterSync"
+
+    internal const val KIND_BOOKMARK = "bookmark"
+    internal const val KIND_LINK_HISTORY = "link_history"
+    internal const val KIND_DOWNLOAD_RECORD = "download_record"
+
+    /** 单批推送条数（与服务端 SyncMaxBatch 上限一致） */
+    private const val PUSH_BATCH = 500
+
+    /** 常驻循环间隔 */
+    private const val LOOP_INTERVAL_MS = 30_000L
+
+    /** 启动延迟：让启动期任务（下载恢复/账号解密/公告检查）先跑完 */
+    private const val STARTUP_DELAY_MS = 8_000L
+
+    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+
+    @Volatile
+    private var started = false
+
+    /** 同一轮里 push+pull 串行；并发调用（定时器撞上手动「立即同步」）直接让后者扑空 */
+    private val syncing = AtomicBoolean(false)
+
+    // ---- 可注入点（测试用；生产走真实单例与网络） ----
+
+    /** 引擎用到的 DAO 集合抽象（AppDatabase 是 final 无法伪造，测试注入内存实现） */
+    internal interface SyncStores {
+        val bookmarkDao: BookmarkDao
+        val linkHistoryDao: LinkHistoryDao
+        val downloadTaskDao: DownloadTaskDao
+        val outboxDao: SyncOutboxDao
+    }
+
+    internal var storesProvider: () -> SyncStores = {
+        val db = AppDatabase.get()
+        object : SyncStores {
+            override val bookmarkDao = db.bookmarkDao()
+            override val linkHistoryDao = db.linkHistoryDao()
+            override val downloadTaskDao = db.downloadTaskDao()
+            override val outboxDao = db.syncOutboxDao()
+        }
+    }
+
+    internal var settingsProvider: () -> PanRouterSettings = { PanRouterSettings() }
+
+    internal var tokenProvider: () -> String? = { PanRouterTokenStore.getToken() }
+
+    /** 传输层工厂：生产=OkHttp 客户端；测试注入录制的假传输 */
+    internal var transportFactory: (baseUrl: String) -> SyncTransport = { baseUrl ->
+        val client = PanRouterClient(baseUrlProvider = { baseUrl })
+        object : SyncTransport {
+            override suspend fun push(deviceId: String, items: List<SyncPushItem>) =
+                client.pushSync(deviceId, items)
+
+            override suspend fun pull(since: Long, limit: Int) = client.pullSync(since, limit)
+        }
+    }
+
+    /** 服务端往返抽象（push/pull 各一个方法，契约见 PanRouterClient 同名方法） */
+    internal interface SyncTransport {
+        suspend fun push(deviceId: String, items: List<SyncPushItem>): Result<SyncPushResult>
+        suspend fun pull(since: Long, limit: Int): Result<SyncPullResult>
+    }
+
+    /** 应用启动时挂载常驻循环（MainScreen LaunchedEffect 调用；重复调用无害） */
+    fun ensureStarted() {
+        if (started) return
+        synchronized(this) {
+            if (started) return
+            started = true
+        }
+        scope.launch {
+            delay(STARTUP_DELAY_MS)
+            while (true) {
+                runCatching { syncOnce("loop") }
+                    .onFailure { Log.w(TAG, "同步轮异常：${it.message ?: it.javaClass.simpleName}") }
+                delay(LOOP_INTERVAL_MS)
+            }
+        }
+    }
+
+    /**
+     * 跑一轮完整同步（回填 → 推送 → 拉取）。前提不满足（未开启/未配置/无 token）或已在同步中返回 false。
+     * 返回 true = 真正执行了一轮（无论有没有变更）。
+     */
+    suspend fun syncOnce(reason: String = "manual"): Boolean {
+        if (!syncing.compareAndSet(false, true)) return false
+        try {
+            val settings = settingsProvider()
+            if (!settings.isSyncReady()) return false
+            val token = tokenProvider()
+            if (token.isNullOrBlank()) return false
+            val stores = storesProvider()
+            val transport = transportFactory(settings.baseUrl)
+
+            backfillSyncUids(stores)
+            pushPending(stores, settings.deviceId, transport)
+            pullRemote(stores, settings, transport)
+            settings.syncLastAt = System.currentTimeMillis()
+            Log.i(TAG, "历史同步完成（$reason）：游标=${settings.syncCursor}")
+            return true
+        } finally {
+            syncing.set(false)
+        }
+    }
+
+    /**
+     * 旧数据回填：syncUid 为空的行分配 uid。收藏/解析历史回填后**补推**（首开启同步时把既有库
+     * 备份上服务端，这是用户开启同步的核心预期）；下载任务只回填 uid 不补推（日志语义：
+     * 历史终态早已发生，全量补传既慢又无回放价值，此后的新终态会自然上报）。
+     */
+    private suspend fun backfillSyncUids(stores: SyncStores) {
+        val outbox = stores.outboxDao
+        stores.bookmarkDao.observeAll().first().filter { it.syncUid.isEmpty() }.forEach { b ->
+            val uid = newUid("bm")
+            stores.bookmarkDao.updateSyncUid(b.id, uid)
+            outbox.enqueue(KIND_BOOKMARK, uid, deleted = false, updatedAt = b.createTime)
+        }
+        stores.linkHistoryDao.observeAll().first().filter { it.syncUid.isEmpty() }.forEach { h ->
+            val uid = newUid("lh")
+            stores.linkHistoryDao.updateSyncUid(h.id, uid)
+            outbox.enqueue(KIND_LINK_HISTORY, uid, deleted = false, updatedAt = h.createTime)
+        }
+        stores.downloadTaskDao.listAll().filter { it.syncUid.isEmpty() }.forEach { t ->
+            stores.downloadTaskDao.updateSyncUid(t.id, newUid("dl"))
+        }
+    }
+
+    /** 消费 outbox：同 kind+uid 合并取最新意图 → 回读业务行组包 → 推送 → 成功后整批标记已推送 */
+    private suspend fun pushPending(stores: SyncStores, deviceId: String, transport: SyncTransport) {
+        val outbox = stores.outboxDao
+        while (true) {
+            val batch = outbox.take(PUSH_BATCH)
+            if (batch.isEmpty()) return
+            // 同 kind+uid 合并取最新意图；时间戳并列时删除赢（宁传墓碑也不复活已删数据）
+            val merged = batch.groupBy { it.kind to it.uid }
+                .map { (_, g) -> g.maxWithOrNull(compareBy({ it.updatedAt }, { it.deleted }))!! }
+
+            // payload 推送时回读（不带在意图里）：多次修改合并成最新状态，DAO 层不必知道契约结构
+            val bookmarkByUid = stores.bookmarkDao.observeAll().first().associateBy { it.syncUid }
+            val historyByUid = stores.linkHistoryDao.observeAll().first().associateBy { it.syncUid }
+            val taskByUid = stores.downloadTaskDao.listAll().associateBy { it.syncUid }
+            val items = merged.mapNotNull { e ->
+                // 墓碑：行已删（也可能从未在本机存在），直接透传删除意图，不做行回读
+                if (e.deleted) {
+                    SyncPushItem(e.kind, e.uid, deleted = true, updatedAt = e.updatedAt, payload = null)
+                } else when (e.kind) {
+                    KIND_BOOKMARK -> bookmarkByUid[e.uid]?.let {
+                        SyncPushItem(e.kind, e.uid, false, e.updatedAt, SyncBookmarkPayload(
+                            link = it.link, title = it.title, platform = it.platform,
+                            pwd = it.pwd, category = it.category, createdAt = it.createTime
+                        ).toJson())
+                    }
+                    KIND_LINK_HISTORY -> historyByUid[e.uid]?.let {
+                        SyncPushItem(e.kind, e.uid, false, e.updatedAt, SyncLinkHistoryPayload(
+                            url = it.url, title = it.title, platform = it.platform,
+                            pwd = it.pwd, createdAt = it.createTime
+                        ).toJson())
+                    }
+                    KIND_DOWNLOAD_RECORD -> taskByUid[e.uid]?.let { t ->
+                        SyncPushItem(e.kind, e.uid, false, e.updatedAt, SyncDownloadRecordPayload(
+                            shareUrl = t.shareUrl, platform = t.platform, fileName = t.fileName,
+                            totalSize = t.totalSize, status = t.status, error = t.errorMsg,
+                            createdAt = t.createTime
+                        ).toJson())
+                    }
+                    else -> null // 未知 kind（防御）：随整批一起消费掉
+                }
+            }
+            // 非墓碑但行已不存在（推送前被删）的意图自然丢弃；全空批不用打网络
+            if (items.isNotEmpty()) {
+                val r = transport.push(deviceId, items)
+                if (r.isFailure) {
+                    Log.w(TAG, "推送失败（下轮重试）：${r.exceptionOrNull()?.message ?: "网络异常"}")
+                    return // 留在 outbox，下轮再推
+                }
+            }
+            // 标记已推送（保留行作 LWW 版本记忆——拉取合并要跟远端时间戳比大小）
+            outbox.markPushed(batch.map { it.id })
+            if (batch.size < PUSH_BATCH) return
+        }
+    }
+
+    /** 按游标翻页拉取远端变更并合并；游标只进不退 */
+    private suspend fun pullRemote(stores: SyncStores, settings: PanRouterSettings, transport: SyncTransport) {
+        val outbox = stores.outboxDao
+        while (true) {
+            val since = settings.syncCursor
+            val r = transport.pull(since, SYNC_PULL_PAGE)
+            if (r.isFailure) {
+                Log.w(TAG, "拉取失败（下轮重试）：${r.exceptionOrNull()?.message ?: "网络异常"}")
+                return
+            }
+            val res = r.getOrThrow()
+            res.items.forEach { applyRemote(stores, outbox, it) }
+            if (res.lastSeq > settings.syncCursor) settings.syncCursor = res.lastSeq
+            if (res.items.size < SYNC_PULL_PAGE) return
+        }
+    }
+
+    /**
+     * 单条远端变更落地（合并规则见类注释）：
+     * 本机已持有不旧于远端的版本（outbox 里的 LWW 记忆，含已推送与待推送）→ 跳过；
+     * 否则清掉本机旧版本记忆、远端落地（墓碑 = 删本地行），并记录落地版本的时间戳。
+     */
+    private suspend fun applyRemote(stores: SyncStores, outbox: SyncOutboxDao, item: SyncRemoteItem) {
+        // download_record 只上行不回填（避免别设备的下载记录变成假任务污染本地列表）
+        if (item.kind != KIND_BOOKMARK && item.kind != KIND_LINK_HISTORY) return
+        val localVersion = outbox.localUpdatedAt(item.kind, item.uid)
+        if (localVersion != null && localVersion >= item.clientUpdatedAt) return
+        outbox.deleteForUid(item.kind, item.uid)
+        if (item.deleted) {
+            when (item.kind) {
+                KIND_BOOKMARK -> stores.bookmarkDao.deleteBySyncUid(item.uid)
+                KIND_LINK_HISTORY -> stores.linkHistoryDao.deleteBySyncUid(item.uid)
+            }
+        } else {
+            val payload = item.payloadJson() ?: return // 空/坏 payload：跳过（墓碑之外不该出现，防御）
+            when (item.kind) {
+                KIND_BOOKMARK -> {
+                    val p = SyncBookmarkPayload.parse(payload)
+                    if (p.link.isEmpty()) return
+                    stores.bookmarkDao.applyFromRemote(
+                        BookmarkEntity(
+                            link = p.link, title = p.title, platform = p.platform, pwd = p.pwd,
+                            category = p.category.ifEmpty { BookmarkEntity.DEFAULT_CATEGORY },
+                            syncUid = item.uid, createTime = p.createdAt
+                        )
+                    )
+                }
+                KIND_LINK_HISTORY -> {
+                    val p = SyncLinkHistoryPayload.parse(payload)
+                    if (p.url.isEmpty()) return
+                    stores.linkHistoryDao.applyFromRemote(
+                        LinkHistoryEntity(
+                            url = p.url, title = p.title, platform = p.platform, pwd = p.pwd,
+                            syncUid = item.uid, createTime = p.createdAt
+                        )
+                    )
+                }
+            }
+        }
+        // 记录「本机现在持有的版本」= 该次远端变更的时间戳（后续更旧的远端/推送都以它仲裁）
+        outbox.enqueue(item.kind, item.uid, deleted = item.deleted, updatedAt = item.clientUpdatedAt, pushed = true)
+    }
+
+    private fun newUid(prefix: String): String = "$prefix-" + java.util.UUID.randomUUID().toString()
+}

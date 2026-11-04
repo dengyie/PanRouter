@@ -287,4 +287,81 @@ class PanRouterClientTest {
         assertTrue("expected PanRouterError", e is PanRouterError)
         assertEquals(PanRouterError.Kind.UNSUPPORTED, (e as PanRouterError).kind)
     }
+
+    // ---------- 历史同步（development.md §7.6 契约） ----------
+
+    @Test
+    fun `pushSync serializes items and parses result`() = runBlocking {
+        server.enqueue(MockResponse().setBody("""{"accepted":2,"skipped":1,"server_time":1762100000000}"""))
+        val result = client.pushSync(
+            deviceId = "pc-1234",
+            items = listOf(
+                SyncPushItem(
+                    kind = "bookmark", uid = "bm-u1", deleted = false, updatedAt = 1762000000000,
+                    payload = org.json.JSONObject()
+                        .put("link", "https://pan.quark.cn/s/abc")
+                        .put("title", "资源")
+                        .put("platform", "QUARK")
+                        .put("pwd", "")
+                        .put("category", "视频")
+                        .put("created_at", 1761990000000)
+                ),
+                SyncPushItem(kind = "link_history", uid = "lh-u1", deleted = true, updatedAt = 1762000001000, payload = null)
+            )
+        ).getOrThrow()
+        assertEquals(2, result.accepted)
+        assertEquals(1, result.skipped)
+        assertEquals(1762100000000L, result.serverTime)
+
+        val req = server.takeRequest()
+        assertEquals("POST", req.method)
+        assertEquals("/api/v1/sync", req.path)
+        assertEquals("Bearer test-token", req.getHeader("Authorization"))
+        val body = org.json.JSONObject(req.body.readUtf8())
+        assertEquals("pc-1234", body.getString("device_id"))
+        val items = body.getJSONArray("items")
+        assertEquals(2, items.length())
+        val first = items.getJSONObject(0)
+        assertEquals("bookmark", first.getString("kind"))
+        assertEquals("bm-u1", first.getString("uid"))
+        assertEquals(false, first.getBoolean("deleted"))
+        assertEquals(1762000000000L, first.getLong("updated_at"))
+        assertEquals("https://pan.quark.cn/s/abc", first.getJSONObject("payload").getString("link"))
+        val second = items.getJSONObject(1)
+        assertTrue(second.getBoolean("deleted"))
+        assertTrue(second.isNull("payload"))
+    }
+
+    @Test
+    fun `pullSync sends cursor and parses items`() = runBlocking {
+        server.enqueue(
+            MockResponse().setBody(
+                """
+                {"items":[
+                  {"id":5,"kind":"bookmark","uid":"bm-u1","device_id":"pc-other",
+                   "payload":"{\"link\":\"https://pan.quark.cn/s/xyz\",\"title\":\"远端收藏\",\"platform\":\"QUARK\",\"pwd\":\"\",\"category\":\"文档\",\"created_at\":1761990000000}",
+                   "deleted":false,"client_updated_at":1762000000000,"server_updated_at":"2026-11-04T00:00:00+08:00"},
+                  {"id":6,"kind":"download_record","uid":"dl-u1","device_id":"pc-other",
+                   "payload":"{\"share_url\":\"https://pan.quark.cn/s/d1\",\"platform\":\"QUARK\",\"file_name\":\"a.zip\",\"total_size\":123,\"status\":3,\"error\":\"\",\"created_at\":1761990000000}",
+                   "deleted":false,"client_updated_at":1762000000001,"server_updated_at":"2026-11-04T00:00:01+08:00"}
+                ],"last_seq":6}
+                """.trimIndent()
+            )
+        )
+        val result = client.pullSync(since = 3).getOrThrow()
+        assertEquals(6L, result.lastSeq)
+        assertEquals(2, result.items.size)
+        val first = result.items[0]
+        assertEquals(5L, first.id)
+        assertEquals("bookmark", first.kind)
+        assertEquals("bm-u1", first.uid)
+        assertEquals("pc-other", first.deviceId)
+        assertEquals(false, first.deleted)
+        assertEquals(1762000000000L, first.clientUpdatedAt)
+        assertEquals("远端收藏", first.payloadJson()?.optString("title"))
+
+        val req = server.takeRequest()
+        assertEquals("/api/v1/sync?since=3&limit=500", req.path)
+        assertEquals("Bearer test-token", req.getHeader("Authorization"))
+    }
 }

@@ -152,6 +152,37 @@ class PanRouterClient(
             }.mapCatching { parseAccountView(jsonBody(it).optJSONObject("account") ?: JSONObject()) }
         }
 
+    // ---------- 历史同步（auth 端点；契约见服务端 development.md §7.6） ----------
+
+    /**
+     * `POST /api/v1/sync` {device_id, items:[...]} → 推送本地变更（收藏/解析历史/下载记录）。
+     * 服务端按 (kind,uid) LWW 仲裁：库内 updated_at 更新的条目被 skip（幂等重推安全）。
+     */
+    suspend fun pushSync(deviceId: String, items: List<SyncPushItem>): Result<SyncPushResult> =
+        withContext(Dispatchers.IO) {
+            request {
+                val body = JSONObject()
+                    .put("device_id", deviceId)
+                    .put("items", JSONArray().apply { items.forEach { put(it.toJson()) } })
+                authedRequest("${baseUrlProvider()}/api/v1/sync", body)
+            }.mapCatching { parseSyncPush(jsonBody(it)) }
+        }
+
+    /**
+     * `GET /api/v1/sync?since=<seq>&limit=` → 拉取 `id > since` 的变更（含其他设备的）。
+     * `since=0` 全量；返回 [SyncPullResult.lastSeq] 作为下一页游标。
+     */
+    suspend fun pullSync(since: Long, limit: Int = SYNC_PULL_PAGE): Result<SyncPullResult> =
+        withContext(Dispatchers.IO) {
+            request {
+                val builder = Request.Builder()
+                    .url("${baseUrlProvider()}/api/v1/sync?since=$since&limit=$limit")
+                    .get()
+                tokenProvider()?.takeIf { it.isNotBlank() }?.let { builder.header("Authorization", "Bearer $it") }
+                builder.build()
+            }.mapCatching { parseSyncPull(jsonBody(it)) }
+        }
+
     // ---------- 底层执行 ----------
 
     /** 构造 POST JSON 请求；已配置 token 时带 `Authorization: Bearer`（optionalAuth 端点游客可调） */

@@ -167,6 +167,9 @@ interface DownloadTaskDao {
     suspend fun updateFileName(id: Long, name: String)
     /** 还在外部引擎里执行、需要轮询同步进度的任务（engineTaskId 非空且未完成/未失败） */
     suspend fun listSyncableEngineTasks(): List<DownloadTaskEntity>
+
+    // ---- PanRouter 历史同步：回填旧数据的同步 uid（仅 UPDATE 该列，不触发 outbox） ----
+    suspend fun updateSyncUid(id: Long, uid: String)
 }
 
 interface BookmarkDao {
@@ -175,6 +178,15 @@ interface BookmarkDao {
     suspend fun insert(bookmark: BookmarkEntity): Long
     suspend fun updateCategory(id: Long, category: String)
     suspend fun delete(id: Long)
+
+    // ---- PanRouter 历史同步（引擎专用；普通增删改的 outbox 记账在 DAO 内部完成） ----
+
+    /** 回填旧数据的同步 uid（仅 UPDATE 该列，不触发 outbox） */
+    suspend fun updateSyncUid(id: Long, uid: String)
+    /** 远端合并：按 syncUid 存在则整行覆盖，不存在则插入；**不触发 outbox**（远端数据不回推） */
+    suspend fun applyFromRemote(bookmark: BookmarkEntity)
+    /** 远端墓碑落地：删掉该 uid 对应行；**不触发 outbox** */
+    suspend fun deleteBySyncUid(uid: String)
 }
 
 interface LinkHistoryDao {
@@ -183,4 +195,25 @@ interface LinkHistoryDao {
     suspend fun insert(entity: LinkHistoryEntity): Long
     suspend fun delete(id: Long)
     suspend fun clear()
+
+    // ---- PanRouter 历史同步（同 BookmarkDao 语义） ----
+    suspend fun updateSyncUid(id: Long, uid: String)
+    suspend fun applyFromRemote(entity: LinkHistoryEntity)
+    suspend fun deleteBySyncUid(uid: String)
+}
+
+/** 历史同步 outbox：业务 DAO 写入变更意图，同步引擎消费；已推送条目保留作 LWW 版本记忆。 */
+interface SyncOutboxDao {
+    /** 记一笔变更（pushed=false 待推送）或一条远端落地后的版本记忆（pushed=true） */
+    suspend fun enqueue(kind: String, uid: String, deleted: Boolean, updatedAt: Long, pushed: Boolean = false)
+    /** 取最老的一批**待推送**条目（pushed=0，id 升序） */
+    suspend fun take(limit: Int): List<SyncOutboxEntity>
+    /** 推送成功后标记已消费（保留行作 LWW 版本记忆） */
+    suspend fun markPushed(ids: List<Long>)
+    /** 该条目本机当前持有的版本时间戳（含已推送与待推送，取最大）；无记录返回 null */
+    suspend fun localUpdatedAt(kind: String, uid: String): Long?
+    /** 清掉该 uid 的全部记录（远端更新落地后，本机旧版本历史作废） */
+    suspend fun deleteForUid(kind: String, uid: String)
+    /** 当前待推送积压条数（pushed=0；设置页展示） */
+    suspend fun count(): Int
 }

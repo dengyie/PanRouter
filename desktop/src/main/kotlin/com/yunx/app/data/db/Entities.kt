@@ -186,6 +186,11 @@ data class DownloadTaskEntity(
     val motionUrl: String = "",
     /** 本任务的下载线程数覆盖（浏览器插件按用户弹窗选择传入）；0 = 跟随平台的线程数设置 */
     val threads: Int = 0,
+    /**
+     * PanRouter 历史同步的跨设备稳定标识（UUID；下载终态上报 download_record 用，
+     * 重试同一任务沿用同 uid 让服务端 LWW 覆盖）。空串 = 旧数据未回填（同步引擎首次运行时补）。
+     */
+    val syncUid: String = "",
     val createTime: Long = System.currentTimeMillis()
 ) {
     companion object {
@@ -219,6 +224,11 @@ data class BookmarkEntity(
     val pwd: String = "",
     /** 分类 */
     val category: String = DEFAULT_CATEGORY,
+    /**
+     * PanRouter 历史同步的跨设备稳定标识（UUID；增删改都以此 uid 在多设备间对齐）。
+     * 空串 = 旧数据未回填（同步引擎首次运行时补，或下次修改时补）。
+     */
+    val syncUid: String = "",
     val createTime: Long = System.currentTimeMillis()
 ) {
     companion object {
@@ -242,5 +252,34 @@ data class LinkHistoryEntity(
     val platform: String = "",
     /** 提取码（可选） */
     val pwd: String = "",
+    /**
+     * PanRouter 历史同步的跨设备稳定标识（UUID）；空串 = 旧数据未回填（同步引擎首次运行时补）。
+     */
+    val syncUid: String = "",
     val createTime: Long = System.currentTimeMillis()
+)
+
+/**
+ * 历史同步待推送队列（outbox 模式）：业务 DAO 在增/删/改的同时把「变更意图」写进本表
+ * （同一连接同一 synchronized 块，零漏事件），同步引擎批量消费。
+ * **不含 payload**——推送时引擎按 (kind, uid) 回读业务表当前值再组包，
+ * 同一条目多次修改自然合并成最新状态，DAO 层也不必知道同步契约的 JSON 结构。
+ *
+ * `pushed=true` 的条目已成功上报，**保留在本表**作为「本机当前持有版本的 LWW 时间戳」：
+ * 拉取合并时要拿它跟远端 client_updated_at 比大小（没有它，推送后到达的旧远端变更
+ * 会把本地新状态覆盖回去）。墓碑/覆盖场景由 deleteForUid 清理历史。
+ */
+data class SyncOutboxEntity(
+    val id: Long = 0,
+    /** bookmark | link_history | download_record（与服务端 kind 白名单一致） */
+    val kind: String,
+    /** 业务行的跨设备稳定标识 */
+    val uid: String,
+    /** true = 删除墓碑（uid 对应行已删，只需传播删除） */
+    val deleted: Boolean = false,
+    /** 本地变更时刻（毫秒）：服务端 LWW 仲裁键 */
+    val updatedAt: Long = System.currentTimeMillis(),
+    val createdAt: Long = System.currentTimeMillis(),
+    /** true = 已推送（仅作 LWW 版本记忆，不再消费） */
+    val pushed: Boolean = false
 )

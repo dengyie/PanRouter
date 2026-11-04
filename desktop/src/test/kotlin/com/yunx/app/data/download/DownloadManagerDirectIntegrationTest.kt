@@ -383,6 +383,7 @@ private class MemoryDownloadTaskDao : DownloadTaskDao {
         mutate(id) { it.copy(engineTaskId = engineTaskId) }
     override suspend fun updateFileName(id: Long, name: String) = mutate(id) { it.copy(fileName = name) }
     override suspend fun listSyncableEngineTasks(): List<DownloadTaskEntity> = emptyList()
+    override suspend fun updateSyncUid(id: Long, uid: String) = mutate(id) { it.copy(syncUid = uid) }
     override suspend fun updateDirect(id: Long, partPath: String, mode: Int) =
         mutate(id) { it.copy(directPart = partPath, directMode = mode) }
 }
