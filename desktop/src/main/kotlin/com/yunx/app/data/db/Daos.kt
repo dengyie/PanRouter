@@ -170,6 +170,8 @@ interface DownloadTaskDao {
 
     // ---- PanRouter 历史同步：回填旧数据的同步 uid（仅 UPDATE 该列，不触发 outbox） ----
     suspend fun updateSyncUid(id: Long, uid: String)
+    /** 按 syncUid 批量取行（推送组包用：只读本批需要的行，不整表加载） */
+    suspend fun listBySyncUids(uids: List<String>): List<DownloadTaskEntity>
 }
 
 interface BookmarkDao {
@@ -183,6 +185,8 @@ interface BookmarkDao {
 
     /** 回填旧数据的同步 uid（仅 UPDATE 该列，不触发 outbox） */
     suspend fun updateSyncUid(id: Long, uid: String)
+    /** 按 syncUid 批量取行（推送组包用） */
+    suspend fun listBySyncUids(uids: List<String>): List<BookmarkEntity>
     /** 远端合并：按 syncUid 存在则整行覆盖，不存在则插入；**不触发 outbox**（远端数据不回推） */
     suspend fun applyFromRemote(bookmark: BookmarkEntity)
     /** 远端墓碑落地：删掉该 uid 对应行；**不触发 outbox** */
@@ -200,6 +204,8 @@ interface LinkHistoryDao {
     suspend fun updateSyncUid(id: Long, uid: String)
     suspend fun applyFromRemote(entity: LinkHistoryEntity)
     suspend fun deleteBySyncUid(uid: String)
+    /** 按 syncUid 批量取行（推送组包用） */
+    suspend fun listBySyncUids(uids: List<String>): List<LinkHistoryEntity>
 }
 
 /** 历史同步 outbox：业务 DAO 写入变更意图，同步引擎消费；已推送条目保留作 LWW 版本记忆。 */
@@ -210,6 +216,8 @@ interface SyncOutboxDao {
     suspend fun take(limit: Int): List<SyncOutboxEntity>
     /** 推送成功后标记已消费（保留行作 LWW 版本记忆） */
     suspend fun markPushed(ids: List<Long>)
+    /** 丢弃指定意图（服务端 4xx 明确拒绝该批内容）：删行且不留版本记忆 */
+    suspend fun discard(ids: List<Long>)
     /** 该条目本机当前持有的版本时间戳（含已推送与待推送，取最大）；无记录返回 null */
     suspend fun localUpdatedAt(kind: String, uid: String): Long?
     /** 清掉该 uid 的全部记录（远端更新落地后，本机旧版本历史作废） */

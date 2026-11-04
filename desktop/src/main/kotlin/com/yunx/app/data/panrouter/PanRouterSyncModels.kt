@@ -108,6 +108,71 @@ data class SyncPullResult(
 
 // ---- payload（客户端语义，服务端不解析） ----
 
+/**
+ * 单条 payload 的服务端上限（development.md §7.6：16KB）。超限的后果是**整批 400**
+ * ——服务端逐条校验，一条超限就让整次推送失败，桌面端若不就地收敛就会每轮重推同一批、队列永久卡死。
+ */
+const val SYNC_PAYLOAD_MAX_BYTES = 16 * 1024
+
+/**
+ * 按 UTF-8 字节数截断，且不切断多字节字符（含代理对）。
+ * 服务端按**字节**计预算，而 String.length 是 UTF-16 单元数——中文/emoji 按 length 判断会算错，
+ * 必须按 toByteArray(UTF_8).size 判断与截断。
+ */
+internal fun String.utf8Truncate(maxBytes: Int): String {
+    if (maxBytes <= 0) return ""
+    val bytes = toByteArray(Charsets.UTF_8)
+    if (bytes.size <= maxBytes) return this
+    // 从头按 UTF-8 序列长度推进，停在预算内最后一个**完整字符**的边界——
+    // 不能从尾部回退判断：边界附近的续字节可能属于一个完整字符（回退会多丢字符）。
+    var end = 0
+    while (end < maxBytes) {
+        val b = bytes[end].toInt() and 0xFF
+        val need = when {
+            b < 0x80 -> 1    // ASCII
+            b < 0xE0 -> 2    // 0xC0..0xDF（合法输入不会出现裸续字节 0x80..0xBF）
+            b < 0xF0 -> 3    // 0xE0..0xEF
+            else -> 4        // 0xF0..0xF7
+        }
+        if (end + need > maxBytes) break
+        end += need
+    }
+    return String(bytes, 0, end, Charsets.UTF_8)
+}
+
+/** 各字段的字节预算（正常数据远小于此，仅作失控长度的收敛闸） */
+private const val CAP_LINK = 8 * 1024
+private const val CAP_TITLE = 4 * 1024
+private const val CAP_ERROR = 2 * 1024
+private const val CAP_FILE = 512
+private const val CAP_CATEGORY = 256
+private const val CAP_PWD = 128
+private const val CAP_PLATFORM = 64
+
+/** 可截断字段：越靠前越先被牺牲（error 是诊断信息，link/url 是数据本体，最后才动） */
+private val SYNC_TRIMMABLE = listOf("error", "title", "file_name", "category", "pwd", "url", "link")
+
+/**
+ * 把 payload 压进服务端字节预算：
+ * 1. 各字段先按 CAP_* 截断（覆盖常规情况）；
+ * 2. 仍超限（JSON 转义膨胀：控制字符/引号会变成 `\u0000` 这类 6 字节序列）则反复砍最长的可截断字段一半，直到进预算。
+ * 收敛后的 payload 保证 < 16KB，不会再出现「单条脏数据把整批推送卡死」。
+ */
+internal fun JSONObject.fittedForSync(limit: Int = SYNC_PAYLOAD_MAX_BYTES - 64): JSONObject {
+    val out = JSONObject(toString())
+    var guard = 0
+    while (out.toString().toByteArray(Charsets.UTF_8).size > limit && guard++ < 32) {
+        val key = SYNC_TRIMMABLE
+            .mapNotNull { k ->
+                out.optString(k).takeIf { it.isNotEmpty() }?.let { k to it.toByteArray(Charsets.UTF_8).size }
+            }
+            .maxByOrNull { it.second }?.first ?: break
+        val cur = out.optString(key)
+        out.put(key, cur.utf8Truncate(cur.toByteArray(Charsets.UTF_8).size / 2))
+    }
+    return out
+}
+
 /** 收藏 payload */
 data class SyncBookmarkPayload(
     val link: String,
@@ -118,12 +183,13 @@ data class SyncBookmarkPayload(
     val createdAt: Long
 ) {
     fun toJson(): JSONObject = JSONObject()
-        .put("link", link)
-        .put("title", title)
-        .put("platform", platform)
-        .put("pwd", pwd)
-        .put("category", category)
+        .put("link", link.utf8Truncate(CAP_LINK))
+        .put("title", title.utf8Truncate(CAP_TITLE))
+        .put("platform", platform.utf8Truncate(CAP_PLATFORM))
+        .put("pwd", pwd.utf8Truncate(CAP_PWD))
+        .put("category", category.utf8Truncate(CAP_CATEGORY))
         .put("created_at", createdAt)
+        .fittedForSync()
 
     companion object {
         fun parse(o: JSONObject) = SyncBookmarkPayload(
@@ -146,11 +212,12 @@ data class SyncLinkHistoryPayload(
     val createdAt: Long
 ) {
     fun toJson(): JSONObject = JSONObject()
-        .put("url", url)
-        .put("title", title)
-        .put("platform", platform)
-        .put("pwd", pwd)
+        .put("url", url.utf8Truncate(CAP_LINK))
+        .put("title", title.utf8Truncate(CAP_TITLE))
+        .put("platform", platform.utf8Truncate(CAP_PLATFORM))
+        .put("pwd", pwd.utf8Truncate(CAP_PWD))
         .put("created_at", createdAt)
+        .fittedForSync()
 
     companion object {
         fun parse(o: JSONObject) = SyncLinkHistoryPayload(
@@ -175,13 +242,14 @@ data class SyncDownloadRecordPayload(
     val createdAt: Long
 ) {
     fun toJson(): JSONObject = JSONObject()
-        .put("share_url", shareUrl)
-        .put("platform", platform)
-        .put("file_name", fileName)
+        .put("share_url", shareUrl.utf8Truncate(CAP_LINK))
+        .put("platform", platform.utf8Truncate(CAP_PLATFORM))
+        .put("file_name", fileName.utf8Truncate(CAP_FILE))
         .put("total_size", totalSize)
         .put("status", status)
-        .put("error", error)
+        .put("error", error.utf8Truncate(CAP_ERROR))
         .put("created_at", createdAt)
+        .fittedForSync()
 
     companion object {
         fun parse(o: JSONObject) = SyncDownloadRecordPayload(

@@ -183,6 +183,10 @@ class AppDatabase private constructor(private val conn: Connection) {
                                 it.execute("ALTER TABLE $table ADD COLUMN syncUid TEXT NOT NULL DEFAULT ''")
                             }
                         }
+                        // 同步按 uid 批量回读（推送组包）与远端落地都按该列查，走索引避免全表扫
+                        conn.createStatement().use {
+                            it.execute("CREATE INDEX IF NOT EXISTS idx_${table}_sync_uid ON $table(syncUid)")
+                        }
                     }
                     // 迁移：多账号（isPrimary / remark）。旧库逐表补列，已存在时忽略。
                     ACCOUNT_TABLES.forEach { table ->
@@ -411,11 +415,36 @@ private class JdbcAccountTable<T : Any>(
 private suspend fun <T> dbIo(block: () -> T): T = withContext(Dispatchers.IO) { block() }
 
 /**
+ * 按 syncUid 批量取行：分块拼 IN（SQLite 单语句变量数有上限，500 条一批正好压在安全区），
+ * 供推送组包按批回读——避免每批都整表加载（大历史库首次同步会是 O(N×批数)）。
+ */
+private inline fun <T> queryBySyncUids(
+    conn: Connection,
+    table: String,
+    uids: List<String>,
+    crossinline map: (java.sql.ResultSet) -> T
+): List<T> {
+    if (uids.isEmpty()) return emptyList()
+    return synchronized(conn) {
+        val out = mutableListOf<T>()
+        uids.chunked(400).forEach { chunk ->
+            val placeholders = chunk.joinToString(",") { "?" }
+            conn.prepareStatement("SELECT * FROM $table WHERE syncUid IN ($placeholders)").use { ps ->
+                chunk.forEachIndexed { i, uid -> ps.setString(i + 1, uid) }
+                ps.executeQuery().use { rs -> while (rs.next()) out += map(rs) }
+            }
+        }
+        out
+    }
+}
+
+/**
  * 历史同步 outbox 记账（业务 DAO 在增/删/改的同一 synchronized(conn) 块内调用，零漏事件）。
  * 只记「变更意图」不带 payload：推送时由同步引擎按 (kind, uid) 回读业务表当前值再组包，
- * 所以 DAO 层不需要知道同步契约的 JSON 结构。积压超上限时丢最老的（防同步长期关闭时无限增长）。
- * pushed=true 的条目已上报、仅作 LWW 版本记忆（不再消费；同一 uid 只保留最新一条，
- * 其余仍受总量上限约束）。
+ * 所以 DAO 层不需要知道同步契约的 JSON 结构。
+ *
+ * 同 uid 的意图就地合并（未推送 + 已推送各自只留最新一条）——推送本来就按 uid 合并取最新，
+ * 留多条纯属冗余，且会挤占上限。
  */
 private fun enqueueOutbox(
     conn: Connection,
@@ -437,36 +466,47 @@ private fun enqueueOutbox(
         ps.setInt(6, if (pushed) 1 else 0)
         ps.executeUpdate()
     }
-    // 同一 uid 的版本记忆只留最新一条（保留 updatedAt 最大者；并列取新 id）：
-    // 本地反复编辑会累积一串 pushed 行，不压缩会顶穿上限、把仍活跃 uid 的记忆挤掉
-    if (pushed) compactOutboxMemory(conn, kind, uid)
-    // 硬上限：超出时删掉最老的多余条目
+    if (pushed) {
+        // 版本记忆（已上报）只留最新一条：LWW 只关心本机持有版本的时间戳 = MAX(updatedAt)
+        compactOutbox(conn, kind, uid, pushed = true)
+        capOutboxMemory(conn)
+    } else {
+        // 待推送意图同样只留最新一条：推送时本就会合并，留多条会在同步长期关闭时
+        // 把上限挤满，导致最早的待推送编辑/墓碑被硬上限删掉（删除意图丢失 = 别的设备复活已删数据）
+        compactOutbox(conn, kind, uid, pushed = false)
+    }
+}
+
+/** 已推送版本记忆的总量上限（同步长期关闭时防止无限增长；每 uid 最多一条） */
+private const val SYNC_OUTBOX_MEMORY_MAX = 5000
+
+/** 版本记忆超限时删最老的：待推送意图不受影响（它们是未同步的真实变更，不能丢） */
+private fun capOutboxMemory(conn: Connection) {
     conn.createStatement().use { st ->
         st.executeUpdate(
-            "DELETE FROM sync_outbox WHERE id IN (" +
-                "SELECT id FROM sync_outbox ORDER BY id DESC LIMIT -1 OFFSET $SYNC_OUTBOX_MAX)"
+            "DELETE FROM sync_outbox WHERE pushed = 1 AND id NOT IN (" +
+                "SELECT id FROM sync_outbox WHERE pushed = 1 ORDER BY id DESC LIMIT $SYNC_OUTBOX_MEMORY_MAX)"
         )
     }
 }
 
-/** outbox 积压硬上限（同步长期关闭时防止无限增长；一次推送最多 500 条，2000 = 4 批内清完） */
-private const val SYNC_OUTBOX_MAX = 2000
-
 /**
- * 压缩 (kind, uid) 的已推送版本记忆：只保留 updatedAt 最大的一条（并列取新 id）。
- * LWW 只关心「本机当前持有版本的时间戳」= MAX(updatedAt)，故丢旧的等价无害；
- * 不做会把上限挤满（每轮推送/每次远端落地各留一行），导致仍活跃 uid 的记忆被顶掉。
+ * 压缩 (kind, uid) 的条目：同一 pushed 状态下只保留「最新版本」一条。
+ * 取值口径与引擎推送合并规则一致：updatedAt 最大者胜；并列时删除赢（宁传墓碑也不复活已删数据）；
+ * 再并列取新 id。
  */
-private fun compactOutboxMemory(conn: Connection, kind: String, uid: String) {
+private fun compactOutbox(conn: Connection, kind: String, uid: String, pushed: Boolean) {
     conn.prepareStatement(
-        "DELETE FROM sync_outbox WHERE kind = ? AND uid = ? AND pushed = 1 AND id <> (" +
-            "SELECT id FROM sync_outbox WHERE kind = ? AND uid = ? AND pushed = 1 " +
-            "ORDER BY updatedAt DESC, id DESC LIMIT 1)"
+        "DELETE FROM sync_outbox WHERE kind = ? AND uid = ? AND pushed = ? AND id <> (" +
+            "SELECT id FROM sync_outbox WHERE kind = ? AND uid = ? AND pushed = ? " +
+            "ORDER BY updatedAt DESC, deleted DESC, id DESC LIMIT 1)"
     ).use { ps ->
         ps.setString(1, kind)
         ps.setString(2, uid)
-        ps.setString(3, kind)
-        ps.setString(4, uid)
+        ps.setInt(3, if (pushed) 1 else 0)
+        ps.setString(4, kind)
+        ps.setString(5, uid)
+        ps.setInt(6, if (pushed) 1 else 0)
         ps.executeUpdate()
     }
 }
@@ -517,7 +557,25 @@ private class JdbcSyncOutboxDao(private val conn: Connection) : SyncOutboxDao {
                     ids.forEachIndexed { i, id -> ps.setLong(i + 1, id) }
                     ps.executeUpdate()
                 }
-                pairs.forEach { (kind, uid) -> compactOutboxMemory(conn, kind, uid) }
+                pairs.forEach { (kind, uid) -> compactOutbox(conn, kind, uid, pushed = true) }
+                capOutboxMemory(conn)
+            }
+        }
+    }
+
+    /**
+     * 丢弃指定意图（服务端以 4xx 明确拒绝该批内容时用）：直接删行，不留版本记忆
+     * ——被拒 ≠ 已同步，留下记忆会让本地误以为「本机版本服务端已知」。
+     */
+    override suspend fun discard(ids: List<Long>) {
+        if (ids.isEmpty()) return
+        dbIo {
+            synchronized(conn) {
+                val placeholders = ids.joinToString(",") { "?" }
+                conn.prepareStatement("DELETE FROM sync_outbox WHERE id IN ($placeholders) AND pushed = 0").use { ps ->
+                    ids.forEachIndexed { i, id -> ps.setLong(i + 1, id) }
+                    ps.executeUpdate()
+                }
             }
         }
     }
@@ -1285,6 +1343,14 @@ private class JdbcDownloadTaskDao(private val conn: Connection) : DownloadTaskDa
                 ps.setLong(2, id)
                 ps.executeUpdate()
             }
+            // 失败任务的错误信息总是在 updateStatus(FAILED) 之后才写入：这里再记一笔意图。
+            // 否则推送若恰好落在两步之间，服务端收到的失败记录会永远缺错误信息
+            //（outbox 只在变更时记账，此后没有新的写入就不会再推）
+            val uid = conn.prepareStatement("SELECT syncUid FROM download_task WHERE id = ?").use { ps ->
+                ps.setLong(1, id)
+                ps.executeQuery().use { rs -> if (rs.next()) rs.getString(1).orEmpty() else "" }
+            }
+            if (uid.isNotEmpty()) enqueueOutbox(conn, "download_record", uid, deleted = false)
         }
         reload()
     }
@@ -1385,6 +1451,10 @@ private class JdbcDownloadTaskDao(private val conn: Connection) : DownloadTaskDa
         }
         reload()
     }
+
+    override suspend fun listBySyncUids(uids: List<String>): List<DownloadTaskEntity> = dbIo {
+        queryBySyncUids(conn, "download_task", uids) { readTask(it) }
+    }
 }
 
 private class JdbcBookmarkDao(private val conn: Connection) : BookmarkDao {
@@ -1395,23 +1465,23 @@ private class JdbcBookmarkDao(private val conn: Connection) : BookmarkDao {
         _bookmarks.value = loadAll()
     }
 
+    private fun readBookmark(rs: ResultSet) = BookmarkEntity(
+        id = rs.getLong("id"),
+        link = rs.getString("link"),
+        title = rs.getString("title"),
+        platform = rs.getString("platform"),
+        pwd = rs.getString("pwd"),
+        category = rs.getString("category"),
+        // 旧库迁移期间 syncUid 列可能尚未添加，runCatching 兜底返回空串
+        syncUid = runCatching { rs.getString("syncUid") }.getOrDefault(""),
+        createTime = rs.getLong("createTime")
+    )
+
     private fun loadAll(): List<BookmarkEntity> = synchronized(conn) {
         conn.prepareStatement("SELECT * FROM bookmark ORDER BY createTime DESC").use { ps ->
             ps.executeQuery().use { rs ->
                 val out = mutableListOf<BookmarkEntity>()
-                while (rs.next()) {
-                    out += BookmarkEntity(
-                        id = rs.getLong("id"),
-                        link = rs.getString("link"),
-                        title = rs.getString("title"),
-                        platform = rs.getString("platform"),
-                        pwd = rs.getString("pwd"),
-                        category = rs.getString("category"),
-                        // 旧库迁移期间 syncUid 列可能尚未添加，runCatching 兜底返回空串
-                        syncUid = runCatching { rs.getString("syncUid") }.getOrDefault(""),
-                        createTime = rs.getLong("createTime")
-                    )
-                }
+                while (rs.next()) out += readBookmark(rs)
                 out
             }
         }
@@ -1495,6 +1565,10 @@ private class JdbcBookmarkDao(private val conn: Connection) : BookmarkDao {
         reload()
     }
 
+    override suspend fun listBySyncUids(uids: List<String>): List<BookmarkEntity> = dbIo {
+        queryBySyncUids(conn, "bookmark", uids) { readBookmark(it) }
+    }
+
     override suspend fun applyFromRemote(bookmark: BookmarkEntity) = dbIo {
         synchronized(conn) {
             // 远端合并：按 syncUid 幂等（存在整行覆盖 / 不存在插入），不记 outbox（远端数据不回推）
@@ -1555,22 +1629,22 @@ private class JdbcLinkHistoryDao(private val conn: Connection) : LinkHistoryDao 
         _history.value = loadAll()
     }
 
+    private fun readLinkHistory(rs: ResultSet) = LinkHistoryEntity(
+        id = rs.getLong("id"),
+        url = rs.getString("url"),
+        title = rs.getString("title"),
+        platform = rs.getString("platform"),
+        pwd = rs.getString("pwd"),
+        // 旧库迁移期间 syncUid 列可能尚未添加，runCatching 兜底返回空串
+        syncUid = runCatching { rs.getString("syncUid") }.getOrDefault(""),
+        createTime = rs.getLong("createTime")
+    )
+
     private fun loadAll(): List<LinkHistoryEntity> = synchronized(conn) {
         conn.prepareStatement("SELECT * FROM link_history ORDER BY createTime DESC").use { ps ->
             ps.executeQuery().use { rs ->
                 val out = mutableListOf<LinkHistoryEntity>()
-                while (rs.next()) {
-                    out += LinkHistoryEntity(
-                        id = rs.getLong("id"),
-                        url = rs.getString("url"),
-                        title = rs.getString("title"),
-                        platform = rs.getString("platform"),
-                        pwd = rs.getString("pwd"),
-                        // 旧库迁移期间 syncUid 列可能尚未添加，runCatching 兜底返回空串
-                        syncUid = runCatching { rs.getString("syncUid") }.getOrDefault(""),
-                        createTime = rs.getLong("createTime")
-                    )
-                }
+                while (rs.next()) out += readLinkHistory(rs)
                 out
             }
         }
@@ -1654,6 +1728,10 @@ private class JdbcLinkHistoryDao(private val conn: Connection) : LinkHistoryDao 
             }
         }
         reload()
+    }
+
+    override suspend fun listBySyncUids(uids: List<String>): List<LinkHistoryEntity> = dbIo {
+        queryBySyncUids(conn, "link_history", uids) { readLinkHistory(it) }
     }
 
     override suspend fun applyFromRemote(entity: LinkHistoryEntity) = dbIo {

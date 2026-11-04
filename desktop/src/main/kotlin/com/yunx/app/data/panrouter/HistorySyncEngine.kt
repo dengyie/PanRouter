@@ -41,6 +41,16 @@ object HistorySyncEngine {
     internal const val KIND_LINK_HISTORY = "link_history"
     internal const val KIND_DOWNLOAD_RECORD = "download_record"
 
+    /** 一轮同步的结果（供 UI 区分「没配好」「已在跑」「完成」） */
+    enum class SyncOutcome {
+        /** 完整跑完一轮（不论有无变更） */
+        DONE,
+        /** 已有一轮在跑（定时器撞上手动「立即同步」），本次没执行 */
+        BUSY,
+        /** 前提不满足：未开启历史同步 / 未配置服务端地址 / 无 api_token */
+        NOT_READY
+    }
+
     /** 单批推送条数（与服务端 SyncMaxBatch 上限一致） */
     private const val PUSH_BATCH = 500
 
@@ -117,16 +127,16 @@ object HistorySyncEngine {
     }
 
     /**
-     * 跑一轮完整同步（回填 → 推送 → 拉取）。前提不满足（未开启/未配置/无 token）或已在同步中返回 false。
-     * 返回 true = 真正执行了一轮（无论有没有变更）。
+     * 跑一轮完整同步（回填 → 推送 → 拉取）。
+     * 返回 [SyncOutcome]：UI 必须能区分「没执行（前提不满足）」与「已在同步中」，两者提示完全不同。
      */
-    suspend fun syncOnce(reason: String = "manual"): Boolean {
-        if (!syncing.compareAndSet(false, true)) return false
+    suspend fun syncOnce(reason: String = "manual"): SyncOutcome {
+        if (!syncing.compareAndSet(false, true)) return SyncOutcome.BUSY
         try {
             val settings = settingsProvider()
-            if (!settings.isSyncReady()) return false
+            if (!settings.isSyncReady()) return SyncOutcome.NOT_READY
             val token = tokenProvider()
-            if (token.isNullOrBlank()) return false
+            if (token.isNullOrBlank()) return SyncOutcome.NOT_READY
             val stores = storesProvider()
             val transport = transportFactory(settings.baseUrl)
 
@@ -135,7 +145,7 @@ object HistorySyncEngine {
             pullRemote(stores, settings, transport)
             settings.syncLastAt = System.currentTimeMillis()
             Log.i(TAG, "历史同步完成（$reason）：游标=${settings.syncCursor}")
-            return true
+            return SyncOutcome.DONE
         } finally {
             syncing.set(false)
         }
@@ -173,10 +183,18 @@ object HistorySyncEngine {
             val merged = batch.groupBy { it.kind to it.uid }
                 .map { (_, g) -> g.maxWithOrNull(compareBy({ it.updatedAt }, { it.deleted }))!! }
 
-            // payload 推送时回读（不带在意图里）：多次修改合并成最新状态，DAO 层不必知道契约结构
-            val bookmarkByUid = stores.bookmarkDao.observeAll().first().associateBy { it.syncUid }
-            val historyByUid = stores.linkHistoryDao.observeAll().first().associateBy { it.syncUid }
-            val taskByUid = stores.downloadTaskDao.listAll().associateBy { it.syncUid }
+            // payload 推送时回读（不带在意图里）：多次修改合并成最新状态，DAO 层不必知道契约结构。
+            // 只回读本批要的行（syncUid 上有索引）——大历史库首次同步不再每批整表加载。
+            val live = merged.filter { !it.deleted }
+            val bookmarkByUid = stores.bookmarkDao
+                .listBySyncUids(live.filter { it.kind == KIND_BOOKMARK }.map { it.uid })
+                .associateBy { it.syncUid }
+            val historyByUid = stores.linkHistoryDao
+                .listBySyncUids(live.filter { it.kind == KIND_LINK_HISTORY }.map { it.uid })
+                .associateBy { it.syncUid }
+            val taskByUid = stores.downloadTaskDao
+                .listBySyncUids(live.filter { it.kind == KIND_DOWNLOAD_RECORD }.map { it.uid })
+                .associateBy { it.syncUid }
             val items = merged.mapNotNull { e ->
                 // 墓碑：行已删（也可能从未在本机存在），直接透传删除意图，不做行回读
                 if (e.deleted) {
@@ -208,7 +226,16 @@ object HistorySyncEngine {
             if (items.isNotEmpty()) {
                 val r = transport.push(deviceId, items)
                 if (r.isFailure) {
-                    Log.w(TAG, "推送失败（下轮重试）：${r.exceptionOrNull()?.message ?: "网络异常"}")
+                    val e = r.exceptionOrNull()
+                    if (isRejectedByServer(e)) {
+                        // 服务端 4xx 明确拒绝内容（kind/uid 非法、payload 超限等）：重推同一批永远失败，
+                        // 队列会被这批「毒丸」永久堵死（后面的变更全部推不出去）。丢弃本批意图换回推进能力。
+                        // 被拒 ≠ 已同步，故用 discard 而非 markPushed——不留版本记忆。
+                        Log.e(TAG, "推送被服务端拒绝，丢弃本批 ${batch.size} 条意图：${e?.message}")
+                        outbox.discard(batch.map { it.id })
+                        continue
+                    }
+                    Log.w(TAG, "推送失败（下轮重试）：${e?.message ?: "网络异常"}")
                     return // 留在 outbox，下轮再推
                 }
             }
@@ -218,7 +245,15 @@ object HistorySyncEngine {
         }
     }
 
-    /** 按游标翻页拉取远端变更并合并；游标只进不退 */
+    /**
+     * 服务端以 4xx **明确拒绝内容**（不是网络/鉴权/服务端故障）：这类重试永远不会成功。
+     * 服务端所有校验失败都走 KindUnsupported(400)，故只认这个组合；
+     * 404（旧服务端没有该端点）/401/429/5xx/网络失败一律保留意图继续重试。
+     */
+    private fun isRejectedByServer(e: Throwable?): Boolean =
+        e is PanRouterError && e.kind == PanRouterError.Kind.UNSUPPORTED && e.httpStatus in 400..499
+
+    /** 按游标翻页拉取远端变更并合并 */
     private suspend fun pullRemote(stores: SyncStores, settings: PanRouterSettings, transport: SyncTransport) {
         val outbox = stores.outboxDao
         while (true) {
@@ -230,29 +265,38 @@ object HistorySyncEngine {
             }
             val res = r.getOrThrow()
             res.items.forEach { applyRemote(stores, outbox, it) }
-            if (res.lastSeq > settings.syncCursor) settings.syncCursor = res.lastSeq
+            // 短页 = 已到底。此时服务端回报的是「库内真实最大序号」：比 since 小说明本机游标超前
+            //（服务端库从备份回档 / 换机迁移误带了旧游标），必须跟随回落，否则永远拉不到任何变更。
+            if (res.lastSeq != since) settings.syncCursor = res.lastSeq
             if (res.items.size < SYNC_PULL_PAGE) return
+            // 防御：满页却没能推进游标 = 服务端契约违约，宁可停下也不死循环
+            if (settings.syncCursor <= since) {
+                Log.w(TAG, "拉取游标未推进（since=$since lastSeq=${res.lastSeq}），本轮停止")
+                return
+            }
         }
     }
 
     /**
      * 单条远端变更落地（合并规则见类注释）：
      * 本机已持有不旧于远端的版本（outbox 里的 LWW 记忆，含已推送与待推送）→ 跳过；
-     * 否则清掉本机旧版本记忆、远端落地（墓碑 = 删本地行），并记录落地版本的时间戳。
+     * 否则远端落地（墓碑 = 删本地行），落地**成功后**才作废旧记忆并记录新版本时间戳。
+     * 顺序很关键：先删记忆再写库的话，坏 payload / 写库失败会让本机既没更新也没记忆，
+     * 后续更旧的远端变更就能覆盖本机更新状态。
      */
     private suspend fun applyRemote(stores: SyncStores, outbox: SyncOutboxDao, item: SyncRemoteItem) {
         // download_record 只上行不回填（避免别设备的下载记录变成假任务污染本地列表）
         if (item.kind != KIND_BOOKMARK && item.kind != KIND_LINK_HISTORY) return
         val localVersion = outbox.localUpdatedAt(item.kind, item.uid)
         if (localVersion != null && localVersion >= item.clientUpdatedAt) return
-        outbox.deleteForUid(item.kind, item.uid)
+
         if (item.deleted) {
             when (item.kind) {
                 KIND_BOOKMARK -> stores.bookmarkDao.deleteBySyncUid(item.uid)
                 KIND_LINK_HISTORY -> stores.linkHistoryDao.deleteBySyncUid(item.uid)
             }
         } else {
-            val payload = item.payloadJson() ?: return // 空/坏 payload：跳过（墓碑之外不该出现，防御）
+            val payload = item.payloadJson() ?: return // 空/坏 payload：整条跳过，本机行与版本记忆都不动
             when (item.kind) {
                 KIND_BOOKMARK -> {
                     val p = SyncBookmarkPayload.parse(payload)
@@ -278,6 +322,7 @@ object HistorySyncEngine {
             }
         }
         // 记录「本机现在持有的版本」= 该次远端变更的时间戳（后续更旧的远端/推送都以它仲裁）
+        outbox.deleteForUid(item.kind, item.uid)
         outbox.enqueue(item.kind, item.uid, deleted = item.deleted, updatedAt = item.clientUpdatedAt, pushed = true)
     }
 

@@ -2020,13 +2020,17 @@ private fun PanRouterSettingsDialog(
                                 PanRouterTokenStore.setToken(token.trim().ifBlank { null })
                                 settings.fallbackToLocal = fallbackToLocal
                                 settings.historySyncEnabled = historySync
-                                syncMsg = if (!HistorySyncEngine.syncOnce("settings")) {
-                                    "未执行：需开启服务端解析、填好地址与 api_token 并勾选历史同步"
-                                } else {
-                                    val backlog = runCatching {
-                                        AppDatabase.get().syncOutboxDao().count()
-                                    }.getOrDefault(0)
-                                    "同步完成 · 待推送积压 $backlog 条"
+                                syncMsg = when (HistorySyncEngine.syncOnce("settings")) {
+                                    HistorySyncEngine.SyncOutcome.NOT_READY ->
+                                        "未执行：需开启服务端解析、填好地址与 api_token 并勾选历史同步"
+                                    HistorySyncEngine.SyncOutcome.BUSY ->
+                                        "已有一轮同步在进行中，稍后自动重试"
+                                    HistorySyncEngine.SyncOutcome.DONE -> {
+                                        val backlog = runCatching {
+                                            AppDatabase.get().syncOutboxDao().count()
+                                        }.getOrDefault(0)
+                                        "同步完成 · 待推送积压 $backlog 条"
+                                    }
                                 }
                                 syncingNow = false
                             }

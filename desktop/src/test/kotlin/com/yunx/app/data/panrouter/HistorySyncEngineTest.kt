@@ -25,8 +25,8 @@ import org.junit.Test
  * download_record 不回填全链路（不打网络、不碰 AppDatabase/prefs 真实存储）。
  *
  * ★ fake 的记账契约与生产 JDBC DAO 逐条对齐（AppDatabase.kt）：insert 分配 uid + 记 outbox、
- *   delete 读 uid + 墓碑、updateSyncUid/applyFromRemote/deleteBySyncUid 不记 outbox——
- *   改生产 DAO 的记账行为时必须同步改这里的 fake。
+ *   delete 读 uid + 墓碑、updateSyncUid/applyFromRemote/deleteBySyncUid 不记 outbox、
+ *   enqueue 按 (kind,uid,pushed) 压缩只留最新一条——改生产 DAO 的记账行为时必须同步改这里的 fake。
  */
 class HistorySyncEngineTest {
 
@@ -40,23 +40,28 @@ class HistorySyncEngineTest {
         override suspend fun enqueue(kind: String, uid: String, deleted: Boolean, updatedAt: Long, pushed: Boolean) {
             val id = (entries.keys.maxOrNull() ?: 0L) + 1
             entries[id] = SyncOutboxEntity(id, kind, uid, deleted, updatedAt, updatedAt, pushed)
-            if (pushed) compact(kind, uid)
+            // 与生产 enqueueOutbox 对齐：同 (kind,uid,pushed) 只留最新一条（时间戳并列删除赢）
+            compact(kind, uid, pushed)
         }
         override suspend fun take(limit: Int): List<SyncOutboxEntity> =
             entries.values.filter { !it.pushed }.sortedBy { it.id }.take(limit)
         override suspend fun markPushed(ids: List<Long>) {
             ids.forEach { id -> entries[id]?.let { entries[id] = it.copy(pushed = true) } }
             // 与生产 markPushed 对齐：标记后压缩受影响 uid 的版本记忆
-            ids.forEach { id -> entries[id]?.let { compact(it.kind, it.uid) } }
+            ids.forEach { id -> entries[id]?.let { compact(it.kind, it.uid, pushed = true) } }
+        }
+        override suspend fun discard(ids: List<Long>) {
+            // 与生产 discard 对齐：只删待推送行（已推送版本记忆不受影响）
+            ids.forEach { id -> entries[id]?.takeIf { !it.pushed }?.let { entries.remove(id) } }
         }
 
-        /** 与生产 compactOutboxMemory 对齐：同 uid 的已推送记忆只留 updatedAt 最大者（并列取新 id） */
-        private fun compact(kind: String, uid: String) {
+        /** 与生产 compactOutbox 对齐：同 (kind,uid,pushed) 只留 updatedAt 最大者（并列：删除赢 → 新 id） */
+        private fun compact(kind: String, uid: String, pushed: Boolean) {
             val keep = entries.values
-                .filter { it.kind == kind && it.uid == uid && it.pushed }
-                .maxWithOrNull(compareBy({ it.updatedAt }, { it.id })) ?: return
+                .filter { it.kind == kind && it.uid == uid && it.pushed == pushed }
+                .maxWithOrNull(compareBy({ it.updatedAt }, { it.deleted }, { it.id })) ?: return
             entries.entries.removeAll {
-                it.value.kind == kind && it.value.uid == uid && it.value.pushed && it.value.id != keep.id
+                it.value.kind == kind && it.value.uid == uid && it.value.pushed == pushed && it.value.id != keep.id
             }
         }
         override suspend fun localUpdatedAt(kind: String, uid: String): Long? =
@@ -102,6 +107,8 @@ class HistorySyncEngineTest {
         override suspend fun updateSyncUid(id: Long, uid: String) {
             rows[id] = rows.getValue(id).copy(syncUid = uid); reload()
         }
+        override suspend fun listBySyncUids(uids: List<String>): List<BookmarkEntity> =
+            if (uids.isEmpty()) emptyList() else rows.values.filter { it.syncUid in uids.toSet() }
         override suspend fun applyFromRemote(bookmark: BookmarkEntity) {
             val existing = rows.entries.firstOrNull { it.value.syncUid == bookmark.syncUid }
             if (existing != null) rows[existing.key] = bookmark.copy(id = existing.key)
@@ -150,6 +157,8 @@ class HistorySyncEngineTest {
         override suspend fun updateSyncUid(id: Long, uid: String) {
             rows[id] = rows.getValue(id).copy(syncUid = uid); reload()
         }
+        override suspend fun listBySyncUids(uids: List<String>): List<LinkHistoryEntity> =
+            if (uids.isEmpty()) emptyList() else rows.values.filter { it.syncUid in uids.toSet() }
         override suspend fun applyFromRemote(entity: LinkHistoryEntity) {
             val existing = rows.entries.firstOrNull { it.value.syncUid == entity.syncUid }
             if (existing != null) rows[existing.key] = entity.copy(id = existing.key)
@@ -161,7 +170,7 @@ class HistorySyncEngineTest {
         }
     }
 
-    /** 引擎只用 listAll / updateSyncUid，其余方法不应被触达 */
+    /** 引擎只用 listAll / updateSyncUid / listBySyncUids，其余方法不应被触达 */
     private class FakeDownloadTaskDao : DownloadTaskDao {
         val rows = LinkedHashMap<Long, DownloadTaskEntity>()
         override fun observeAll(): Flow<List<DownloadTaskEntity>> = MutableStateFlow(rows.values.toList())
@@ -184,15 +193,19 @@ class HistorySyncEngineTest {
         override suspend fun updateSyncUid(id: Long, uid: String) {
             rows[id] = rows.getValue(id).copy(syncUid = uid)
         }
+        override suspend fun listBySyncUids(uids: List<String>): List<DownloadTaskEntity> =
+            if (uids.isEmpty()) emptyList() else rows.values.filter { it.syncUid in uids.toSet() }
     }
 
-    /** 录制推送、回放拉取的假传输 */
+    /** 录制推送、回放拉取的假传输（push/pull 失败队列可注入，默认成功） */
     private class FakeTransport : HistorySyncEngine.SyncTransport {
         val pushed = mutableListOf<Pair<String, List<SyncPushItem>>>()
+        val pushResponses = ArrayDeque<Result<SyncPushResult>>()
         val pullResponses = ArrayDeque<Result<SyncPullResult>>()
         override suspend fun push(deviceId: String, items: List<SyncPushItem>): Result<SyncPushResult> {
             pushed += deviceId to items
-            return Result.success(SyncPushResult(accepted = items.size, skipped = 0, serverTime = 0))
+            return pushResponses.removeFirstOrNull()
+                ?: Result.success(SyncPushResult(accepted = items.size, skipped = 0, serverTime = 0))
         }
         override suspend fun pull(since: Long, limit: Int): Result<SyncPullResult> =
             pullResponses.removeFirstOrNull() ?: Result.success(SyncPullResult(emptyList(), lastSeq = since))
@@ -267,7 +280,7 @@ class HistorySyncEngineTest {
 
         // 服务端没有新数据（游标 0 → 空响应）
         transport.pullResponses += Result.success(SyncPullResult(emptyList(), lastSeq = 0))
-        assertTrue(HistorySyncEngine.syncOnce("test"))
+        assertEquals(HistorySyncEngine.SyncOutcome.DONE, HistorySyncEngine.syncOnce("test"))
 
         // 收藏/历史被回填 uid 并推送；下载任务只回填 uid 不推送
         assertEquals(1, transport.pushed.size)
@@ -297,12 +310,12 @@ class HistorySyncEngineTest {
         val bmId = bookmarks.insert(BookmarkEntity(link = "https://x/1", title = "v1"))
         val uid = bookmarks.rows.getValue(bmId).syncUid
         bookmarks.updateCategory(bmId, "软件")
-        // 手工补记一条更早的意图（模拟两次修改落了两条 outbox）
+        // 手工补记一条更早的意图（模拟两次修改落了两条 outbox）——生产/真实库会在 DAO 层就地合并
         outbox.enqueue(HistorySyncEngine.KIND_BOOKMARK, uid, deleted = false, updatedAt = 1000)
         val latestAt = outbox.entries.values.filter { it.uid == uid }.maxOf { it.updatedAt }
 
         transport.pullResponses += Result.success(SyncPullResult(emptyList(), lastSeq = 0))
-        assertTrue(HistorySyncEngine.syncOnce("test"))
+        assertEquals(HistorySyncEngine.SyncOutcome.DONE, HistorySyncEngine.syncOnce("test"))
 
         assertEquals(1, transport.pushed.size)
         val items = transport.pushed[0].second
@@ -319,7 +332,7 @@ class HistorySyncEngineTest {
         bookmarks.delete(bmId)
 
         transport.pullResponses += Result.success(SyncPullResult(emptyList(), lastSeq = 0))
-        assertTrue(HistorySyncEngine.syncOnce("test"))
+        assertEquals(HistorySyncEngine.SyncOutcome.DONE, HistorySyncEngine.syncOnce("test"))
 
         val items = transport.pushed[0].second
         assertEquals(1, items.size)
@@ -337,7 +350,7 @@ class HistorySyncEngineTest {
         repeat(3) { i ->
             bookmarks.updateCategory(bmId, "分类$i")
             transport.pullResponses += Result.success(SyncPullResult(emptyList(), lastSeq = 0))
-            assertTrue(HistorySyncEngine.syncOnce("test"))
+            assertEquals(HistorySyncEngine.SyncOutcome.DONE, HistorySyncEngine.syncOnce("test"))
         }
 
         // 版本记忆不累积：同一 uid 只有一条 pushed 行，且是本机最新版本的时间戳
@@ -371,7 +384,7 @@ class HistorySyncEngineTest {
                 lastSeq = 2
             )
         )
-        assertTrue(HistorySyncEngine.syncOnce("test"))
+        assertEquals(HistorySyncEngine.SyncOutcome.DONE, HistorySyncEngine.syncOnce("test"))
 
         // 收藏落地（空分类回默认），download_record 不回填为本地任务
         val bm = bookmarks.rows.values.single()
@@ -394,7 +407,7 @@ class HistorySyncEngineTest {
                 lastSeq = 9
             )
         )
-        assertTrue(HistorySyncEngine.syncOnce("test"))
+        assertEquals(HistorySyncEngine.SyncOutcome.DONE, HistorySyncEngine.syncOnce("test"))
 
         assertTrue(bookmarks.rows.isEmpty())
         assertEquals(0, outbox.count()) // 本地旧意图作废（远端墓碑更新）
@@ -421,7 +434,7 @@ class HistorySyncEngineTest {
                 lastSeq = 3
             )
         )
-        assertTrue(HistorySyncEngine.syncOnce("test"))
+        assertEquals(HistorySyncEngine.SyncOutcome.DONE, HistorySyncEngine.syncOnce("test"))
 
         val bm = bookmarks.rows.getValue(bmId)
         assertEquals("本地新改", bm.title) // 本地未被远端旧版覆盖
@@ -448,7 +461,7 @@ class HistorySyncEngineTest {
                 lastSeq = 4
             )
         )
-        assertTrue(HistorySyncEngine.syncOnce("test"))
+        assertEquals(HistorySyncEngine.SyncOutcome.DONE, HistorySyncEngine.syncOnce("test"))
 
         assertEquals("远端新版", bookmarks.rows.getValue(bmId).title)
         // 本机版本记忆被替换为该次远端变更的时间戳（旧意图/旧记忆作废）
@@ -456,9 +469,105 @@ class HistorySyncEngineTest {
     }
 
     @Test
+    fun `bad remote payload leaves local row and version memory untouched`() = runBlocking {
+        val bmId = bookmarks.insert(BookmarkEntity(link = "https://x/keep", title = "本机保留"))
+        val uid = bookmarks.rows.getValue(bmId).syncUid
+        val pendingAt = outbox.entries.values.first { it.uid == uid }.updatedAt
+
+        transport.pullResponses += Result.success(
+            SyncPullResult(
+                items = listOf(
+                    // 非 JSON payload：整条跳过——本机行、待推送意图、版本记忆都不动
+                    SyncRemoteItem(
+                        id = 5, kind = HistorySyncEngine.KIND_BOOKMARK, uid = uid, deviceId = "pc-other",
+                        payload = "{not-json", deleted = false, clientUpdatedAt = 999_999
+                    ),
+                    // 空 link：同样跳过（不产生空数据行）
+                    SyncRemoteItem(
+                        id = 6, kind = HistorySyncEngine.KIND_BOOKMARK, uid = uid, deviceId = "pc-other",
+                        payload = org.json.JSONObject().put("title", "无链接").toString(),
+                        deleted = false, clientUpdatedAt = 999_998
+                    )
+                ),
+                lastSeq = 6
+            )
+        )
+        assertEquals(HistorySyncEngine.SyncOutcome.DONE, HistorySyncEngine.syncOnce("test"))
+
+        assertEquals("本机保留", bookmarks.rows.getValue(bmId).title)
+        // 关键性质：坏 payload 不得覆盖本机版本记忆——仍是本机 pending 的时间戳，而非远端 999_999
+        assertEquals(pendingAt, outbox.localUpdatedAt(HistorySyncEngine.KIND_BOOKMARK, uid))
+        // 本轮 push 阶段已把待推送意图正常推走（假传输默认成功），队列清空
+        assertEquals(0, outbox.count())
+        // 游标照常推进：跳过的坏条目不会卡住后续变更
+        assertEquals(6L, PanRouterSettings().syncCursor)
+    }
+
+    // ---------- 毒丸 / 游标防御 ----------
+
+    @Test
+    fun `server rejected batch is discarded so queue keeps flowing`() = runBlocking {
+        bookmarks.insert(BookmarkEntity(link = "https://x/poison", title = "毒丸"))
+        // 服务端 4xx 明确拒绝（UNSUPPORTED/400）：重推永远失败，必须丢弃换回推进能力
+        transport.pushResponses += Result.failure(
+            PanRouterError("payload too large", PanRouterError.Kind.UNSUPPORTED, retriable = false, httpStatus = 400)
+        )
+        transport.pullResponses += Result.success(SyncPullResult(emptyList(), lastSeq = 0))
+        assertEquals(HistorySyncEngine.SyncOutcome.DONE, HistorySyncEngine.syncOnce("test"))
+        assertEquals(0, outbox.count()) // 毒丸批被丢弃，不卡队列
+
+        // 下一轮正常数据照常推送
+        val bm2 = bookmarks.insert(BookmarkEntity(link = "https://x/ok", title = "正常"))
+        transport.pullResponses += Result.success(SyncPullResult(emptyList(), lastSeq = 0))
+        assertEquals(HistorySyncEngine.SyncOutcome.DONE, HistorySyncEngine.syncOnce("test"))
+        val lastPush = transport.pushed.last().second
+        assertEquals(1, lastPush.size)
+        assertEquals(bookmarks.rows.getValue(bm2).syncUid, lastPush[0].uid)
+        assertEquals(0, outbox.count())
+    }
+
+    @Test
+    fun `network failure keeps intent for retry`() = runBlocking {
+        bookmarks.insert(BookmarkEntity(link = "https://x/net", title = "网络失败"))
+        // 网络/服务端故障 ≠ 内容被拒：意图必须留在队列里下轮重试
+        transport.pushResponses += Result.failure(
+            PanRouterError("connect timeout", PanRouterError.Kind.NETWORK, retriable = true)
+        )
+        transport.pullResponses += Result.success(SyncPullResult(emptyList(), lastSeq = 0))
+        assertEquals(HistorySyncEngine.SyncOutcome.DONE, HistorySyncEngine.syncOnce("test"))
+        assertEquals(1, outbox.count())
+    }
+
+    @Test
+    fun `cursor rewinds to server reported max seq when local cursor is ahead`() = runBlocking {
+        PanRouterSettings().syncCursor = 999_999L
+        // 服务端库回档后真实最大序号变小：空页回报 42，客户端必须跟随回落
+        transport.pullResponses += Result.success(SyncPullResult(emptyList(), lastSeq = 42L))
+        assertEquals(HistorySyncEngine.SyncOutcome.DONE, HistorySyncEngine.syncOnce("test"))
+        assertEquals(42L, PanRouterSettings().syncCursor)
+    }
+
+    @Test
+    fun `full page without cursor advance stops instead of looping`() = runBlocking {
+        val items = (1L..SYNC_PULL_PAGE).map { i ->
+            SyncRemoteItem(
+                id = i, kind = HistorySyncEngine.KIND_DOWNLOAD_RECORD, uid = "dl-$i", deviceId = "pc-other",
+                payload = "", deleted = false, clientUpdatedAt = i
+            )
+        }
+        // 排两页相同响应：若没有「游标未推进即停」防御，第二页也会被消费（死循环）
+        repeat(2) { transport.pullResponses += Result.success(SyncPullResult(items, lastSeq = 0)) }
+        assertEquals(HistorySyncEngine.SyncOutcome.DONE, HistorySyncEngine.syncOnce("test"))
+        assertEquals(1, transport.pullResponses.size) // 只消费了一页
+        assertEquals(0L, PanRouterSettings().syncCursor)
+    }
+
+    // ---------- 前提判定 ----------
+
+    @Test
     fun `not ready settings short circuit without touching transport`() = runBlocking {
         PanRouterSettings().historySyncEnabled = false
-        org.junit.Assert.assertFalse(HistorySyncEngine.syncOnce("test")) // 未执行
+        assertEquals(HistorySyncEngine.SyncOutcome.NOT_READY, HistorySyncEngine.syncOnce("test")) // 未执行
         assertTrue(transport.pushed.isEmpty())
         assertEquals(0L, PanRouterSettings().syncCursor)
     }
