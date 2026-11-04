@@ -139,6 +139,10 @@ tasks.named<ProcessResources>("processResources") {
 tasks.withType<Test> {
     useJUnit()
     jvmArgs("-Dfile.encoding=UTF-8", "-Dsun.jnu.encoding=UTF-8")
+    // 数据目录整体重定向到 build/：Log 门面、AppContext 等单例在测试里被触达时
+    // 只写构建产物目录，绝不污染真实用户目录（历史教训：GatewayTest 直写注册表、
+    // 引擎测试把「推送被拒」假错误写进真实 yunx-desktop.log 干扰过生产排障）
+    environment("YUNX_DESKTOP_DATA_DIR", layout.buildDirectory.dir("test-data").get().asFile.absolutePath)
 }
 
 // 本机工作目录含非 ASCII 字符时，Gradle 测试 worker 的 classpath 传递会乱码（测试类 ClassNotFound），

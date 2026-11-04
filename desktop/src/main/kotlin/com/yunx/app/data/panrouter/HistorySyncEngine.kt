@@ -136,9 +136,12 @@ object HistorySyncEngine {
         if (!syncing.compareAndSet(false, true)) return SyncOutcome.BUSY
         try {
             val settings = settingsProvider()
-            if (!settings.isSyncReady()) return SyncOutcome.NOT_READY
             val token = tokenProvider()
-            if (token.isNullOrBlank()) return SyncOutcome.NOT_READY
+            // 就绪判定走 tokenProvider 注入缝而非 PanRouterTokenStore 直连：
+            // 两者生产等价（默认实现即 TokenStore），但测试可注入，不隐性依赖真实加密密钥
+            if (!settings.historySyncEnabled || !settings.isConfigured() || token.isNullOrBlank()) {
+                return SyncOutcome.NOT_READY
+            }
             val stores = storesProvider()
             val transport = transportFactory(settings.baseUrl)
 

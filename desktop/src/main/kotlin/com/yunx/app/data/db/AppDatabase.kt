@@ -192,6 +192,18 @@ class AppDatabase private constructor(private val conn: Connection) {
                             it.execute("CREATE INDEX IF NOT EXISTS idx_${table}_sync_uid ON $table(syncUid)")
                         }
                     }
+                    // 迁移：重复实体归一按 link/url 找本地同实体行——pull 每条远端变更都要查一次，
+                    // 首次大积压同步（数千条 × 全表扫）会被线性放大，走索引
+                    runCatching {
+                        conn.createStatement().use {
+                            it.execute("CREATE INDEX IF NOT EXISTS idx_bookmark_link ON bookmark(link)")
+                        }
+                    }
+                    runCatching {
+                        conn.createStatement().use {
+                            it.execute("CREATE INDEX IF NOT EXISTS idx_link_history_url ON link_history(url)")
+                        }
+                    }
                     // 迁移：多账号（isPrimary / remark）。旧库逐表补列，已存在时忽略。
                     ACCOUNT_TABLES.forEach { table ->
                         runCatching {

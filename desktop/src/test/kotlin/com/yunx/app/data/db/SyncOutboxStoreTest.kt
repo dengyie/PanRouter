@@ -187,7 +187,7 @@ class SyncOutboxStoreTest {
 
     @Test
     fun `listByLinkForSync returns same-link rows ordered by createTime`() = runBlocking {
-        val (db, _) = newDb()
+        val (db, dir) = newDb()
         val bookmarks = db.bookmarkDao()
         bookmarks.insert(BookmarkEntity(link = "https://x/same", title = "b", syncUid = "u-b", createTime = 200))
         bookmarks.insert(BookmarkEntity(link = "https://x/same", title = "a", syncUid = "u-a", createTime = 100))
@@ -195,6 +195,24 @@ class SyncOutboxStoreTest {
         val rows = bookmarks.listByLinkForSync("https://x/same")
         assertEquals(listOf("u-a", "u-b"), rows.map { it.syncUid })
         assertEquals(listOf("a", "b"), rows.map { it.title })
+        // 重复归一的两条查找索引已随迁移建立
+        assertEquals(
+            1, rawCount(dir, "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='idx_bookmark_link'")
+        )
+    }
+
+    @Test
+    fun `listByUrlForSync returns same-url rows ordered by createTime`() = runBlocking {
+        val (db, dir) = newDb()
+        val histories = db.linkHistoryDao()
+        histories.insert(LinkHistoryEntity(url = "https://x/h", title = "y", syncUid = "lh-y", createTime = 300))
+        histories.insert(LinkHistoryEntity(url = "https://x/h", title = "x", syncUid = "lh-x", createTime = 150))
+        histories.insert(LinkHistoryEntity(url = "https://x/elsewhere", title = "z", syncUid = "lh-z", createTime = 10))
+        val rows = histories.listByUrlForSync("https://x/h")
+        assertEquals(listOf("lh-x", "lh-y"), rows.map { it.syncUid })
+        assertEquals(
+            1, rawCount(dir, "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='idx_link_history_url'")
+        )
     }
 
     // ---- 远端落地 SQL：按 uid 幂等覆盖、不记账、墓碑删行 ----
