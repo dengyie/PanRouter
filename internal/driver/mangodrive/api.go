@@ -1,0 +1,273 @@
+// OpenList(AList 社区版)REST v3 线协议封装。
+// 所有对 OpenList 的 HTTP 细节收敛在此文件;driver 与 transfer service 只依赖本类型。
+package mangodrive
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"net/http"
+	"net/url"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/dengyie/panrouter/internal/driver"
+	"github.com/dengyie/panrouter/internal/pkg/httpx"
+)
+
+// API 是带 token 的 OpenList 客户端。base 形如 https://drive.example.com 或
+// http://10.0.0.3:5244(内网直连,绕开 Cloudflare 隧道 100MB 请求体上限)。
+type API struct {
+	client *httpx.Client
+	base   string
+	token  string
+}
+
+func NewAPI(c *httpx.Client, base, token string) *API {
+	return &API{client: c, base: strings.TrimRight(base, "/"), token: token}
+}
+
+// Obj 是 /api/fs/get、/api/fs/list 返回的条目。
+type Obj struct {
+	Name     string `json:"name"`
+	Size     int64  `json:"size"`
+	IsDir    bool   `json:"is_dir"`
+	Modified string `json:"modified"`
+	Sign     string `json:"sign"`
+	RawURL   string `json:"raw_url"`
+	Provider string `json:"provider"`
+}
+
+type apiResp struct {
+	Code    int             `json:"code"`
+	Message string          `json:"message"`
+	Data    json.RawMessage `json:"data"`
+}
+
+// classifyMsg 把 OpenList 文案映射到契约错误类别。
+func classifyMsg(msg string) *driver.Error {
+	m := strings.ToLower(msg)
+	switch {
+	case strings.Contains(m, "token is invalidated"), strings.Contains(m, "token is expired"),
+		strings.Contains(m, "not logged in"), strings.Contains(m, "unauthorized"),
+		strings.Contains(m, "无效的令牌"), strings.Contains(m, "登录"):
+		return driver.NewErr(driver.KindAuthExpired, "Mango Drive 凭据已失效,请到账号页更新", nil)
+	case strings.Contains(m, "not found"), strings.Contains(m, "object not exist"),
+		strings.Contains(m, "not exist"), strings.Contains(m, "不存在"):
+		return driver.NewErr(driver.KindNotFound, "Mango Drive 路径不存在:"+msg, nil)
+	case strings.Contains(m, "limit"), strings.Contains(m, "too many"), strings.Contains(m, "频繁"):
+		return driver.NewErr(driver.KindRiskControl, "Mango Drive 限流:"+msg, nil)
+	default:
+		return driver.NewErr(driver.KindUpstream, "Mango Drive 接口异常:"+msg, nil)
+	}
+}
+
+// do 发送 JSON 请求并校验业务码;body 为 nil 时发空体。
+func (a *API) do(ctx context.Context, method, endpoint string, body any, out any) error {
+	var rd io.Reader
+	if body != nil {
+		b, err := json.Marshal(body)
+		if err != nil {
+			return fmt.Errorf("marshal request: %w", err)
+		}
+		rd = bytes.NewReader(b)
+	}
+	req, err := http.NewRequestWithContext(ctx, method, a.base+endpoint, rd)
+	if err != nil {
+		return driver.NewErr(driver.KindUpstream, "构造请求失败", err)
+	}
+	req.Header.Set("User-Agent", BrowserUA)
+	if body != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	if a.token != "" {
+		req.Header.Set("Authorization", a.token)
+	}
+	res, err := a.client.Do(req)
+	if err != nil {
+		return driver.NewErr(driver.KindUpstream, "Mango Drive 网络请求失败", err)
+	}
+	var resp apiResp
+	if len(res.Body) > 0 {
+		if err := json.Unmarshal(res.Body, &resp); err != nil {
+			return driver.NewErr(driver.KindInterfaceChanged, "Mango Drive 响应结构变化,解析失败", err)
+		}
+	}
+	if res.StatusCode == http.StatusUnauthorized {
+		return driver.NewErr(driver.KindAuthExpired, "Mango Drive 凭据已失效,请到账号页更新", nil)
+	}
+	if res.StatusCode >= 400 && resp.Message == "" {
+		return driver.NewErr(driver.KindUpstream, fmt.Sprintf("Mango Drive 响应异常:%d", res.StatusCode), nil)
+	}
+	if resp.Code != http.StatusOK {
+		msg := resp.Message
+		if msg == "" {
+			msg = strconv.Itoa(resp.Code)
+		}
+		return classifyMsg(msg)
+	}
+	if out != nil && len(resp.Data) > 0 {
+		if err := json.Unmarshal(resp.Data, out); err != nil {
+			return driver.NewErr(driver.KindInterfaceChanged, "Mango Drive 响应结构变化,解析失败", err)
+		}
+	}
+	return nil
+}
+
+// Login 用用户名密码换 token(供账号引导与凭据校验使用)。
+func (a *API) Login(ctx context.Context, username, password string) (string, error) {
+	var out struct {
+		Token string `json:"token"`
+	}
+	if err := a.do(ctx, http.MethodPost, "/api/auth/login",
+		map[string]string{"username": username, "password": password}, &out); err != nil {
+		return "", err
+	}
+	if out.Token == "" {
+		return "", driver.NewErr(driver.KindInterfaceChanged, "Mango Drive 登录响应缺少 token", nil)
+	}
+	return out.Token, nil
+}
+
+// Me 校验当前 token 是否有效,返回用户名。
+func (a *API) Me(ctx context.Context) (string, error) {
+	var out struct {
+		ID       int    `json:"id"`
+		Username string `json:"username"`
+	}
+	if err := a.do(ctx, http.MethodGet, "/api/me", nil, &out); err != nil {
+		return "", err
+	}
+	return out.Username, nil
+}
+
+// Get 读取单个路径的元数据(文件含 raw_url;目录 is_dir=true)。
+func (a *API) Get(ctx context.Context, p string) (*Obj, error) {
+	var out Obj
+	if err := a.do(ctx, http.MethodPost, "/api/fs/get",
+		map[string]any{"path": p, "password": ""}, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+// List 列目录(自动翻页,上界 maxListPages)。
+func (a *API) List(ctx context.Context, p string) ([]Obj, error) {
+	var all []Obj
+	for page := 1; page <= maxListPages; page++ {
+		var out struct {
+			Content []Obj `json:"content"`
+			Total   int   `json:"total"`
+		}
+		err := a.do(ctx, http.MethodPost, "/api/fs/list", map[string]any{
+			"path": p, "password": "", "page": page, "per_page": listPageSize, "refresh": false,
+		}, &out)
+		if err != nil {
+			return nil, err
+		}
+		all = append(all, out.Content...)
+		if len(out.Content) < listPageSize || page*listPageSize >= out.Total {
+			break
+		}
+	}
+	return all, nil
+}
+
+// Mkdir 创建目录(已存在视为成功)。
+func (a *API) Mkdir(ctx context.Context, p string) error {
+	err := a.do(ctx, http.MethodPost, "/api/fs/mkdir", map[string]string{"path": p}, nil)
+	if err != nil {
+		var de *driver.Error
+		if errors.As(err, &de) && de.Kind == driver.KindUpstream {
+			return nil // 已存在等幂等场景,交给后续 Put 报真实错误
+		}
+		return err
+	}
+	return nil
+}
+
+// Put 流式上传:PUT /api/fs/put,目标路径放在 File-Path 头(URL 编码)。
+// 不做整文件缓冲,内存占用与文件大小无关。
+func (a *API) Put(ctx context.Context, p string, size int64, r io.Reader) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodPut, a.base+"/api/fs/put", r)
+	if err != nil {
+		return driver.NewErr(driver.KindUpstream, "构造上传请求失败", err)
+	}
+	req.Header.Set("User-Agent", BrowserUA)
+	req.Header.Set("Authorization", a.token)
+	req.Header.Set("File-Path", url.PathEscape(p))
+	req.Header.Set("As-Task", "false")
+	req.Header.Set("Content-Type", "application/octet-stream")
+	// 上游长度未知(如 chunked)时保持 -1:走 chunked PUT,不设虚假 Content-Length。
+	if size > 0 {
+		req.ContentLength = size
+	}
+	res, err := a.client.Do(req)
+	if err != nil {
+		return driver.NewErr(driver.KindUpstream, "Mango Drive 上传失败", err)
+	}
+	var resp apiResp
+	if len(res.Body) > 0 {
+		if err := json.Unmarshal(res.Body, &resp); err != nil {
+			return driver.NewErr(driver.KindInterfaceChanged, "Mango Drive 上传响应结构变化", err)
+		}
+	}
+	if res.StatusCode >= 400 || (resp.Code != 0 && resp.Code != http.StatusOK) {
+		msg := resp.Message
+		if msg == "" {
+			msg = fmt.Sprintf("HTTP %d", res.StatusCode)
+		}
+		return classifyMsg(msg)
+	}
+	return nil
+}
+
+// OfflineTask 是离线下载任务。
+type OfflineTask struct {
+	ID       string `json:"id"`
+	Name     string `json:"name"`
+	State    int    `json:"state"`
+	Progress int    `json:"progress"`
+	Error    string `json:"error"`
+}
+
+// AddOffline 让 OpenList 侧(aria2)自己下载 URL 并落到 p。
+// 仅适用于不需要额外请求头的直链;需要 UA/Cookie/Referer 的源走 Put 通道。
+func (a *API) AddOffline(ctx context.Context, p string, urls []string) ([]OfflineTask, error) {
+	var out struct {
+		Tasks []OfflineTask `json:"tasks"`
+	}
+	err := a.do(ctx, http.MethodPost, "/api/fs/add_offline_download", map[string]any{
+		"path": p, "urls": urls, "tool": "aria2", "delete_policy": "delete_on_upload_succeed",
+	}, &out)
+	if err != nil {
+		return nil, err
+	}
+	return out.Tasks, nil
+}
+
+// Ping 探测服务活性(健康检查/凭据校验的轻量入口)。
+func (a *API) Ping(ctx context.Context) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, a.base+"/ping", nil)
+	if err != nil {
+		return driver.NewErr(driver.KindUpstream, "构造请求失败", err)
+	}
+	req.Header.Set("User-Agent", BrowserUA)
+	res, err := a.client.Do(req)
+	if err != nil {
+		return driver.NewErr(driver.KindUpstream, "Mango Drive 网络请求失败", err)
+	}
+	if res.StatusCode >= 400 {
+		return driver.NewErr(driver.KindUpstream, fmt.Sprintf("Mango Drive 响应异常:%d", res.StatusCode), nil)
+	}
+	return nil
+}
+
+// WithTimeout 返回带总超时的 ctx 包装(上传等长任务用调用方自带预算)。
+func WithTimeout(ctx context.Context, d time.Duration) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(ctx, d)
+}

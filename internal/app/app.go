@@ -3,6 +3,7 @@
 package app
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -14,6 +15,7 @@ import (
 	"github.com/dengyie/panrouter/internal/config"
 	"github.com/dengyie/panrouter/internal/driver"
 	"github.com/dengyie/panrouter/internal/driver/lanzou"
+	"github.com/dengyie/panrouter/internal/driver/mangodrive"
 	"github.com/dengyie/panrouter/internal/driver/quark"
 	"github.com/dengyie/panrouter/internal/pkg/breaker"
 	"github.com/dengyie/panrouter/internal/pkg/crypto"
@@ -26,9 +28,20 @@ import (
 )
 
 // driverFactories:网盘 ID → 构造函数。新增网盘 = 新 driver 包 + 此处一个条目 + config 一个键。
-var driverFactories = map[string]func(*httpx.Client) driver.Driver{
-	"quark":  func(c *httpx.Client) driver.Driver { return quark.New(c, "") },
-	"lanzou": func(c *httpx.Client) driver.Driver { return lanzou.New(c) },
+var driverFactories = map[string]func(context.Context, *httpx.Client, config.DriverCommon) (driver.Driver, error){
+	"quark": func(_ context.Context, c *httpx.Client, _ config.DriverCommon) (driver.Driver, error) {
+		return quark.New(c, ""), nil
+	},
+	"lanzou": func(_ context.Context, c *httpx.Client, _ config.DriverCommon) (driver.Driver, error) {
+		return lanzou.New(c), nil
+	},
+	"mangodrive": func(_ context.Context, c *httpx.Client, dc config.DriverCommon) (driver.Driver, error) {
+		d := mangodrive.New(c)
+		// 内网(EasyTier)通道:直连 OpenList,绕开 Cloudflare 隧道请求体上限。
+		d.InternalBase = dc.InternalBase
+		d.PublicBase = dc.PublicBase
+		return d, nil
+	},
 }
 
 type Options struct {
@@ -60,6 +73,7 @@ type App struct {
 	Accounts *service.AccountService
 	Relay    *service.Relay
 	Aria2    *service.Aria2
+	Transfer *service.Transfer
 	AES      *crypto.AES
 	Signer   *sign.Signer
 	Met      *metrics.Registry
@@ -128,7 +142,12 @@ func Build(o Options) (*App, error) {
 			return nil, fmt.Errorf("stream client %s: %w", id, err)
 		}
 		apiClients[id], streamClients[id] = apiCl, streamCl
-		driversList = append(driversList, factory(apiCl))
+		dd, derr := factory(context.Background(), apiCl, dc)
+		if derr != nil {
+			_ = store.Close()
+			return nil, fmt.Errorf("driver %s: %w", id, derr)
+		}
+		driversList = append(driversList, dd)
 	}
 	for _, ex := range o.ExtraDrivers {
 		id := ex.Driver.ID()
@@ -153,10 +172,15 @@ func Build(o Options) (*App, error) {
 		_ = store.Close()
 		return nil, fmt.Errorf("aria2 client: %w", err)
 	}
+	transfer, err := service.NewTransfer(cfgp, resolver, streamClients, store, aes, met, o.Logger)
+	if err != nil {
+		_ = store.Close()
+		return nil, fmt.Errorf("transfer: %w", err)
+	}
 
 	return &App{
 		Cfg: cfgp, Store: store, Registry: reg, Resolver: resolver, Accounts: accSvc,
-		Relay: relay, Aria2: aria2, AES: aes, Signer: signer, Met: met, Limiter: lim,
+		Relay: relay, Aria2: aria2, Transfer: transfer, AES: aes, Signer: signer, Met: met, Limiter: lim,
 		Log: o.Logger, apiClients: apiClients, streamClients: streamClients,
 	}, nil
 }

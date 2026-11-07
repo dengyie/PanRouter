@@ -70,7 +70,7 @@ func main() {
 
 	deps := api.Deps{
 		Version: version, Cfg: a.Cfg, Resolver: a.Resolver, Relay: a.Relay, Aria2: a.Aria2,
-		Accounts: a.Accounts, Store: a.Store, AES: a.AES, Signer: a.Signer,
+		Accounts: a.Accounts, Store: a.Store, AES: a.AES, Signer: a.Signer, Transfer: a.Transfer,
 		Log: a.Log, Met: a.Met, WebFS: webFS,
 	}
 	srv := &http.Server{

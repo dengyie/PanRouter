@@ -25,6 +25,7 @@ type Deps struct {
 	Resolver *service.Resolver
 	Relay    *service.Relay
 	Aria2    *service.Aria2
+	Transfer *service.Transfer
 	Accounts *service.AccountService
 	Store    *repo.Store
 	AES      *crypto.AES
@@ -72,6 +73,9 @@ func Router(d Deps) http.Handler {
 			pr.Post("/downloads", d.handlePushDownload)
 			pr.Get("/downloads", d.handleListDownloads)
 			pr.Get("/downloads/{gid}", d.handleDownloadStatus)
+			pr.Post("/transfer/mangodrive", d.handleTransferMangodrive)
+			pr.Get("/transfer", d.handleListTransfers)
+			pr.Get("/transfer/{id}", d.handleGetTransfer)
 			pr.Post("/sync", d.handlePushSync)
 			pr.Get("/sync", d.handlePullSync)
 		})

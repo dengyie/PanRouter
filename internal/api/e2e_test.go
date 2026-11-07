@@ -184,7 +184,7 @@ func newE2E(t *testing.T, sameHost bool) *e2eEnv {
 
 	deps := Deps{
 		Version: "e2e", Cfg: a.Cfg, Resolver: a.Resolver, Relay: a.Relay, Aria2: a.Aria2,
-		Accounts: a.Accounts, Store: a.Store, AES: a.AES, Signer: a.Signer,
+		Accounts: a.Accounts, Store: a.Store, AES: a.AES, Signer: a.Signer, Transfer: a.Transfer,
 		Log: a.Log, Met: a.Met, WebFS: nil,
 	}
 	ts := httptest.NewServer(Router(deps))

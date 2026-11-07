@@ -41,12 +41,30 @@ type DriverCommon struct {
 	Proxy         string   `mapstructure:"proxy"`
 	LimitQPS      float64  `mapstructure:"limit_qps"`
 	DownloadConc  int      `mapstructure:"download_concurrency"`
+	// InternalBase 可选:同存储的内网(EasyTier)API 基址。私有盘(如 Mango Drive)
+	// 配置后走内网直连,避开 Cloudflare 隧道的请求体上限。
+	InternalBase string `mapstructure:"internal_base"`
+	// PublicBase 可选:对外域名基址,用于还原相对形态的直链。
+	PublicBase string `mapstructure:"public_base"`
 }
 
 type Aria2 struct {
 	Endpoint string `mapstructure:"endpoint"`
 	Secret   string `mapstructure:"secret"`
 	SameHost bool   `mapstructure:"same_host"`
+}
+
+// Transfer 是云对云转存的落点配置(Mango Drive / OpenList)。
+type Transfer struct {
+	// Endpoint OpenList 服务基址。内网(EasyTier)地址优先:Cloudflare 隧道
+	// 对请求体有上限,大文件 PUT 必须绕开。
+	Endpoint string `mapstructure:"endpoint"`
+	// Token OpenList API Token(Authorization 头原值)。
+	Token string `mapstructure:"token"`
+	// DestDir 默认落盘目录。
+	DestDir string `mapstructure:"dest_dir"`
+	// MaxBytes 单文件上限;0 = 默认 64GiB,负值 = 不限。
+	MaxBytes int64 `mapstructure:"max_bytes"`
 }
 
 type Log struct {
@@ -60,6 +78,7 @@ type Config struct {
 	Drivers      map[string]DriverCommon `mapstructure:"drivers"`       // 以网盘 ID 为键;新增网盘 = 加一个键 + main 工厂注册
 	Aria2        Aria2                   `mapstructure:"aria2"`
 	Log          Log                     `mapstructure:"log"`
+	Transfer     Transfer                `mapstructure:"transfer"`
 }
 
 // 默认凭据常量:非 loopback 监听时若仍是默认值,main 会拒绝启动(安全守卫)。
@@ -82,13 +101,19 @@ func Default() *Config {
 	c.Auth.APIToken = DefaultAPIToken
 	c.Auth.JWTSecret = DefaultJWTSecret
 	c.DomainRoutes = map[string][]string{
-		"quark":  {"pan.quark.cn"},
-		"lanzou": {"lanzou.com", "lanzouw.com", "lanzoui.com", "lanzoue.com", "lanzouf.com", "lanzoa.com", "lanzoub.com", "lanzouc.com", "lanzoud.com", "lanzouv.com", "lanzoux.com", "lansov.com", "lanzn.com", "lanzouq.com", "lanzouy.com", "lanzouu.com"},
+		"quark":      {"pan.quark.cn"},
+		"mangodrive": {"drive.example.com"},
+		"lanzou":     {"lanzou.com", "lanzouw.com", "lanzoui.com", "lanzoue.com", "lanzouf.com", "lanzoa.com", "lanzoub.com", "lanzouc.com", "lanzoud.com", "lanzouv.com", "lanzoux.com", "lansov.com", "lanzn.com", "lanzouq.com", "lanzouy.com", "lanzouu.com"},
 	}
 	c.Drivers = map[string]DriverCommon{
 		"quark": {
 			Enabled: true, LimitQPS: 2, DownloadConc: 3,
 			RedirectAllow: []string{".quark.cn", ".quarkcdn.cn", ".uc.cn"},
+		},
+		"mangodrive": {
+			// 私有盘:对外只暴露"列目录/提链",写盘走 transfer 编排,并发与限频放宽。
+			Enabled: true, LimitQPS: 10, DownloadConc: 8,
+			RedirectAllow: []string{"drive.example.com"},
 		},
 		"lanzou": {
 			Enabled: true, LimitQPS: 5, DownloadConc: 3,
@@ -98,6 +123,8 @@ func Default() *Config {
 	c.Aria2.Endpoint = "http://127.0.0.1:6800/jsonrpc"
 	c.Aria2.SameHost = true
 	c.Log.Level = "info"
+	c.Transfer.DestDir = "/pool/panrouter"
+	c.Transfer.MaxBytes = 64 << 30
 	return c
 }
 
@@ -193,6 +220,9 @@ func validateReload(old, next *Config) error {
 		if _, ok := old.Drivers[id]; !ok {
 			return fmt.Errorf("driver %q registration is startup-only; restart required", id)
 		}
+	}
+	if !reflect.DeepEqual(old.Transfer, next.Transfer) {
+		return fmt.Errorf("transfer settings are startup-only; restart required")
 	}
 	return nil
 }
