@@ -126,6 +126,13 @@ func (t *TransferTask) finish(state, errMsg, hint string) {
 	t.Error = errMsg
 	t.Hint = hint
 	t.EndedAt = time.Now()
+	// 成功即 Done=Size:done 是搬运计数,终值不落会让轮询永远停在 0%。
+	// Size 在此覆盖为实际字节(解析期登记的可能是 0 或过期值)。
+	if state == "done" {
+		if n := atomic.LoadInt64(&t.done); n > 0 {
+			t.Size = n
+		}
+	}
 	if t.met != nil {
 		t.met.Inc("panrouter_transfer_total", map[string]string{"state": state, "channel": t.Channel})
 	}
