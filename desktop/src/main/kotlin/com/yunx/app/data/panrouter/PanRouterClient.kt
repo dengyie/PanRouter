@@ -183,6 +183,75 @@ class PanRouterClient(
             }.mapCatching { parseSyncPull(jsonBody(it)) }
         }
 
+    // ---------- 自建存储端点（OpenList 兼容；auth 端点） ----------
+
+    /**
+     * `GET /api/v1/storage` → 服务端当前接入的存储端点信息。
+     *
+     * 桌面端不内置部署域名/容量:端点的对外基址(`public_base`)、默认落盘目录全部由
+     * 服务端配置决定(schema 见服务端 `internal/api/storage.go`)。`enabled=false`
+     * 表示服务端没接端点,调用方应隐藏入口而不是猜一个地址。
+     */
+    suspend fun storageInfo(): Result<StorageInfo> = withContext(Dispatchers.IO) {
+        request {
+            val builder = Request.Builder().url("${baseUrlProvider()}/api/v1/storage").get()
+            tokenProvider()?.takeIf { it.isNotBlank() }?.let { builder.header("Authorization", "Bearer $it") }
+            builder.build()
+        }.mapCatching { parseStorageInfo(jsonBody(it)) }
+    }
+
+    // ---------- 云对云转存（M4；auth 端点） ----------
+
+    /**
+     * `POST /api/v1/transfer/mangodrive` → 202 + 任务句柄。
+     * 服务端立刻返回「已受理」，字节搬运在服务端后台进行（本机可关）。
+     */
+    suspend fun submitTransfer(req: TransferRequest): Result<TransferTask> =
+        withContext(Dispatchers.IO) {
+            request {
+                val body = JSONObject().put("source_url", req.sourceUrl)
+                if (req.pwd.isNotBlank()) body.put("pwd", req.pwd)
+                if (req.fid.isNotBlank()) body.put("fid", req.fid)
+                if (req.destDir.isNotBlank()) body.put("dest_dir", req.destDir)
+                if (req.name.isNotBlank()) body.put("name", req.name)
+                if (req.channel.isNotBlank()) body.put("channel", req.channel)
+                if (req.ua.isNotBlank()) body.put("ua", req.ua)
+                authedRequest("${baseUrlProvider()}/api/v1/transfer/mangodrive", body)
+            }.mapCatching { parseTransferTask(jsonBody(it).optJSONObject("task") ?: JSONObject()) }
+        }
+
+    /** `GET /api/v1/transfer` → 服务端在内存里保留的任务（近期，最多 200 条） */
+    suspend fun listTransfers(): Result<List<TransferTask>> =
+        withContext(Dispatchers.IO) {
+            request {
+                val builder = Request.Builder()
+                    .url("${baseUrlProvider()}/api/v1/transfer")
+                    .get()
+                tokenProvider()?.takeIf { it.isNotBlank() }?.let { builder.header("Authorization", "Bearer $it") }
+                builder.build()
+            }.mapCatching { body ->
+                val arr = jsonBody(body).optJSONArray("tasks")
+                val out = ArrayList<TransferTask>(if (arr == null) 0 else arr.length())
+                for (i in 0 until (arr?.length() ?: 0)) {
+                    out.add(parseTransferTask(arr!!.optJSONObject(i) ?: JSONObject()))
+                }
+                out
+            }
+        }
+
+    /** `GET /api/v1/transfer/{id}` → 单任务进度（路径段编码：URLEncoder 的 `+` 在 path 里是字面加号，需转 %20） */
+    suspend fun transferTask(id: String): Result<TransferTask> =
+        withContext(Dispatchers.IO) {
+            request {
+                val seg = java.net.URLEncoder.encode(id, "UTF-8").replace("+", "%20")
+                val builder = Request.Builder()
+                    .url("${baseUrlProvider()}/api/v1/transfer/$seg")
+                    .get()
+                tokenProvider()?.takeIf { it.isNotBlank() }?.let { builder.header("Authorization", "Bearer $it") }
+                builder.build()
+            }.mapCatching { parseTransferTask(jsonBody(it).optJSONObject("task") ?: JSONObject()) }
+        }
+
     // ---------- 底层执行 ----------
 
     /** 构造 POST JSON 请求；已配置 token 时带 `Authorization: Bearer`（optionalAuth 端点游客可调） */

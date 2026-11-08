@@ -18,6 +18,9 @@ import com.yunx.app.data.download.DownloadManager
 import com.yunx.app.data.download.DownloadPlatform
 import com.yunx.app.data.download.DownloadSource
 import com.yunx.app.data.panrouter.PanRouterError
+import com.yunx.app.data.panrouter.PanRouterClient
+import com.yunx.app.data.panrouter.TransferRequest
+import com.yunx.app.data.panrouter.TransferTask
 import com.yunx.app.data.panrouter.PanRouterResolveGateway
 import com.yunx.app.data.panrouter.PanRouterSettings
 import com.yunx.app.data.panrouter.RemoteBatchItem
@@ -144,7 +147,12 @@ class ResolveViewModel(
      * PanRouter 服务端解析网关（null = 未启用集成）：非空且配置开启时，覆盖平台优先走服务端解析，
      * 失败按策略回落本地链（docs/INTEGRATION-PANROUTER.md §3.2）。
      */
-    private val panRouterGateway: PanRouterResolveGateway? = null
+    private val panRouterGateway: PanRouterResolveGateway? = null,
+    /**
+     * M4 私有盘转存客户端（null = 未配置 PanRouter，分享页不显示「转存到 Mango Drive」）。
+     * 只在服务端解析模式下可用：源链接就是服务端的分享 URL，服务端自己取链更省事。
+     */
+    private val mangoTransferClient: PanRouterClient? = null
 ) : ViewModel() {
 
     init {
@@ -196,6 +204,22 @@ class ResolveViewModel(
     var saveMessage by mutableStateOf<String?>(null)
         private set
 
+    /** M4.3 私有盘转存中（服务端云对云搬运：分享页「转存到 Mango Drive」） */
+    var isTransferringToMango by mutableStateOf(false)
+        private set
+
+    /** M4.3 私有盘转存结果消息（Toast；与服务端云盘复用同一个 Snackbar 通道） */
+    var mangoTransferMessage by mutableStateOf<String?>(null)
+        private set
+
+    /** 当前分享在服务端解析模式下能否直接转存进私有盘（需要远端会话 + 客户端注入） */
+    val canTransferToMango: Boolean
+        get() = isRemote && mangoTransferClient != null
+
+    fun consumeMangoTransferMessage() {
+        mangoTransferMessage = null
+    }
+
     /** 当前分享是否支持转存（夸克 / UC / 迅雷 / 百度 / 139 / 123 / 115 / 光鸭） */
     val canSave: Boolean
         get() = currentPlatform == SharePlatform.QUARK ||
@@ -241,9 +265,13 @@ class ResolveViewModel(
 
     /** 请求转存：记录目标文件并打开目录选择弹窗 */
     fun requestSave(file: ShareFile) {
-        // 服务端解析模式：直链由服务端账号池提链，本地无需（也不该）转存
+        // 服务端解析模式：本地不持有上游账号，改为提交「云对云转存到私有盘」（M4.3）
         if (isRemote) {
-            downloadError = "云端解析模式无需转存，直接下载即可"
+            if (canTransferToMango) {
+                transferToMangoDrive(file)
+            } else {
+                downloadError = "云端解析模式无需转存，直接下载即可"
+            }
             return
         }
         // 游客模式只开放列目录：转存需要登录，直接给提示，别让用户进到空的目录选择
@@ -262,6 +290,49 @@ class ResolveViewModel(
 
     fun consumeSaveMessage() {
         saveMessage = null
+    }
+
+    /**
+     * M4.3 一键转存到私有盘（Mango Drive）：把服务端解析出的文件交给服务端
+     * 云对云搬运（服务端拉上游 → 写私有盘），本机不落字节、关掉客户端也会继续。
+     *
+     * 服务端 transfer 需要「源目录 URL + fid」定位单个文件：
+     * 普通远端会话的源就是用户粘贴的分享链接本身；批量会话按 fid 前缀路由回所属分享。
+     */
+    /** 提交单文件转存（单个/批量共用；服务端已受理即成功，返回 null 表示无法定位源）。 */
+    private suspend fun submitMangoTransfer(file: ShareFile, destDir: String = ""): TransferTask? {
+        val client = mangoTransferClient ?: return null
+        val sourceUrl = remoteBatchContext[file.fid]?.first ?: currentLink.orEmpty()
+        if (sourceUrl.isBlank()) return null
+        val fid = if (remoteBatchContext[file.fid] != null) file.fid.substringAfter(':') else file.fid
+        val pwd = remoteBatchContext[file.fid]?.second ?: currentPwd.orEmpty()
+        return client.submitTransfer(
+            TransferRequest(
+                sourceUrl = sourceUrl,
+                pwd = pwd,
+                fid = fid,
+                destDir = destDir,
+                name = file.fname.substringAfterLast('/')
+            )
+        ).getOrNull()
+    }
+
+    fun transferToMangoDrive(file: ShareFile, destDir: String = "") {
+        viewModelScope.launch {
+            isTransferringToMango = true
+            try {
+                val task = submitMangoTransfer(file, destDir)
+                mangoTransferMessage = if (task == null) {
+                    "缺少分享链接，无法转存"
+                } else {
+                    "已受理转存：${task.fileName.ifBlank { task.id }}（服务端搬运中）"
+                }
+            } catch (e: Exception) {
+                mangoTransferMessage = e.message ?: "转存失败"
+            } finally {
+                isTransferringToMango = false
+            }
+        }
     }
 
     /** 转存到网盘指定目录（保存成功自动关闭弹窗；夸克 / 迅雷 / 百度分平台实现） */
@@ -465,7 +536,11 @@ class ResolveViewModel(
     /** 批量转存到网盘根目录（夸克 / 迅雷 / 百度分平台；仅支持转存的平台） */
     fun batchSaveToCloud() {
         if (isRemote) {
-            downloadError = "云端解析模式无需转存，直接下载即可"
+            if (canTransferToMango) {
+                batchTransferToMango()
+            } else {
+                downloadError = "云端解析模式无需转存，直接下载即可"
+            }
             return
         }
         val files = _selected.toList()
@@ -541,6 +616,33 @@ class ResolveViewModel(
                 }
                 if (!interrupted) {
                     downloadError = if (okCount > 0) "已转存 $okCount 项到${platformName()}" else "转存失败"
+                }
+                exitMultiSelect()
+            } finally {
+                isBatchWorking = false
+                batchCancelRequested = false
+            }
+        }
+    }
+
+    /** M4.3 批量云对云转存到私有盘：逐项提交，服务端异步搬运（受理成功即计数）。 */
+    fun batchTransferToMango() {
+        val files = _selected.toList()
+        if (files.isEmpty()) return
+        viewModelScope.launch {
+            isBatchWorking = true
+            batchCancelRequested = false
+            try {
+                var ok = 0
+                var failed = 0
+                for (file in files) {
+                    if (batchCancelRequested) break
+                    if (submitMangoTransfer(file) != null) ok++ else failed++
+                }
+                mangoTransferMessage = if (ok > 0) {
+                    "已受理 $ok 项转存" + if (failed > 0) "，$failed 项失败" else ""
+                } else {
+                    "转存失败"
                 }
                 exitMultiSelect()
             } finally {
@@ -2473,7 +2575,9 @@ class ResolveViewModel(
         private val multiAccountDownloadProvider: () -> Boolean = { settings.multiAccountDownload },
         private val multiSourceDownloadProvider: () -> Boolean = { settings.multiSourceActive() },
         /** PanRouter 服务端解析网关（null = 未启用集成）；MainScreen 传 PanRouterHub.gateway */
-        private val panRouterGateway: PanRouterResolveGateway? = null
+        private val panRouterGateway: PanRouterResolveGateway? = null,
+        /** M4 私有盘转存客户端（null = 未配置 PanRouter）；MainScreen 传 PanRouterHub.client */
+        private val mangoTransferClient: PanRouterClient? = null
     ) : ViewModelProvider.Factory {
         @Suppress("UNCHECKED_CAST")
         override fun <T : ViewModel> create(modelClass: KClass<T>, extras: CreationExtras): T {
@@ -2497,7 +2601,8 @@ class ResolveViewModel(
                 noSaveDownloadProvider,
                 multiAccountDownloadProvider,
                 multiSourceDownloadProvider,
-                panRouterGateway
+                panRouterGateway,
+                mangoTransferClient
             ) as T
         }
     }

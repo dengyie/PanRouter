@@ -293,8 +293,10 @@ fun ShareDetailScreen(
                             checkBaiduLimit(file) { viewModel.fetchDownloadLink(file) }
                         }
                     },
-                    // 仅夸克分享显示转存按钮（多选时隐藏）
-                    onSave = if (!viewModel.multiSelectMode && viewModel.canSave) {
+                    // 网盘平台分享转存到本平台；服务端解析模式下转为「云对云转存到自建云盘」（M4.3）
+                    onSave = if (!viewModel.multiSelectMode &&
+                        (viewModel.canSave || viewModel.canTransferToMango)
+                    ) {
                         { viewModel.requestSave(file) }
                     } else {
                         null
@@ -334,8 +336,8 @@ fun ShareDetailScreen(
             MultiSelectBar(
                 count = viewModel.selected.size,
                 actions = buildList {
-                    // 转存仅夸克分享支持
-                    if (viewModel.canSave) {
+                    // 转存：网盘平台转存到本平台；服务端解析模式下批量转存到自建云盘
+                    if (viewModel.canSave || viewModel.canTransferToMango) {
                         add(
                             MultiSelectAction("转存", Icons.Outlined.SaveAlt, MaterialTheme.colorScheme.primary) {
                                 viewModel.batchSaveToCloud()

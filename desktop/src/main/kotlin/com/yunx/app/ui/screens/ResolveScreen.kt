@@ -213,6 +213,15 @@ fun ResolveScreen(
         }
     }
 
+    // M4.3 私有盘转存结果（服务端受理成功 / 失败原因）
+    val mangoTransferMessage = viewModel.mangoTransferMessage
+    LaunchedEffect(mangoTransferMessage) {
+        mangoTransferMessage?.let {
+            SnackbarController.show(it)
+            viewModel.consumeMangoTransferMessage()
+        }
+    }
+
     Box(modifier = modifier.fillMaxSize()) {
         // 状态切换过渡：输入态/加载/详情/错误之间平滑淡入淡出 + 轻微位移
         AnimatedContent(

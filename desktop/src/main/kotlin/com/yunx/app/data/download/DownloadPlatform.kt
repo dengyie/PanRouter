@@ -20,6 +20,8 @@ object DownloadPlatform {
     const val ILANZOU = "ilanzou"
     /** 蓝奏云 */
     const val LANZOU = "lanzou"
+    /** Mango Drive 私有聚合云盘（PanRouter 服务端 mangodrive 驱动；仅服务端提链，本机不直连网盘） */
+    const val MANGO = "mango"
     /** 磁力链接（BT）：只能交给 Gopeed 引擎，内置分片下载器不支持 */
     const val MAGNET = "magnet"
     /** ed2k 链接：同样只有 Gopeed 引擎里有实现，内置分片下载器不支持 */

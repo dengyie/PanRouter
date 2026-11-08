@@ -37,6 +37,7 @@ object ResolveRouter {
     fun downloadPlatformFor(pan: String): String = when (pan) {
         "quark" -> DownloadPlatform.QUARK
         "lanzou" -> DownloadPlatform.LANZOU
+        "mangodrive" -> DownloadPlatform.MANGO
         else -> DownloadPlatform.GENERIC
     }
 

@@ -1,0 +1,443 @@
+package com.yunx.app.ui.viewmodel
+
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateListOf
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.setValue
+import androidx.lifecycle.ViewModel
+import androidx.lifecycle.ViewModelProvider
+import androidx.lifecycle.viewModelScope
+import androidx.lifecycle.viewmodel.CreationExtras
+import com.yunx.app.data.download.DownloadManager
+import com.yunx.app.data.download.DownloadPlatform
+import com.yunx.app.data.mangodrive.MangoDriveClient
+import com.yunx.app.data.network.model.DownloadLink
+import com.yunx.app.data.network.model.ShareFile
+import com.yunx.app.data.panrouter.RemoteLinkResult
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.launch
+import kotlin.reflect.KClass
+
+/** Mango Drive 浏览 UI 状态（根目录 dirPath = "/"）。 */
+sealed interface MangoCloudUiState {
+    data object Loading : MangoCloudUiState
+    data class Loaded(
+        val files: List<ShareFile>,
+        /** 从根到当前目录的目录名（不含根） */
+        val pathNames: List<String>,
+        /** 当前目录的存储路径（根 = "/"） */
+        val dirPath: String
+    ) : MangoCloudUiState
+    data class Error(val message: String) : MangoCloudUiState
+}
+
+/**
+ * Mango Drive 私有聚合云盘浏览 ViewModel（镜像蓝奏云个人盘浏览）。
+ *
+ * 认证不靠 Cookie：服务端 mangodrive 驱动持有 OpenList token，桌面端只需 PanRouter 的
+ * baseUrl + api_token（未配置时 resolve 会 401，界面给出明确提示）。
+ * 目录按存储路径逐级下钻（path 栈），每级都向服务端 resolve 一次文件列表。
+ */
+class MangoCloudViewModel(
+    private val client: MangoDriveClient,
+    private val downloadManager: DownloadManager
+) : ViewModel() {
+
+    private val _uiState = MutableStateFlow<MangoCloudUiState>(MangoCloudUiState.Loading)
+    val uiState: StateFlow<MangoCloudUiState> = _uiState.asStateFlow()
+
+    var actionFile by mutableStateOf<ShareFile?>(null)
+        private set
+    var cloudMessage by mutableStateOf<String?>(null)
+        private set
+    var isOperating by mutableStateOf(false)
+        private set
+    var folderProgress by mutableStateOf<String?>(null)
+        private set
+    var refreshing by mutableStateOf(false)
+        private set
+    var downloadTriggered by mutableStateOf(0)
+        private set
+    var multiSelectMode by mutableStateOf(false)
+        private set
+
+    private val _selected = mutableStateListOf<ShareFile>()
+    val selected: List<ShareFile> get() = _selected
+
+    var downloadLink by mutableStateOf<DownloadLink?>(null)
+        private set
+
+    /** 当前待确认下载的保存目录（空串 = 跟随全局设置）；下载弹窗展示用 */
+    var pendingSaveDir by mutableStateOf("")
+        private set
+
+    private var pendingDownload: PendingDownload? = null
+    private var downloadCancelRequested = false
+
+    private val dirStack = ArrayDeque<String>()
+    private val nameStack = ArrayDeque<String>()
+
+    init {
+        loadRoot()
+    }
+
+    // ---------- 目录浏览 ----------
+
+    fun loadRoot() {
+        dirStack.clear()
+        nameStack.clear()
+        load("/", emptyList())
+    }
+
+    fun openFolder(file: ShareFile) {
+        if (!file.isdir) return
+        val child = childPath(currentPath(), file.fname)
+        dirStack.addLast(child)
+        nameStack.addLast(file.fname)
+        load(child, nameStack.toList())
+    }
+
+    fun back() {
+        if (nameStack.isEmpty()) {
+            loadRoot()
+            return
+        }
+        dirStack.removeLast()
+        nameStack.removeLast()
+        load(dirStack.lastOrNull() ?: "/", nameStack.toList())
+    }
+
+    fun navigateToLevel(level: Int) {
+        while (nameStack.size > level) {
+            dirStack.removeLast()
+            nameStack.removeLast()
+        }
+        load(dirStack.lastOrNull() ?: "/", nameStack.toList())
+    }
+
+    /** 下拉刷新 */
+    fun refresh() {
+        val current = uiState.value
+        if (current !is MangoCloudUiState.Loaded) {
+            loadRoot()
+            return
+        }
+        refreshing = true
+        viewModelScope.launch {
+            try {
+                _uiState.value = MangoCloudUiState.Loaded(
+                    files = listFiles(current.dirPath),
+                    pathNames = current.pathNames,
+                    dirPath = current.dirPath
+                )
+            } catch (e: Exception) {
+                cloudMessage = e.message ?: "刷新失败"
+            } finally {
+                refreshing = false
+            }
+        }
+    }
+
+    private fun currentPath(): String =
+        (uiState.value as? MangoCloudUiState.Loaded)?.dirPath ?: "/"
+
+    private fun load(path: String, pathNames: List<String>) {
+        _uiState.value = MangoCloudUiState.Loading
+        viewModelScope.launch {
+            _uiState.value = try {
+                MangoCloudUiState.Loaded(listFiles(path), pathNames, path)
+            } catch (e: Exception) {
+                MangoCloudUiState.Error(e.message ?: "加载失败")
+            }
+        }
+    }
+
+    /** 服务端列目录 → 本地 ShareFile（目录在前，同类按名称排序；服务端已按名称排序，这里只兜底） */
+    private suspend fun listFiles(path: String): List<ShareFile> {
+        val result = client.listDir(path).getOrThrow()
+        return result.files.map { item ->
+            ShareFile(
+                fid = item.fid,
+                fname = item.name,
+                fsize = item.size.coerceAtLeast(-1L),
+                isdir = item.isDir,
+                // 私有盘没有分享目录层级：父目录用 path 自身记录，fidToken 留空
+                pdirFid = path,
+                fidToken = ""
+            )
+        }.sortedWith(compareByDescending<ShareFile> { it.isdir }.thenBy { it.fname })
+    }
+
+    // ---------- 多选 ----------
+
+    fun enterMultiSelect(file: ShareFile) {
+        multiSelectMode = true
+        _selected.clear()
+        _selected.add(file)
+    }
+
+    fun toggleSelect(file: ShareFile) {
+        if (_selected.contains(file)) _selected.remove(file) else _selected.add(file)
+    }
+
+    fun toggleSelectAll(files: List<ShareFile>) {
+        if (_selected.size == files.size) _selected.clear()
+        else {
+            _selected.clear()
+            _selected.addAll(files)
+        }
+    }
+
+    fun exitMultiSelect() {
+        multiSelectMode = false
+        _selected.clear()
+    }
+
+    fun openActions(file: ShareFile) {
+        actionFile = file
+    }
+
+    fun dismissActions() {
+        actionFile = null
+    }
+
+    fun consumeMessage() {
+        cloudMessage = null
+    }
+
+    fun consumeDownloadTriggered() {
+        downloadTriggered = 0
+    }
+
+    fun cancelDownload() {
+        downloadCancelRequested = true
+    }
+
+    // ---------- 下载 ----------
+
+    /** 下载文件：向服务端取直链 → 弹下载确认弹窗（确认后入队） */
+    fun downloadFile() = beginDownload("")
+
+    /** 下载到指定目录：单次覆盖保存目录，不改全局设置 */
+    fun downloadFileTo(saveDir: String) = beginDownload(saveDir)
+
+    private fun beginDownload(saveDir: String) {
+        val file = actionFile ?: return
+        viewModelScope.launch {
+            isOperating = true
+            try {
+                val link = client.link(currentPath(), file.fid).getOrThrow()
+                val url = downloadUrlOf(link)
+                val headers = downloadHeadersOf(link)
+                pendingSaveDir = saveDir
+                pendingDownload = PendingDownload(
+                    url = url,
+                    fileName = file.fname.ifBlank { link.fileName },
+                    size = if (link.size > 0) link.size else file.fsize,
+                    saveDir = saveDir,
+                    headers = headers
+                )
+                downloadLink = DownloadLink(
+                    fid = link.fid,
+                    filename = file.fname.ifBlank { link.fileName },
+                    downloadUrl = url,
+                    size = if (link.size > 0) link.size else file.fsize
+                )
+            } catch (e: Exception) {
+                cloudMessage = e.message ?: "获取直链失败"
+            } finally {
+                isOperating = false
+            }
+        }
+    }
+
+    /** 下载弹窗确认：用已生成的直链入队（平台 MANGO，线程数跟「按平台设置」） */
+    fun startDownload() {
+        val pd = pendingDownload ?: return
+        downloadLink = null
+        pendingDownload = null
+        pendingSaveDir = ""
+        viewModelScope.launch {
+            isOperating = true
+            try {
+                downloadManager.enqueue(
+                    url = pd.url,
+                    fileName = pd.fileName,
+                    size = pd.size,
+                    platform = DownloadPlatform.MANGO,
+                    headers = pd.headers,
+                    saveDir = pd.saveDir
+                )
+                cloudMessage = "已加入下载：${pd.fileName}"
+                actionFile = null
+                downloadTriggered++
+            } catch (e: Exception) {
+                cloudMessage = e.message ?: "下载失败"
+            } finally {
+                isOperating = false
+            }
+        }
+    }
+
+    fun dismissDownloadDialog() {
+        downloadLink = null
+        pendingDownload = null
+        pendingSaveDir = ""
+    }
+
+    /** 递归列出文件夹内全部文件：[相对前缀文件名] → 绝对 fid（只认 fid，路径由服务端解析） */
+    private suspend fun collectFiles(
+        dirPath: String,
+        prefix: String,
+        out: MutableList<Pair<String, String>>,
+        depth: Int
+    ) {
+        if (depth > 8) return
+        for (item in listFiles(dirPath)) {
+            val rel = if (prefix.isEmpty()) item.fname else "$prefix/${item.fname}"
+            if (item.isdir) {
+                collectFiles(childPath(dirPath, item.fname), rel, out, depth + 1)
+            } else {
+                out.add(rel to item.fid)
+            }
+        }
+    }
+
+    private suspend fun enqueueEach(
+        tasks: List<Pair<String, String>>,
+        saveDir: String
+    ): Int {
+        var ok = 0
+        tasks.forEachIndexed { index, (rel, fid) ->
+            if (downloadCancelRequested) return@forEachIndexed
+            folderProgress = "正在加入下载 ${index + 1}/${tasks.size}"
+            runCatching {
+                val link = client.link(client.parentDirOf(fid), fid).getOrThrow()
+                downloadManager.enqueue(
+                    url = downloadUrlOf(link),
+                    fileName = rel,
+                    size = if (link.size > 0) link.size else -1L,
+                    platform = DownloadPlatform.MANGO,
+                    headers = downloadHeadersOf(link),
+                    saveDir = saveDir
+                )
+                ok++
+            }
+        }
+        return ok
+    }
+
+    fun downloadFolder(saveDir: String = "") {
+        val folder = actionFile ?: return
+        if (!folder.isdir) return
+        viewModelScope.launch {
+            isOperating = true
+            folderProgress = "正在收集文件…"
+            downloadCancelRequested = false
+            try {
+                val tasks = mutableListOf<Pair<String, String>>()
+                collectFiles(childPath(currentPath(), folder.fname), folder.fname, tasks, 0)
+                if (tasks.isEmpty()) {
+                    cloudMessage = "文件夹为空"
+                    actionFile = null
+                    return@launch
+                }
+                val ok = enqueueEach(tasks, saveDir)
+                if (downloadCancelRequested) {
+                    cloudMessage = "已中断下载"
+                } else {
+                    cloudMessage = "已加入 $ok 个下载任务"
+                }
+            } catch (e: Exception) {
+                cloudMessage = e.message ?: "下载文件夹失败"
+            } finally {
+                isOperating = false
+                folderProgress = null
+                downloadCancelRequested = false
+                actionFile = null
+            }
+        }
+    }
+
+    fun downloadSelected(saveDir: String = "") {
+        val files = _selected.toList()
+        if (files.isEmpty()) return
+        val base = currentPath()
+        viewModelScope.launch {
+            isOperating = true
+            folderProgress = "正在收集文件…"
+            downloadCancelRequested = false
+            try {
+                val tasks = mutableListOf<Pair<String, String>>()
+                for (file in files) {
+                    if (file.isdir) {
+                        collectFiles(childPath(base, file.fname), file.fname, tasks, 0)
+                    } else {
+                        tasks.add(file.fname to file.fid)
+                    }
+                }
+                if (tasks.isEmpty()) {
+                    cloudMessage = "所选文件夹为空"
+                    exitMultiSelect()
+                    return@launch
+                }
+                val ok = enqueueEach(tasks, saveDir)
+                if (downloadCancelRequested) {
+                    cloudMessage = "已中断批量下载"
+                } else {
+                    cloudMessage = "已加入 $ok 个下载任务"
+                }
+                exitMultiSelect()
+            } catch (e: Exception) {
+                cloudMessage = e.message ?: "批量下载失败"
+            } finally {
+                isOperating = false
+                folderProgress = null
+                downloadCancelRequested = false
+            }
+        }
+    }
+
+    class Factory(
+        private val client: MangoDriveClient,
+        private val downloadManager: DownloadManager
+    ) : ViewModelProvider.Factory {
+        @Suppress("UNCHECKED_CAST")
+        override fun <T : ViewModel> create(modelClass: KClass<T>, extras: CreationExtras): T =
+            MangoCloudViewModel(client, downloadManager) as T
+    }
+
+    companion object {
+        /** 子目录路径：父路径 + "/" + 名（根 "/" 不产生 "//"） */
+        internal fun childPath(parent: String, name: String): String {
+            val p = parent.trim().trimEnd('/')
+            val n = name.trim()
+            if (n.isEmpty()) return if (p.isEmpty()) "/" else p
+            return if (p.isEmpty()) "/$n" else "$p/$n"
+        }
+
+        /**
+         * 直链取值：优先 direct_url（OpenList 签名直链，桌面端直连，不经 pxed 中转；
+         * 服务端实测支持 Range，可多线程分块）。
+         * 没有 direct_url 时按路由回退：302 → download_url；stream → stream_url。
+         */
+        internal fun downloadUrlOf(link: RemoteLinkResult): String {
+            link.directUrl?.takeIf { it.isNotBlank() }?.let { return it }
+            return link.effectiveUrl()
+        }
+
+        /**
+         * 直链请求头：服务端 need_headers 时按 ua/referer 注入。
+         * direct_url 会被 Cloudflare 边缘按 UA 校验（不带 UA 直接 000/拒连），所以必须带。
+         */
+        internal fun downloadHeadersOf(link: RemoteLinkResult): Map<String, String> {
+            if (!link.needHeaders) return emptyMap()
+            val out = LinkedHashMap<String, String>(2)
+            if (link.ua.isNotBlank()) out["User-Agent"] = link.ua
+            if (link.referer.isNotBlank()) out["Referer"] = link.referer
+            return out
+        }
+    }
+}

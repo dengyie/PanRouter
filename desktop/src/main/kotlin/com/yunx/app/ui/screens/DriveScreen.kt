@@ -76,6 +76,8 @@ import com.yunx.app.ui.viewmodel.DriveQuotaViewModel
 import com.yunx.app.ui.viewmodel.GuangYaCloudViewModel
 import com.yunx.app.ui.viewmodel.ILanzouCloudViewModel
 import com.yunx.app.ui.viewmodel.LanzouCloudViewModel
+import com.yunx.app.ui.viewmodel.MangoCloudViewModel
+import com.yunx.app.ui.viewmodel.MangoTransferViewModel
 import com.yunx.app.ui.viewmodel.MultiAccountViewModel
 import com.yunx.app.ui.viewmodel.Pan115CloudViewModel
 import com.yunx.app.ui.viewmodel.Pan123CloudViewModel
@@ -135,6 +137,10 @@ fun DriveScreen(
     ilanzouCloudViewModel: ILanzouCloudViewModel,
     /** 蓝奏云云盘浏览 ViewModel */
     lanzouCloudViewModel: LanzouCloudViewModel,
+    /** Mango Drive 私有聚合云盘浏览 ViewModel */
+    mangoCloudViewModel: MangoCloudViewModel,
+    /** Mango Drive 云对云转存记录 ViewModel（M4.3） */
+    mangoTransferViewModel: MangoTransferViewModel,
     /** 网盘空间详情 ViewModel（顶部空间总览） */
     driveQuotaViewModel: DriveQuotaViewModel,
     onQuarkLogin: () -> Unit,
@@ -159,6 +165,8 @@ fun DriveScreen(
     onILanzouLogout: () -> Unit,
     onLanzouLogin: () -> Unit,
     onLanzouLogout: () -> Unit,
+    /** 是否已配置 PanRouter（Mango Drive 的解析/提链全部经服务端） */
+    mangoAvailable: Boolean = false,
     /** 是否已配置 GitHub Token（控制 GitHub 卡片副标题与登录态样式） */
     githubHasToken: Boolean = false,
     /** 点击 GitHub 卡片：已配置 Token 时进入「我的主页」；未配置时打开 Token 管理弹窗 */
@@ -215,6 +223,10 @@ fun DriveScreen(
     var showILanzouCloud by rememberSaveable { mutableStateOf(false) }
     // 蓝奏云云盘浏览：网盘 Tab 内切换（非全屏）
     var showLanzouCloud by rememberSaveable { mutableStateOf(false) }
+    // Mango Drive 私有聚合云盘浏览：网盘 Tab 内切换（非全屏）
+    var showMangoCloud by rememberSaveable { mutableStateOf(false) }
+    // Mango Drive 转存记录（M4.3）：从私有盘页头部进入
+    var showMangoTransfers by rememberSaveable { mutableStateOf(false) }
 
     // 夸克：登录态由数据库驱动；已登录则副标题显示昵称
     val quark = DriveAccount(
@@ -287,6 +299,15 @@ fun DriveScreen(
         avatarText = "蓝",
         isLoggedIn = lanzouAccount != null
     )
+    // 自建云盘：服务端接入的 OpenList 兼容端点（driver = mangodrive）；无本机登录，靠服务端账号池提链。
+    // 卡片文案不描述具体部署（容量/加密方式都在服务端），端点不可达时与服务端透明转发/直链模式互相兜底。
+    val mango = DriveAccount(
+        id = "mangodrive",
+        name = "自建云盘",
+        description = if (mangoAvailable) "OpenList 兼容端点" else "需先在设置中配置 PanRouter",
+        avatarText = "盘",
+        isLoggedIn = mangoAvailable
+    )
     // GitHub：把 GitHub 当网盘浏览下载；此处仅做 Token 管理（提升 API 限额），浏览入口在解析页
     val github = DriveAccount(
         id = "github",
@@ -298,6 +319,8 @@ fun DriveScreen(
     val others = remember {
         emptyList<DriveAccount>()
     }
+    // 自建云盘没有统一用量接口：不伪造容量（具体池大小属于服务端部署，客户端不内置）。
+    // 卡片只显示自身状态，容量类信息留给服务端下发的 storage 信息。
 
     // 进入网盘页加载空间详情（仅已登录平台）
     LaunchedEffect(Unit) {
@@ -316,6 +339,8 @@ fun DriveScreen(
             showGuangYaCloud -> 8
             showILanzouCloud -> 9
             showLanzouCloud -> 10
+            showMangoTransfers -> 12
+            showMangoCloud -> 11
             else -> 0
         },
         transitionSpec = {
@@ -384,6 +409,18 @@ fun DriveScreen(
             scrollBehavior = scrollBehavior,
             onExit = { showLanzouCloud = false },
             onDownloadStarted = onDownloadStarted
+        )
+        11 -> MangoCloudScreen(
+            viewModel = mangoCloudViewModel,
+            scrollBehavior = scrollBehavior,
+            onExit = { showMangoCloud = false },
+            onDownloadStarted = onDownloadStarted,
+            onOpenTransfers = { showMangoTransfers = true }
+        )
+        12 -> MangoTransferScreen(
+            viewModel = mangoTransferViewModel,
+            scrollBehavior = scrollBehavior,
+            onBack = { showMangoTransfers = false }
         )
             else -> LazyVerticalGrid(
                 // 四宫格 = 两列；列表 = 单列。切换列数复用同一棵列表，卡片状态不丢。
@@ -558,6 +595,17 @@ fun DriveScreen(
                         },
                         onMoreClick = if (lanzou.isLoggedIn) {
                             { showLanzouSheet = true }
+                        } else {
+                            null
+                        }
+                    )
+                }
+                item(key = mango.id) {
+                    // 私有盘不伪造「已用/上限」；要展示容量需服务端提供 storage 用量字段（当前契约没有）
+                    DriveAccountCard(
+                        account = mango,
+                        onClick = if (mangoAvailable) {
+                            { showMangoCloud = true }
                         } else {
                             null
                         }
@@ -813,6 +861,8 @@ private fun DriveAccountCard(
     modifier: Modifier = Modifier,
     /** 网盘空间详情（已登录且有数据时在卡片内显示进度条）；null 不显示 */
     quota: QuotaInfo? = null,
+    /** 无用量接口时的容量说明（如「总容量 2.0 TB」）；quota 为 null 时展示。默认不显示：容量属于远端部署信息 */
+    quotaCaption: String? = null,
     onClick: (() -> Unit)? = null,
     /** 已登录时右侧「三个点」更多按钮（打开账号弹窗）；null 则不显示 */
     onMoreClick: (() -> Unit)? = null
@@ -825,6 +875,7 @@ private fun DriveAccountCard(
         DriveAccountCardContent(
             account = account,
             quota = quota,
+            quotaCaption = quotaCaption,
             clickable = onClick != null,
             onMoreClick = onMoreClick
         )
@@ -850,6 +901,7 @@ private fun DriveAccountCard(
 private fun DriveAccountCardContent(
     account: DriveAccount,
     quota: QuotaInfo? = null,
+    quotaCaption: String? = null,
     clickable: Boolean,
     onMoreClick: (() -> Unit)? = null
 ) {
@@ -897,7 +949,7 @@ private fun DriveAccountCardContent(
             )
             // 已登录且有空间数据：卡片内展示剩余空间进度条（出现时淡入 + 纵向展开，避免突兀）
             AnimatedVisibility(
-                visible = account.isLoggedIn && quota != null,
+                visible = account.isLoggedIn && (quota != null || quotaCaption != null),
                 enter = fadeIn(tween(300)) + expandVertically(
                     expandFrom = Alignment.Top,
                     animationSpec = tween(300)
@@ -906,7 +958,15 @@ private fun DriveAccountCardContent(
             ) {
                 Column {
                     Spacer(modifier = Modifier.height(8.dp))
-                    quota?.let { QuotaInlineBar(it) }
+                    if (quota != null) {
+                        QuotaInlineBar(quota)
+                    } else if (quotaCaption != null) {
+                        Text(
+                            text = quotaCaption,
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
                 }
             }
         }

@@ -100,12 +100,41 @@ data class RemoteBatchItem(
     val error: String?
 )
 
+/**
+ * `GET /api/v1/storage`：服务端当前接入的存储端点（任何 OpenList 兼容实现）。
+ *
+ * 桌面端不内置部署域名与容量：端点对外基址、默认落盘目录、单文件上限都由服务端配置决定，
+ * 客户端只消费这里的结果。[enabled] 为 false 表示服务端没接存储端点。
+ */
+data class StorageInfo(
+    val enabled: Boolean,
+    /** 端点对外基址（如 https://pool.example.net，无尾斜杠）；disabled 时为空串 */
+    val publicBase: String,
+    /** 服务端默认落盘目录；空 = 端点根目录 */
+    val destDir: String,
+    /** 单文件转存上限（字节）；0 = 服务端不限 */
+    val maxBytes: Long
+) {
+    /** 是否可用于拼解析链接（enabled 且有基址） */
+    val usable: Boolean get() = enabled && publicBase.isNotBlank()
+}
+
 // ---------- JSON 解析（服务端字段缺失时取安全默认值，不抛解析异常） ----------
 
 internal fun parseServerInfo(body: JSONObject): RemoteServerInfo = RemoteServerInfo(
     status = body.optString("status"),
     version = body.optString("version")
 )
+
+internal fun parseStorageInfo(body: JSONObject): StorageInfo {
+    val base = body.optString("public_base").trim().trimEnd('/')
+    return StorageInfo(
+        enabled = body.optBoolean("enabled", false),
+        publicBase = base,
+        destDir = (body.optString("dest_dir").takeIf { it.startsWith("/") } ?: "").trimEnd('/'),
+        maxBytes = body.optLong("max_bytes", 0L)
+    )
+}
 
 internal fun parseResolveResult(body: JSONObject): RemoteResolveResult = RemoteResolveResult(
     pan = body.optString("pan"),

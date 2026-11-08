@@ -10,11 +10,17 @@ object PanRouterHub {
 
     /** 懒构造：首次用到（解析页装配/设置页测试连接）才建；探活宿主作用域随实例常驻 */
     val gateway: PanRouterResolveGateway by lazy {
-        PanRouterResolveGateway(
-            client = PanRouterClient(
-                baseUrlProvider = { PanRouterSettings().baseUrl },
-                tokenProvider = { PanRouterTokenStore.getToken() }
-            )
+        PanRouterResolveGateway(client = client)
+    }
+
+    /**
+     * 复用同一个 HTTP 客户端（无状态，实时读设置/Token）：
+     * M4 私有盘转存（提交/轮询）与 M4.3 转存记录页共用。
+     */
+    val client: PanRouterClient by lazy {
+        PanRouterClient(
+            baseUrlProvider = { PanRouterSettings().baseUrl },
+            tokenProvider = { PanRouterTokenStore.getToken() }
         )
     }
 }

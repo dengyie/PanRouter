@@ -71,10 +71,12 @@ import com.yunx.app.data.db.AppDatabase
 import com.yunx.app.data.download.ChunkDownloader
 import com.yunx.app.data.download.DownloadManager
 import com.yunx.app.data.download.DownloadPlatform
+import com.yunx.app.data.mangodrive.MangoDriveClient
 import com.yunx.app.data.gopeed.GopeedEngine
 import com.yunx.app.data.panrouter.HistorySyncEngine
 import com.yunx.app.data.panrouter.PanRouterContribution
 import com.yunx.app.data.panrouter.PanRouterHub
+import com.yunx.app.data.panrouter.PanRouterSettings
 import com.yunx.app.data.network.BaiduApi
 import com.yunx.app.data.network.C139Api
 import com.yunx.app.data.network.GitHubApi
@@ -177,6 +179,8 @@ import com.yunx.app.ui.viewmodel.ILanzouAccountViewModel
 import com.yunx.app.ui.viewmodel.ILanzouCloudViewModel
 import com.yunx.app.ui.viewmodel.LanzouAccountViewModel
 import com.yunx.app.ui.viewmodel.LanzouCloudViewModel
+import com.yunx.app.ui.viewmodel.MangoCloudViewModel
+import com.yunx.app.ui.viewmodel.MangoTransferViewModel
 import com.yunx.app.ui.viewmodel.MultiAccountViewModel
 import com.yunx.app.ui.viewmodel.Pan115AccountViewModel
 import com.yunx.app.ui.viewmodel.Pan115CloudViewModel
@@ -559,6 +563,15 @@ fun MainScreen(
             lanzouViewModel.lanzouAccount.map { it != null }
         )
     )
+    val mangoCloudViewModel: MangoCloudViewModel = viewModel(
+        factory = MangoCloudViewModel.Factory(
+            MangoDriveClient(),
+            downloadManager
+        )
+    )
+    val mangoTransferViewModel: MangoTransferViewModel = viewModel(
+        factory = MangoTransferViewModel.Factory(PanRouterHub.client)
+    )
     val driveQuotaViewModel: DriveQuotaViewModel = viewModel(
         factory = DriveQuotaViewModel.Factory(
             api, { repository.getAccount()?.cookie },
@@ -648,7 +661,9 @@ fun MainScreen(
             // 取链方式开关：设置页「免转存下载」实时生效
             { settings.quarkNoSaveDownload },
             // PanRouter 服务端解析网关：设置/Token 实时读取，改配置即时生效（docs/INTEGRATION-PANROUTER.md §4.1）
-            panRouterGateway = PanRouterHub.gateway
+            panRouterGateway = PanRouterHub.gateway,
+            // M4.3 私有盘云对云转存：分享页「转存」在服务端解析模式下提交到 Mango Drive
+            mangoTransferClient = PanRouterHub.client
         )
     )
     val downloadViewModel: DownloadViewModel = viewModel(
@@ -1027,6 +1042,9 @@ fun MainScreen(
                             guangyaCloudViewModel = guangyaCloudViewModel,
                             ilanzouCloudViewModel = ilanzouCloudViewModel,
                             lanzouCloudViewModel = lanzouCloudViewModel,
+                            mangoCloudViewModel = mangoCloudViewModel,
+                            mangoTransferViewModel = mangoTransferViewModel,
+                            mangoAvailable = PanRouterSettings().isConfigured(),
                             driveQuotaViewModel = driveQuotaViewModel,
                             multiAccount = multiAccountViewModel,
                             videoLoginState = videoLoginState,
