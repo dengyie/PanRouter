@@ -74,6 +74,7 @@ func Router(d Deps) http.Handler {
 			pr.Get("/downloads", d.handleListDownloads)
 			pr.Get("/downloads/{gid}", d.handleDownloadStatus)
 			pr.Post("/transfer/mangodrive", d.handleTransferMangodrive)
+			pr.Get("/storage", d.handleStorageInfo)
 			pr.Get("/transfer", d.handleListTransfers)
 			pr.Get("/transfer/{id}", d.handleGetTransfer)
 			pr.Post("/sync", d.handlePushSync)

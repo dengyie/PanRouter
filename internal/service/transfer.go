@@ -38,13 +38,15 @@ const (
 	ChannelAuto TransferChannel = "auto"
 )
 
-// defaultMaxTransferBytes 单文件转存上限:64GiB(0 = 不限)。
-const defaultMaxTransferBytes = 64 << 30
-
-// 已完成任务在内存中保留的条数与时长,供 UI 回看进度。
+// 转存编排的默认值:全部可被 transfer 配置段覆盖(见 config.Transfer)。
 const (
-	keepTasks     = 200
-	keepTaskAfter = 24 * time.Hour
+	// defaultMaxTransferBytes 单文件转存上限:64GiB。
+	defaultMaxTransferBytes = 64 << 30
+	// defaultAutoStreamBytes channel=auto 的大小阈值:达到该值走 stream(本机中转)。
+	defaultAutoStreamBytes = 8 << 30
+	// defaultKeepTasks / defaultKeepTaskAfter 内存里保留的终结任务条数与时长。
+	defaultKeepTasks     = 200
+	defaultKeepTaskAfter = 24 * time.Hour
 )
 
 type Transfer struct {
@@ -165,12 +167,16 @@ func (t *TransferTask) Snapshot() TransferTask {
 	}
 }
 
-// destDefault 默认落盘目录。
+// DefaultDest 对外暴露的默认落盘目录(供 storage 信息接口)。
+func (s *Transfer) DefaultDest() string { return s.destDefault() }
+
+// destDefault 默认落盘目录;未配置时为端点根目录(由 OpenList 自身决定归属),
+// 桌面端想让转存落在某个子目录时应显式传 dest_dir 或配置 transfer.dest_dir。
 func (s *Transfer) destDefault() string {
 	if d := s.cfg.Get().Transfer.DestDir; strings.TrimSpace(d) != "" {
 		return cleanStorePath(d)
 	}
-	return "/pool/panrouter"
+	return "/"
 }
 
 func (s *Transfer) driveAPI() *mangodrive.API {
@@ -269,6 +275,7 @@ func (s *Transfer) Submit(req TransferRequest) (*TransferTask, error) {
 // pruneLocked 清理过期/超量的终结任务(调用方持有 s.mu)。
 func (s *Transfer) pruneLocked() {
 	now := time.Now()
+	keepTasks, keepTaskAfter := s.keepPolicy()
 	var terminal []*TransferTask
 	for _, t := range s.tasks {
 		t.mu.Lock()
@@ -292,6 +299,51 @@ func (s *Transfer) pruneLocked() {
 	for i := keepTasks; i < len(terminal); i++ {
 		delete(s.tasks, terminal[i].ID)
 	}
+}
+
+// keepPolicy 终结任务保留策略(条数 + 时长);配置为 0 走默认。
+func (s *Transfer) keepPolicy() (int, time.Duration) {
+	c := s.cfg.Get().Transfer
+	n, d := c.KeepTasks, c.KeepTaskAfter
+	if n <= 0 {
+		n = defaultKeepTasks
+	}
+	if d <= 0 {
+		d = defaultKeepTaskAfter
+	}
+	return n, d
+}
+
+// autoStreamBytes channel=auto 时改用 stream(本机中转)的文件大小阈值;
+// 配置为负视为「全部走 offline」,0 走默认 8GiB。
+func (s *Transfer) autoStreamBytes() int64 {
+	n := s.cfg.Get().Transfer.AutoStreamBytes
+	switch {
+	case n < 0:
+		return 0
+	case n == 0:
+		return defaultAutoStreamBytes
+	default:
+		return n
+	}
+}
+
+// PublicBase 端点的对外访问基址:优先 transfer.public_base,否则取 domain_routes
+// 里 mangodrive 的首个域名。桌面端用它拼解析链接,所以不回落内网 endpoint。
+func (s *Transfer) PublicBase() string {
+	c := s.cfg.Get()
+	if b := strings.TrimRight(strings.TrimSpace(c.Transfer.PublicBase), "/"); b != "" {
+		if !strings.Contains(b, "://") {
+			b = "https://" + b
+		}
+		return b
+	}
+	for _, d := range c.DomainRoutes["mangodrive"] {
+		if d = strings.TrimRight(strings.TrimSpace(d), "/"); d != "" {
+			return "https://" + d
+		}
+	}
+	return ""
 }
 
 // hintOf 取 driver.Error 的分类作为 hint,其余留空。
@@ -328,7 +380,7 @@ func (s *Transfer) Run(ctx context.Context, task *TransferTask, req TransferRequ
 	channel := req.Channel
 	if channel == "" || channel == ChannelAuto {
 		channel = ChannelStream
-		if !src.needHdr && !src.meta.BindIP && src.size < 8<<30 {
+		if !src.needHdr && !src.meta.BindIP && src.size < s.autoStreamBytes() {
 			channel = ChannelOffline
 		}
 	}

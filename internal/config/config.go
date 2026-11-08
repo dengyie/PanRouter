@@ -41,13 +41,13 @@ type DriverCommon struct {
 	Proxy         string   `mapstructure:"proxy"`
 	LimitQPS      float64  `mapstructure:"limit_qps"`
 	DownloadConc  int      `mapstructure:"download_concurrency"`
-	// InternalBase 可选:同存储的内网(EasyTier)API 基址。私有盘(如 Mango Drive)
-	// 配置后走内网直连,避开 Cloudflare 隧道的请求体上限。
+	// InternalBase 可选:同一存储的内网(mesh/私网)API 基址。自建私有存储
+	// 配置后走内网直连,避开公网入口的请求体上限;与具体是哪一套存储无关。
 	InternalBase string `mapstructure:"internal_base"`
 	// PublicBase 可选:对外域名基址,用于还原相对形态的直链。
 	PublicBase string `mapstructure:"public_base"`
-	// AllowPrivate 允许该 driver 直连私网/回环地址。仅私有盘(自建 OpenList
-	// 走 EasyTier 内网或本地 socks5)需要,默认关闭以守住 SSRF 防线。
+	// AllowPrivate 允许该 driver 直连私网/回环地址。仅自建存储(mesh 内网
+	// 或本地 socks5)需要,默认关闭以守住 SSRF 防线。
 	AllowPrivate bool `mapstructure:"allow_private"`
 }
 
@@ -57,9 +57,11 @@ type Aria2 struct {
 	SameHost bool   `mapstructure:"same_host"`
 }
 
-// Transfer 是云对云转存的落点配置(Mango Drive / OpenList)。
+// Transfer 是云对云转存的落点配置:任何 OpenList 兼容端点(AList v3 线 API)。
+// 具体是哪一套部署、落在哪个目录,全部由本段配置决定;服务端与客户端都不写死。
+// 未配置 endpoint / token 时转存功能整体关闭(接口回 4xx),其余逻辑不感知存储形态。
 type Transfer struct {
-	// Endpoint OpenList 服务基址。内网(EasyTier)地址优先:Cloudflare 隧道
+	// Endpoint OpenList 服务基址。内网(mesh)地址优先:Cloudflare 隧道
 	// 对请求体有上限,大文件 PUT 必须绕开。
 	Endpoint string `mapstructure:"endpoint"`
 	// Token OpenList API Token(Authorization 头原值)。
@@ -67,10 +69,21 @@ type Transfer struct {
 	// DestDir 默认落盘目录。
 	DestDir string `mapstructure:"dest_dir"`
 	// Proxy 可选:访问 Endpoint 的代理(http:// 或 socks5://)。无 TUN 的
-	// EasyTier 节点靠本地 socks5 才能摸到内网地址。
+	// mesh 节点靠本地 socks5 才能摸到内网地址。
 	Proxy string `mapstructure:"proxy"`
 	// MaxBytes 单文件上限;0 = 默认 64GiB,负值 = 不限。
 	MaxBytes int64 `mapstructure:"max_bytes"`
+	// AutoStreamBytes channel=auto 时,文件达到该大小即改用 stream(本机中转),
+	// 否则走 offline(远端直拉);单个 channel 请求不受影响。0 = 默认 8GiB。
+	AutoStreamBytes int64 `mapstructure:"auto_stream_bytes"`
+	// KeepTasks 内存里保留的终结任务条数(新→旧);0 = 默认 200。
+	KeepTasks int `mapstructure:"keep_tasks"`
+	// KeepTaskAfter 终结任务的保留时长;0 = 默认 24h。
+	KeepTaskAfter time.Duration `mapstructure:"keep_task_after"`
+	// PublicBase 可选:端点的对外访问基址(如 https://drive.example.com)。
+	// 桌面端据此拼解析链接,不必内置域名;空 = 由 domain_routes 里
+	// mangodrive 的首个域名推导。
+	PublicBase string `mapstructure:"public_base"`
 }
 
 type Log struct {
@@ -106,6 +119,9 @@ func Default() *Config {
 	c.Auth.PasswordBcrypt = "$2a$10$ZmboqbL3NvvVCXSDUR3ev.EWMUKRFo6OjQObNE3K6b.XggHNyuT9K"
 	c.Auth.APIToken = DefaultAPIToken
 	c.Auth.JWTSecret = DefaultJWTSecret
+	// 以下是参考部署(本仓库作者的自建云盘)的默认值:任何部署都可在 config.yaml 里
+	// 显式覆盖(domain_routes / drivers / transfer 各段)。PanRouter 契约是「任意
+	// OpenList 兼容端点」,具体域、目录、容量不属于代码,只属于配置。
 	c.DomainRoutes = map[string][]string{
 		"quark":      {"pan.quark.cn"},
 		"mangodrive": {"drive.example.com"},
@@ -117,7 +133,6 @@ func Default() *Config {
 			RedirectAllow: []string{".quark.cn", ".quarkcdn.cn", ".uc.cn"},
 		},
 		"mangodrive": {
-			// 私有盘:对外只暴露"列目录/提链",写盘走 transfer 编排,并发与限频放宽。
 			Enabled: true, LimitQPS: 10, DownloadConc: 8,
 			RedirectAllow: []string{"drive.example.com"},
 		},
@@ -129,8 +144,12 @@ func Default() *Config {
 	c.Aria2.Endpoint = "http://127.0.0.1:6800/jsonrpc"
 	c.Aria2.SameHost = true
 	c.Log.Level = "info"
-	c.Transfer.DestDir = "/pool/panrouter"
+	// dest_dir 无默认:未配置时落到端点根目录(由 OpenList 自身决定归属),
+	// 本仓库参考部署在 config.yaml 里显式配置了 /pool/panrouter。
 	c.Transfer.MaxBytes = 64 << 30
+	c.Transfer.AutoStreamBytes = 8 << 30
+	c.Transfer.KeepTasks = 200
+	c.Transfer.KeepTaskAfter = 24 * time.Hour
 	return c
 }
 
