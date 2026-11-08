@@ -85,7 +85,10 @@ type CredStatus struct {
 
 // DirectLink 描述直链及其校验约束,是下载路径决策(§4.3)的唯一输入。
 type DirectLink struct {
-	URL       string
+	URL string
+	// ServerURL 供服务端自己拉取(转存)用的直链;空 = 复用 URL。
+	// 私有盘的公网域名不可回源(如 Cloudflare 隧道)时由内网基址提供。
+	ServerURL string
 	UA        string // 直链要求的 UA;空 = 不校验
 	Referer   string // 直链要求的 Referer;空 = 不校验
 	Cookie    string // 直链需携带的 Cookie;非空则浏览器 302 不可用

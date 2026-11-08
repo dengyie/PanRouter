@@ -445,7 +445,7 @@ func (r *Resolver) ResolveFile(ctx context.Context, rawURL, pwd, fid string, own
 	extJSON, _ := json.Marshal(ext)
 	l := &repo.Link{
 		ShareKey: key, FID: fid, FileName: name, Size: size,
-		DirectLink: dl.URL, UA: dl.UA, Referer: dl.Referer, CookieEnc: cookieEnc,
+		DirectLink: dl.URL, ServerLink: dl.ServerURL, UA: dl.UA, Referer: dl.Referer, CookieEnc: cookieEnc,
 		BindIP: dl.BindIP, ExpiresAt: dl.ExpiresAt, Ext: string(extJSON),
 	}
 	// 落库失败必须报错:直链未持久化时不得返回看似成功的下载入口(P2-6)。

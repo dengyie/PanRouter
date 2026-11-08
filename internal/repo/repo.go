@@ -37,12 +37,14 @@ type Share struct {
 }
 
 type Link struct {
-	ID         uint      `gorm:"primaryKey" json:"id"`
-	ShareKey   string    `gorm:"uniqueIndex:idx_share_fid;size:64" json:"share_key"`
-	FID        string    `gorm:"column:fid;uniqueIndex:idx_share_fid;size:128" json:"fid"`
-	FileName   string    `gorm:"size:512" json:"file_name"`
-	Size       int64     `json:"size"`
-	DirectLink string    `gorm:"type:text" json:"-"`
+	ID         uint   `gorm:"primaryKey" json:"id"`
+	ShareKey   string `gorm:"uniqueIndex:idx_share_fid;size:64" json:"share_key"`
+	FID        string `gorm:"column:fid;uniqueIndex:idx_share_fid;size:128" json:"fid"`
+	FileName   string `gorm:"size:512" json:"file_name"`
+	Size       int64  `json:"size"`
+	DirectLink string `gorm:"type:text" json:"-"`
+	// ServerLink 服务端自取直链(转存用);空 = 复用 DirectLink。
+	ServerLink string    `gorm:"type:text" json:"-"`
 	UA         string    `gorm:"size:512" json:"ua"`
 	Referer    string    `gorm:"size:512" json:"referer"`
 	CookieEnc  []byte    `json:"-"`
@@ -169,7 +171,8 @@ func (s *Store) UpsertLink(l *Link) error {
 	l.ID = exist.ID
 	return s.db.Model(&exist).Updates(map[string]any{
 		"file_name": l.FileName, "size": l.Size, "direct_link": l.DirectLink,
-		"ua": l.UA, "referer": l.Referer, "cookie_enc": l.CookieEnc,
+		"server_link": l.ServerLink,
+		"ua":          l.UA, "referer": l.Referer, "cookie_enc": l.CookieEnc,
 		"bind_ip": l.BindIP, "expires_at": l.ExpiresAt, "ext": l.Ext,
 	}).Error
 }

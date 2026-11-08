@@ -115,6 +115,10 @@ func TestDriverResolveAndLink(t *testing.T) {
 	if !strings.HasSuffix(dl.URL, "/d/Pool/a.mkv?sign=s1") {
 		t.Fatalf("raw_url not absolutized: %s", dl.URL)
 	}
+	// 只配内网基址:服务端自取直链要补成内网绝对地址。
+	if want := f.srv.URL + "/d/Pool/a.mkv?sign=s1"; dl.ServerURL != want {
+		t.Fatalf("server link: got %q want %q", dl.ServerURL, want)
+	}
 	if dl.UA == "" || !dl.ExpiresAt.After(time.Now()) {
 		t.Fatalf("link constraints missing: %+v", dl)
 	}

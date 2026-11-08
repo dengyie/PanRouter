@@ -21,14 +21,17 @@ import (
 	"github.com/dengyie/panrouter/internal/repo"
 )
 
-type fakeDriver struct{ linkURL string }
+type fakeDriver struct {
+	linkURL   string
+	serverURL string // 可选:服务端自取直链;空 = 复用 linkURL
+}
 
 func (f *fakeDriver) ID() string { return "fake" }
 func (f *fakeDriver) ResolveShare(context.Context, driver.ShareLink, *driver.Credential) ([]driver.FileNode, error) {
 	return []driver.FileNode{{FID: "f1", Name: "n.bin", Size: 300, Ext: map[string]string{}}}, nil
 }
 func (f *fakeDriver) GetDirectLink(context.Context, *driver.Credential, driver.FileRef) (driver.DirectLink, error) {
-	return driver.DirectLink{URL: f.linkURL, ExpiresAt: time.Now().Add(time.Hour)}, nil
+	return driver.DirectLink{URL: f.linkURL, ServerURL: f.serverURL, ExpiresAt: time.Now().Add(time.Hour)}, nil
 }
 func (f *fakeDriver) CheckCredential(context.Context, driver.Credential) (driver.CredStatus, error) {
 	return driver.CredStatus{Valid: true}, nil

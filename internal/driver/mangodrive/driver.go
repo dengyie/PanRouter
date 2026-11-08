@@ -155,11 +155,20 @@ func (d *Driver) GetDirectLink(ctx context.Context, cred *driver.Credential, ref
 	// 内网基址取到的 raw_url 指向 mesh/回环地址,客户端无法访问;
 	// 换回对外域名(sign 只签路径,换 host 不影响校验)。
 	link := absolute(obj.RawURL, d.PublicBase)
-	if d.InternalBase != "" && d.PublicBase != "" {
+	internal := ""
+	switch {
+	case d.InternalBase != "" && d.PublicBase != "":
 		link = swapBase(link, d.InternalBase, d.PublicBase)
+		// 转存由服务端自取:公网域名经 Cloudflare 隧道有 100MB 请求体限制且
+		// 不可回源,拉取会 TLS 超时;内网直连才是这台 OpenList 的可靠出口。
+		internal = swapBase(link, d.PublicBase, d.InternalBase)
+	case d.InternalBase != "":
+		// 只配内网基址:raw_url 可能是相对路径,补成内网绝对地址。
+		internal = absolute(link, d.InternalBase)
 	}
 	return driver.DirectLink{
 		URL:       link,
+		ServerURL: internal,
 		UA:        BrowserUA,
 		ExpiresAt: time.Now().Add(rawLinkTTL),
 	}, nil

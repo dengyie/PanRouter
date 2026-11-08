@@ -340,12 +340,14 @@ func (s *Transfer) Run(ctx context.Context, task *TransferTask, req TransferRequ
 // ---- 执行 ----
 
 type transferSource struct {
-	file     *ResolveFileResult
-	meta     LinkMeta
-	name     string
-	size     int64
-	upstream string
-	needHdr  bool
+	file *ResolveFileResult
+	meta LinkMeta
+	name string
+	size int64
+	// serverURL 服务端自取直链;空 = 用 file.DirectURL(公网直链,给客户端用)。
+	serverURL string
+	upstream  string
+	needHdr   bool
 }
 
 // resolveSource 把分享链接解析成直链 + 提取链约束。
@@ -398,12 +400,13 @@ func (s *Transfer) resolveSource(ctx context.Context, req TransferRequest) (*tra
 		name = res.FileName
 	}
 	return &transferSource{
-		file:     res,
-		meta:     LinkMeta{UA: link.UA, Referer: link.Referer, Cookie: string(cookie), BindIP: link.BindIP},
-		name:     cleanName(name),
-		size:     link.Size,
-		upstream: pan,
-		needHdr:  NeedHeaders(link.UA, link.Referer, string(cookie), ua),
+		file:      res,
+		meta:      LinkMeta{UA: link.UA, Referer: link.Referer, Cookie: string(cookie), BindIP: link.BindIP},
+		name:      cleanName(name),
+		size:      link.Size,
+		serverURL: link.ServerLink,
+		upstream:  pan,
+		needHdr:   NeedHeaders(link.UA, link.Referer, string(cookie), ua),
 	}, nil
 }
 
@@ -435,7 +438,13 @@ func (s *Transfer) transferStream(ctx context.Context, task *TransferTask, src *
 	if up == nil {
 		return driver.NewErr(driver.KindUnsupported, "网盘 "+src.upstream+" 未启用中转客户端", nil)
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, src.file.DirectURL, nil)
+	// 服务端自取优先走 driver 给的内网直链:私有盘公网域名可能不可回源
+	// (Cloudflare 隧道 100MB 限制/拒绝回源),内网直连才是可靠出口。
+	fetchURL := src.serverURL
+	if fetchURL == "" {
+		fetchURL = src.file.DirectURL
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, fetchURL, nil)
 	if err != nil {
 		return driver.NewErr(driver.KindUpstream, "构造上游请求失败", err)
 	}
@@ -521,13 +530,18 @@ func (s *Transfer) transferOffline(ctx context.Context, task *TransferTask, src 
 	if err := s.driveAPI().Mkdir(ctx, dir); err != nil {
 		return err
 	}
-	tasks, err := s.driveAPI().AddOffline(ctx, dir, []string{src.file.DirectURL})
+	// OpenList 离线端点用内网直链:aria2 与本机同网络,无需绕 Cloudflare。
+	offlineURL := src.serverURL
+	if offlineURL == "" {
+		offlineURL = src.file.DirectURL
+	}
+	tasks, err := s.driveAPI().AddOffline(ctx, dir, []string{offlineURL})
 	if err != nil {
 		return err
 	}
 	// OpenList 离线端点异步建任务,成功时空响应体亦属正常;任务由远端队列接管。
 	if len(tasks) > 0 && task != nil {
-		task.log.Infow("offline task created", "id", task.ID, "remote", tasks[0].ID, "url", src.file.DirectURL)
+		task.log.Infow("offline task created", "id", task.ID, "remote", tasks[0].ID, "url", offlineURL)
 	}
 	task.set(src.size)
 	return nil
