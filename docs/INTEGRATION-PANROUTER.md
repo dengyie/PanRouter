@@ -1,6 +1,6 @@
 # YunX-Desktop × PanRouter 深度整合开发规格
 
-> 状态：v1.10（2026-11-05，测试隔离 + 去重索引，桌面端 v0.1.9）
+> 状态：v1.11（2026-11-09，M4 自建云盘契约补规格，桌面端 v0.1.10/0.1.11）
 > 本文是「云析桌面版二次开发 + PanRouter 深度整合」的工程规格（Engineering Spec）。
 > 生产运维与拓扑以 Obsidian《PanRouter 部署与运维》为准；PanRouter 服务端契约以仓内
 > `panrouter/docs/development.md` v2.1 为准。三份文档冲突时以各自领域的最新 canonical 为准并回写对齐。
@@ -206,6 +206,24 @@ desktop/src/main/kotlin/com/yunx/app/
 - **游标**：服务端对生效变更做 DELETE+INSERT 换取新 rowid，故 `id` 严格单调，客户端游标只进不退。
 - **默认关闭**：同步开关默认 false，用户显式开启才上行（落实 §11-3 隐私裁定）。
 
+### 5.4 M4 端点（自建云盘 / OpenList 兼容端点，已上线）
+
+| 端点 | 用途 | 状态 |
+|---|---|---|
+| `GET /api/v1/storage` | 端点信息下发（auth）：`{code, driver:"mangodrive", enabled, public_base, dest_dir, max_bytes}`；未接入时回 200 + `enabled=false`，桌面端隐藏入口并报 UNSUPPORTED，**不猜域名** | **已上线**（M4.1 服务端 `24acc8b`） |
+| `POST /api/v1/transfer/mangodrive` | 云对云转存受理（auth）：`{source_url, pwd, fid, dest_dir, name, channel, ua}` → **202** `{code, task, poll:"/api/v1/transfer/<id>"}`；校验失败同步 4xx（source_url 必填、仅 http(s)、channel 白名单、端点未配置 KindUnsupported） | **已上线**（同上） |
+| `GET /api/v1/transfer` / `GET /api/v1/transfer/{id}` | 任务列表 / 单任务快照。快照字段：`{id, state, channel, source_url, dest_path, file_name, size, done, error, hint, started_at, ended_at}`；`state = queued\|running\|done\|failed` | **已上线**（同上） |
+
+**M4 契约要点（客户端零部署信息的落点）**：
+- **基址服务端下发**：桌面端 `MangoDriveClient` 先问 `GET /storage`（实例内缓存），`publicBaseUrl` 仅作服务端不可达时的手动覆盖；`enabled=false → UNSUPPORTED`。换一套 OpenList 端点只改服务端 `transfer` 配置。
+- **channel 语义**：`stream`（服务端拉上游 → 流式 PUT，兼容任意提取链约束）/ `offline`（OpenList 侧 aria2 直拉，仅公开直链，需 UA/Referer/Cookie 或 BindIP 的源拒收）/ `auto`（默认；有约束或 BindIP 或 `size ≥ transfer.auto_stream_bytes` 走 stream，否则 offline）。
+- **快照幂等**：`done` 原子计数，二次快照（handler 内 Get→Snapshot）不回零；成功终态 `Done=Size=实际字节`。
+- **转存上限**：单文件 `transfer.max_bytes`（0=默认 64GiB，负=不限）；storage 端点对 ≤0 回报 64GiB 默认值（已知展示口径差异）。
+- **任务可观测**：任务内存态保留 `keep_tasks`(200)/`keep_task_after`(24h)；浏览器断开不中断已受理任务（独立 ctx）。
+- **解析/浏览链**：`mangodrive` driver 把存储路径当分享（FID 即路径，≤100 字符直用、超长 `p:<sha1>`）；浏览 = 目录 URL + fid 定位文件（`url` 给目录、`fid` 给文件，直接给文件路径会 404——桌面端 `MangoDriveClient.link(dirPath, fid)` 契约）；目录分享批量转存由桌面端逐文件提交（可观测、可重试）。
+- **桌面直连下载**：`DownloadPlatform.MANGO` 取 `direct_url`（OpenList 签名直链，只签路径 host 可换，支持 Range 206）走本地 ChunkDownloader，**不经 /stream 中转降档**；必须携带返回的 UA。
+- **红线延伸**：桌面端零部署信息（域名/容量/目录全部服务端下发）；OpenList token 只在服务端（加密），桌面端只持 api_token。
+
 ---
 
 ## 6. 服务端（panrouter 仓）配套事项
@@ -289,6 +307,15 @@ pxed 上行有限且多设备共享：stream 路径线程数 = `min(用户设置
 
 ---
 
+### M4 —— 自建云盘（OpenList 兼容端点）接入 ✅（2026-11-08 收口）
+
+- **M4.1 服务端**：`mangodrive` driver（OpenList REST v3：列目录/提链/凭据校验）+ 云对云转存服务与三端点（§5.4）；内网/公网双基址（EasyTier 直连绕 CF 100MB 请求体上限，`swapBase` 仅同 host 换基址——签名只签路径）。
+- **M4.2 桌面浏览**：网盘页「自建云盘」卡片 + 浏览页（列目录/面包屑/长按多选/文件夹递归入队，`DownloadPlatform.MANGO` 直连分块下载 + sha256 校验）。
+- **M4.3 桌面转存**：分享页一键转存（服务端解析模式下逐文件提交）+ 转存记录页（3s 轮询、终结自停）。
+- **验收**：三层线上 E2E + sha256 字节级比对全过（140000 / 5242880 / 1048576 B）；`MangoDriveClientTest` / `PanRouterTransferTest` / 两个真机 E2E（env 门控，无凭据自动跳过）。
+- **红线**：桌面端零部署信息；存储解耦轮后端点信息全部服务端下发（`GET /storage`），`mangodrive` 只作协议类别名（品牌 → 类别）。
+- **后续加固（2026-11-09 review 轮）**：MANGO 补入按平台线程设置列表（v0.1.11）；offline 通道远端任务状态不回传为已知限制（转存记录对 offline 显示「已受理」语义即可，客户端不轮询远端 aria2）。
+
 ## 10. 测试策略
 
 - **契约测试**：`PanRouterClientTest` 用 OkHttp `MockWebServer` 回放 PanRouter 真实响应样本（样本文件对齐 PanRouter 仓 httptest fixture 风格，**手工誊抄协议字段、不复制其代码**，维持 R1 边界）。服务端契约变更（development.md §12.2）时先补样本再改代码。
@@ -315,6 +342,7 @@ pxed 上行有限且多设备共享：stream 路径线程数 = `min(用户设置
 
 ## 变更记录
 
+- **v1.11（2026-11-09）**：**M4 契约补规格（桌面端 v0.1.10/0.1.11）**。M4 三层（自建云盘接入）此前只在 vault 记录，规格缺位——本轮把 §5.4（storage/transfer 端点契约 + channel 语义 + 快照幂等 + 转存上限 + 解析浏览链 + 桌面直连下载 + 红线延伸）与 §9 M4 里程碑正式写入。随批：MANGO 补入按平台线程设置列表（v0.1.11，修复「下载线程数无法按平台调整、落全局默认」）；登记已知限制：offline 通道远端 aria2 任务状态不回传（转存记录对其为「已受理」语义），storage 端点 max_bytes 对 ≤0 回报默认值的展示口径差异。
 - **v1.10（2026-11-05）**：**测试隔离根治 + 去重查找索引（桌面端 v0.1.9，服务端零改动）**。① 测试 JVM 数据目录整体重定向（`tasks.withType<Test>` 注入 `YUNX_DESKTOP_DATA_DIR`→`build/test-data`）：Log 门面/AppContext 等单例在测试中只写构建产物目录，不再污染真实用户目录（线上排障时曾把引擎测试的假错误「推送被拒」写进真实 `yunx-desktop.log` 干扰判读）。重定向**暴露并根治一颗潜伏缺陷**：引擎 `syncOnce` 就绪判定原经 `isSyncReady()` 直连真实 `PanRouterTokenStore`，其解密密钥在 `<dbDir>/credential.key`——引擎测试一直隐性依赖用户真实 token+密钥才通过；改为经 `tokenProvider` 注入缝判定（生产默认实现不变，测试可注入）。② 去重查找索引迁移：`idx_bookmark_link` / `idx_link_history_url`——重复归一 pull 每条远端变更都要按 link/url 查本地，首次大积压同步（数千条×全表扫）线性放大；真库测试同步断言索引存在。`:desktop:test` **172/172** 绿（+1 URL 真库用例）。
 - **v1.9（2026-11-05）**：**重复实体归一（v1.7 遗留的「跨设备同 URL 重复」裁定项落地，桌面端 v0.1.8，服务端零改动）**。多设备在开启同步前各自解析/收藏同一链接 → 异 uid 两行 → 同步后各端重复。根因修复：`applyRemote` 落地前按 link/url 找齐本地同实体异 uid 行（新 DAO `listByLinkForSync`/`listByUrlForSync`，`ORDER BY createTime ASC, id ASC`），按「**createTime 最早者胜，并列取 uid 字典序小者**」的确定性规则裁决唯一赢家——每台设备独立算出同一赢家，全网收敛；败者走 `reconcileLose`：作废旧记忆 + 记待推送墓碑（时间戳取 `max(now, 对方+1)` 保证必赢服务端 LWW），双端收到墓碑删行后只剩赢家一行。只改拉取合并侧即可收敛全部场景（本机新增与远端撞车时，对端收到墓碑自行删行）。测试 +4（远端旧胜→本地墓碑上传 / 本地旧胜→远端 uid 墓碑且幂等重拉被记忆挡住 / 历史页同规则 / 真库排序口径），并修正 `not ready` 用例的游标顺序依赖（改为断言「不变」）；`:desktop:test` **171/171** 绿。服务端本轮零改动（纯客户端合并逻辑）。
 - **v1.8（2026-11-05）**：**M3 Review 修复轮二批（final review 7 项全修，桌面端 v0.1.7 ↔ 服务端体上限+日志）**。① P2 生产 outbox SQL 零覆盖：新增 `SyncOutboxStoreTest` 6 例——`AppDatabase.open` 增内部测试入口（可传临时目录开独立真库，不触碰单例），真实 SQLite 驱动生产 DAO 验证同 uid 压缩（编辑/墓碑/记忆各只留最新）、版本记忆 5000 上限挤最老且待推送不动、discard 删意图不留记忆且不误伤已推送、900 uid 分块 IN 回读 + 空 uid 行提取 + 索引迁移、download_record 终态意图接线（insert 不记账 / FAILED+error / COMPLETED）、applyFromRemote 按 uid 幂等且不记账；② P2 设置页「立即同步」协程无兜底：整段 runCatching（DAO/prefs IO 异常裸抛会崩 UI 协程且 syncingNow 卡死），对齐同文件既有惯例；③ P2 回填每轮全表物化：三 DAO 加 `listWithEmptySyncUid()`（`WHERE syncUid=''` 走本轮所建索引），引擎 backfill 不再 observeAll 全量——空 uid 行只存在于老库迁移形态；④ P3 服务端 sync/accounts 请求体上限：`decodeBoundedBody` = `http.MaxBytesReader(10MB)` + `MaxBytesError→KindUnsupported(400)`（客户端毒丸语义可收敛），e2e `TestE2ESyncPushBodyCap` 锁定（11MB 拒 + 正常体不受影响）；⑤ P3 游标回退查询失败补 `Warnw` 日志（原静默吞掉，运维无痕）；⑥ 注释订正（chunked(400)）+ 清理未用 import；⑦ 明确不修：历史记录跨设备同 URL 重复（uid 即身份模型语义，需产品裁定）。`:desktop:test` **167/167** 绿（+7），服务端 `go vet` + 全量绿（+1 e2e）。**线上实测（CI 编译产物实机部署）**：服务端 healthz `9eda5b91992c` + 生产同步契约冒烟 8/8（401/LWW skip/pull 回读/墓碑/17KB payload 400/游标回落/**10MB 请求体 400**）；桌面端 CI 便携包（`AppVersionKt`=0.1.7）实机启动，真实旧库完成迁移（三表 syncUid + sync_outbox + 索引），**双向全通**——生产推送的测试收藏被应用拉取落地（游标 0→3）、运行中应用把注入的空 uid 行回填并推送上生产（change id=4，device=DESKTOP-VST7EIE-6018，payload 完整，积压清零）、服务端墓碑下发后应用本地删除（游标 4→6，记忆更新为墓碑版本）；全程引擎日志零错误。
