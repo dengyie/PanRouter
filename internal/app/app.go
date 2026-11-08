@@ -108,7 +108,9 @@ func Build(o Options) (*App, error) {
 		return httpx.New(httpx.Options{
 			Timeout: 30 * time.Second, NoBodyTimeout: stream,
 			Proxy: c.Proxy, RedirectAllow: c.RedirectAllow,
-			AllowPrivate: o.AllowPrivateClients,
+			// 私有盘自建 OpenList:内网基址或本地 socks5 出口都是私网,
+			// 由 driver 配置显式放行;其余网盘保持 SSRF 防护。
+			AllowPrivate: o.AllowPrivateClients || c.AllowPrivate,
 		})
 	}
 

@@ -46,6 +46,9 @@ type DriverCommon struct {
 	InternalBase string `mapstructure:"internal_base"`
 	// PublicBase 可选:对外域名基址,用于还原相对形态的直链。
 	PublicBase string `mapstructure:"public_base"`
+	// AllowPrivate 允许该 driver 直连私网/回环地址。仅私有盘(自建 OpenList
+	// 走 EasyTier 内网或本地 socks5)需要,默认关闭以守住 SSRF 防线。
+	AllowPrivate bool `mapstructure:"allow_private"`
 }
 
 type Aria2 struct {
@@ -63,6 +66,9 @@ type Transfer struct {
 	Token string `mapstructure:"token"`
 	// DestDir 默认落盘目录。
 	DestDir string `mapstructure:"dest_dir"`
+	// Proxy 可选:访问 Endpoint 的代理(http:// 或 socks5://)。无 TUN 的
+	// EasyTier 节点靠本地 socks5 才能摸到内网地址。
+	Proxy string `mapstructure:"proxy"`
 	// MaxBytes 单文件上限;0 = 默认 64GiB,负值 = 不限。
 	MaxBytes int64 `mapstructure:"max_bytes"`
 }

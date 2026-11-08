@@ -152,8 +152,14 @@ func (d *Driver) GetDirectLink(ctx context.Context, cred *driver.Credential, ref
 	if obj.RawURL == "" {
 		return driver.DirectLink{}, driver.NewErr(driver.KindInterfaceChanged, "Mango Drive 未返回 raw_url", nil)
 	}
+	// 内网基址取到的 raw_url 指向 mesh/回环地址,客户端无法访问;
+	// 换回对外域名(sign 只签路径,换 host 不影响校验)。
+	link := absolute(obj.RawURL, d.PublicBase)
+	if d.InternalBase != "" && d.PublicBase != "" {
+		link = swapBase(link, d.InternalBase, d.PublicBase)
+	}
 	return driver.DirectLink{
-		URL:       absolute(obj.RawURL, d.PublicBase),
+		URL:       link,
 		UA:        BrowserUA,
 		ExpiresAt: time.Now().Add(rawLinkTTL),
 	}, nil
@@ -203,4 +209,23 @@ func absolute(raw, base string) string {
 		return raw
 	}
 	return b + raw
+}
+
+// swapBase 把 raw 中 oldBase(scheme://host) 换成 newBase,仅当 host 一致时生效。
+func swapBase(raw, oldBase, newBase string) string {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return raw
+	}
+	o, oerr := url.Parse(oldBase)
+	n, nerr := url.Parse(newBase)
+	if oerr != nil || nerr != nil {
+		return raw
+	}
+	if u.IsAbs() && u.Scheme == o.Scheme && u.Host == o.Host {
+		u.Scheme = n.Scheme
+		u.Host = n.Host
+		return u.String()
+	}
+	return raw
 }

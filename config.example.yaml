@@ -63,12 +63,15 @@ drivers:
     download_concurrency: 8
     internal_base: http://10.0.0.3:5244      # 内网(EasyTier)直连:绕开 CF 隧道请求体上限
     public_base: https://drive.example.com      # 对外域名:相对 raw_url 的还原基址
+    # proxy: socks5://127.0.0.1:11080            # 无 TUN 的节点:经本地 socks5 到内网
+    allow_private: true                         # 放行私网/回环;仅私有盘开,默认 false 守 SSRF
     redirect_allow: ["drive.example.com"]
 
 # 云对云转存:把解析出的直链搬进私有盘,不经客户端。
 # endpoint 同样建议用内网地址;token 为 OpenList 的 API Token。
 transfer:
   endpoint: http://10.0.0.3:5244
+  # proxy: socks5://127.0.0.1:11080             # 同上;无 TUN 节点必填
   token: ""
   dest_dir: /pool/panrouter
   max_bytes: 0                        # 0 = 默认 64GiB,负值 = 不限

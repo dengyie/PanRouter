@@ -139,3 +139,15 @@ func TestDriverCheckCredential(t *testing.T) {
 		t.Fatalf("bad token must be auth_expired, got %v", err)
 	}
 }
+
+func TestSwapBaseRewritesInternalLink(t *testing.T) {
+	got := swapBase("http://127.0.0.1:15244/p/Pool/a.mkv?sign=s1",
+		"http://127.0.0.1:15244", "https://drive.example.com")
+	want := "https://drive.example.com/p/Pool/a.mkv?sign=s1"
+	if got != want {
+		t.Fatalf("got %q want %q", got, want)
+	}
+	if same := swapBase(want, "http://127.0.0.1:15244", "https://drive.example.com"); same != want {
+		t.Fatalf("public link must stay untouched, got %q", same)
+	}
+}

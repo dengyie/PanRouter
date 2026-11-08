@@ -52,9 +52,9 @@ func TestTransferContract(t *testing.T) {
 	if st != http.StatusBadRequest {
 		t.Fatalf("bogus channel: status=%d", st)
 	}
-	// 缺 source_url → 404(not_found)
+	// 缺 source_url → 400(unsupported)
 	st, _ = doRaw(t, ts, token, "POST", "/api/v1/transfer/mangodrive", `{}`)
-	if st != http.StatusNotFound {
+	if st != http.StatusBadRequest {
 		t.Fatalf("empty source: status=%d", st)
 	}
 	// 非 http 链接 → 400(unsupported)

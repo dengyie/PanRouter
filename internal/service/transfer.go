@@ -67,7 +67,10 @@ type Transfer struct {
 // drive 仅用于探测 Mango Drive 端点,内网地址需要 AllowPrivate。
 func NewTransfer(cfg *config.Provider, resolver *Resolver, upstream map[string]*httpx.Client,
 	store *repo.Store, aes aesCipher, met *metrics.Registry, log *loggerType) (*Transfer, error) {
-	dcl, err := httpx.New(httpx.Options{Timeout: 20 * time.Second, AllowPrivate: true, NoBodyTimeout: true})
+	dcl, err := httpx.New(httpx.Options{
+		Timeout: 20 * time.Second, AllowPrivate: true, NoBodyTimeout: true,
+		Proxy: cfg.Get().Transfer.Proxy,
+	})
 	if err != nil {
 		return nil, fmt.Errorf("transfer client: %w", err)
 	}
@@ -194,7 +197,7 @@ func (s *Transfer) List() []TransferTask {
 func (s *Transfer) Submit(req TransferRequest) (*TransferTask, error) {
 	req.SourceURL = strings.TrimSpace(req.SourceURL)
 	if req.SourceURL == "" {
-		return nil, driver.NewErr(driver.KindNotFound, "source_url 必填", nil)
+		return nil, driver.NewErr(driver.KindUnsupported, "source_url 必填", nil)
 	}
 	if !strings.HasPrefix(req.SourceURL, "http://") && !strings.HasPrefix(req.SourceURL, "https://") {
 		return nil, driver.NewErr(driver.KindUnsupported, "仅支持 http(s) 链接", nil)
