@@ -438,6 +438,16 @@ func (r *Resolver) ResolveFile(ctx context.Context, rawURL, pwd, fid string, own
 	if merr != nil {
 		return nil, merr
 	}
+	if name == "" {
+		// 调用方直接给了 fid(如 mangodrive 的 FID 就是存储路径)却没先列过分享:
+		// 缓存与分享快照里都没有名字/大小,回问 driver 一次,别把「文件」+0 发出去。
+		if n, s := r.driverStat(ctx, drv, rawURL, fid, cred); n != "" {
+			name, size = n, s
+		}
+	}
+	if name == "" {
+		name = "文件"
+	}
 	cookieEnc, err := r.aes.EncryptBytes([]byte(dl.Cookie))
 	if err != nil {
 		return nil, fmt.Errorf("encrypt cookie: %w", err)
@@ -491,6 +501,7 @@ func (r *Resolver) buildRef(key, fid string, own bool) (*driver.FileRef, error) 
 	return ref, nil
 }
 
+// fileMeta 取文件展示元数据:先查直链缓存行,再查分享快照;都没有返回空 name 交由调用方兜底。
 func (r *Resolver) fileMeta(key, fid string, ref *driver.FileRef) (string, int64, map[string]string, error) {
 	l, err := r.store.GetLink(key, fid)
 	if err != nil {
@@ -505,18 +516,39 @@ func (r *Resolver) fileMeta(key, fid string, ref *driver.FileRef) (string, int64
 	if err != nil {
 		return "", 0, nil, fmt.Errorf("query share snapshot: %w", err)
 	}
-	if sh == nil {
-		return "文件", 0, ref.Ext, nil
-	}
-	var nodes []driver.FileNode
-	if json.Unmarshal([]byte(sh.RawTree), &nodes) == nil {
-		for _, n := range nodes {
-			if n.FID == fid {
-				return n.Name, n.Size, n.Ext, nil
+	if sh != nil {
+		var nodes []driver.FileNode
+		if json.Unmarshal([]byte(sh.RawTree), &nodes) == nil {
+			for _, n := range nodes {
+				if n.FID == fid {
+					return n.Name, n.Size, n.Ext, nil
+				}
 			}
 		}
 	}
-	return "文件", 0, ref.Ext, nil
+	return "", 0, ref.Ext, nil
+}
+
+// driverStat 回问 driver:把 rawURL 当作文件路径解析,命中 fid 时取名字与大小。
+// 只用于「缓存与分享快照都查不到」的场景(driver 的 FID 自带定位信息,如 mangodrive 的路径)。
+// 失败不致命:名字/大小只是展示信息,不该让一次可用的提链整体失败。
+func (r *Resolver) driverStat(ctx context.Context, drv driver.Driver, rawURL, fid string,
+	cred *driver.Credential) (string, int64) {
+	var nodes []driver.FileNode
+	err := r.guard(ctx, drv.ID(), func() error {
+		var gerr error
+		nodes, gerr = drv.ResolveShare(ctx, driver.ShareLink{URL: rawURL}, cred)
+		return gerr
+	})
+	if err != nil {
+		return "", 0
+	}
+	for _, n := range nodes {
+		if n.FID == fid && !n.IsDir && n.Name != "" {
+			return n.Name, n.Size
+		}
+	}
+	return "", 0
 }
 
 // buildResult 由 repo.Link 派生下载路径与签名链接。
