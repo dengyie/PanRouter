@@ -238,6 +238,9 @@ func (s *Transfer) Submit(req TransferRequest) (*TransferTask, error) {
 	go func() {
 		rctx, cancel := context.WithCancel(context.Background())
 		defer cancel()
+		// 后台任务已过管理员鉴权(路由挂在 auth 组内):显式打标,
+		// 否则 resolver 按游客处理,不读账号 Cookie → auth_expired。
+		rctx = WithAuthed(rctx, true)
 		if err := s.Run(rctx, task, req); err != nil {
 			task.finish("failed", err.Error(), hintOf(err))
 			s.log.Warnw("transfer failed", "id", task.ID, "err", err)
