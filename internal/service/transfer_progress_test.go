@@ -62,3 +62,43 @@ func TestTransferProgressVisibleWhilePutPending(t *testing.T) {
 		t.Fatalf("终态 done=%d want 100000", snap.Done)
 	}
 }
+
+// 回归:Get 返回的是快照副本,API handler 会再对它调一次 Snapshot。
+// 二次快照必须保留进度,否则线上轮询永远读到 done=0(即使 size 正确)。
+func TestTransferSnapshotIdempotent(t *testing.T) {
+	payload := strings.Repeat("z", 4096)
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Length", "4096")
+		_, _ = w.Write([]byte(payload))
+	}))
+	defer up.Close()
+
+	ol := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPut && r.URL.Path == "/api/fs/put":
+			_, _ = io.Copy(io.Discard, r.Body)
+			_, _ = w.Write([]byte(`{"code":200,"message":"success"}`))
+		case r.URL.Path == "/api/fs/mkdir":
+			_, _ = w.Write([]byte(`{"code":200,"message":"success"}`))
+		default:
+			t.Errorf("unexpected openlist call: %s %s", r.Method, r.URL.Path)
+		}
+	}))
+	defer ol.Close()
+
+	tr, share := newTransferFixture(t, up.URL, ol.URL)
+	task, err := tr.Submit(TransferRequest{SourceURL: share, Channel: ChannelStream, DestDir: "/Pool", UA: "UA/1"})
+	if err != nil {
+		t.Fatalf("submit: %v", err)
+	}
+	waitDone(t, tr, task.ID)
+
+	snap := tr.Get(task.ID)
+	if snap.Done != 4096 || snap.Size != 4096 {
+		t.Fatalf("首次快照 size/done=%d/%d want 4096", snap.Size, snap.Done)
+	}
+	again := snap.Snapshot()
+	if again.Done != 4096 || again.Size != 4096 {
+		t.Fatalf("二次快照 size/done=%d/%d want 4096", again.Size, again.Done)
+	}
+}

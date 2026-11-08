@@ -131,6 +131,7 @@ func (t *TransferTask) finish(state, errMsg, hint string) {
 	if state == "done" {
 		if n := atomic.LoadInt64(&t.done); n > 0 {
 			t.Size = n
+			t.Done = n
 		}
 	}
 	if t.met != nil {
@@ -139,9 +140,15 @@ func (t *TransferTask) finish(state, errMsg, hint string) {
 }
 
 // Snapshot 返回可序列化的当前状态(进度原子读取;不复制锁)。
+// 幂等:快照可能被再次快照(Get → handler),copy 里没有原子计数器,
+// 进度靠 Done 字段传递,否则第二次快照会把 done 读回 0。
 func (t *TransferTask) Snapshot() TransferTask {
 	t.mu.Lock()
 	defer t.mu.Unlock()
+	done := atomic.LoadInt64(&t.done)
+	if t.Done > done {
+		done = t.Done
+	}
 	return TransferTask{
 		ID:        t.ID,
 		State:     t.State,
@@ -150,7 +157,7 @@ func (t *TransferTask) Snapshot() TransferTask {
 		DestPath:  t.DestPath,
 		FileName:  t.FileName,
 		Size:      t.Size,
-		Done:      atomic.LoadInt64(&t.done),
+		Done:      done,
 		Error:     t.Error,
 		Hint:      t.Hint,
 		StartedAt: t.StartedAt,
