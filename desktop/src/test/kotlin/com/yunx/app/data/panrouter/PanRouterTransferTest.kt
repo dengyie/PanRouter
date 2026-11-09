@@ -213,6 +213,17 @@ class PanRouterTransferTest {
         assertTrue(unknown.isRunning)
         assertFalse(unknown.isTerminal)
 
+        // offline 受理后停在 pending：不是终态，必须继续轮询，
+        // 否则桌面端会在产物真正落池前停止轮询。
+        assertEquals("落池中", TransferTask.stateLabelOf(TransferTask.STATE_PENDING))
+        val pending = TransferTask(
+            id = "p", state = TransferTask.STATE_PENDING, channel = TransferChannel.OFFLINE,
+            sourceUrl = "", destPath = "/Pool/a.bin", fileName = "a.bin", size = 0L, done = 0L,
+            error = "", hint = "", startedAtMs = 0L, endedAtMs = 0L
+        )
+        assertTrue(pending.isRunning)
+        assertFalse(pending.isTerminal)
+
         assertEquals("排队中", TransferTask.stateLabelOf(TransferTask.STATE_QUEUED))
         assertEquals("搬运中", TransferTask.stateLabelOf(TransferTask.STATE_RUNNING))
         assertEquals("已完成", TransferTask.stateLabelOf(TransferTask.STATE_DONE))

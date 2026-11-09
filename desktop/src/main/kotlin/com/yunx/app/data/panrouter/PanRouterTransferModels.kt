@@ -44,7 +44,7 @@ data class TransferRequest(
 /** 转存任务快照（服务端 `TransferTask`）。 */
 data class TransferTask(
     val id: String,
-    /** queued | running | done | failed */
+    /** queued | running | pending | done | failed */
     val state: String,
     val channel: String,
     val sourceUrl: String,
@@ -58,7 +58,7 @@ data class TransferTask(
     val endedAtMs: Long
 ) {
     val isTerminal: Boolean get() = state == STATE_DONE || state == STATE_FAILED
-    val isRunning: Boolean get() = state == STATE_RUNNING || state == STATE_QUEUED
+    val isRunning: Boolean get() = state == STATE_RUNNING || state == STATE_QUEUED || state == STATE_PENDING
 
     /** 0..1；未知总大小（size <= 0）时为 null，界面用不确定进度条 */
     val progress: Float?
@@ -67,12 +67,15 @@ data class TransferTask(
     companion object {
         const val STATE_QUEUED = "queued"
         const val STATE_RUNNING = "running"
+        /** 远端已受理（离线通道），产物尚未落池确认：仍占着目标路径，需继续轮询 */
+        const val STATE_PENDING = "pending"
         const val STATE_DONE = "done"
         const val STATE_FAILED = "failed"
 
         fun stateLabelOf(state: String): String = when (state) {
             STATE_QUEUED -> "排队中"
             STATE_RUNNING -> "搬运中"
+            STATE_PENDING -> "落池中"
             STATE_DONE -> "已完成"
             STATE_FAILED -> "失败"
             else -> state
