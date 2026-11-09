@@ -1,6 +1,6 @@
 # YunX-Desktop × PanRouter 深度整合开发规格
 
-> 状态：v1.12（2026-11-09，转存通道/上限契约与生产实测对齐，服务端 `3aac3ee`）
+> 状态：v1.13（2026-11-10，offline 真实落盘名契约 + 生产 aria2 sidecar 上线，服务端 `43a4075`）
 > 本文是「云析桌面版二次开发 + PanRouter 深度整合」的工程规格（Engineering Spec）。
 > 生产运维与拓扑以 Obsidian《PanRouter 部署与运维》为准；PanRouter 服务端契约以仓内
 > `panrouter/docs/development.md` v2.1 为准。三份文档冲突时以各自领域的最新 canonical 为准并回写对齐。
@@ -217,7 +217,8 @@ desktop/src/main/kotlin/com/yunx/app/
 **M4 契约要点（客户端零部署信息的落点）**：
 - **基址服务端下发**：桌面端 `MangoDriveClient` 先问 `GET /storage`（实例内缓存），`publicBaseUrl` 仅作服务端不可达时的手动覆盖；`enabled=false → UNSUPPORTED`。换一套 OpenList 端点只改服务端 `transfer` 配置。
 - **channel 语义**：`stream`（服务端拉上游 → 流式 PUT，兼容任意提取链约束）/ `offline`（OpenList 侧 aria2 直拉，仅公开直链，需 UA/Referer/Cookie 或 BindIP 的源拒收）/ `auto`（默认；有约束或 BindIP 或 `size ≥ transfer.auto_stream_bytes` 走 stream，否则 offline）。
-- **offline 可用性前提（v1.12）**：offline 依赖 OpenList 宿主侧的 aria2 RPC（`http://localhost:6800/jsonrpc`）——**未部署 aria2 的端点上 offline 必然失败**。`auto` 选中的 offline 提交失败时**自动回退 stream**（任务快照 `channel` 落最终实际通道 `stream`，warn 日志留 `offline unavailable, falling back to stream`），因此桌面端默认通道在无 aria2 部署上仍可用；**显式** `channel=offline` 不回退，失败原因原样下发（`hint=upstream_error`，error 含 aria2 RPC 拒绝原文），调用方需自行降级重试。
+- **offline 可用性前提（v1.12）**：offline 依赖 OpenList 宿主侧的 aria2 RPC（`http://localhost:6800/jsonrpc`）——**未部署 aria2 的端点上 offline 必然失败**。`auto` 选中的 offline 提交失败时**自动回退 stream**（任务快照 `channel` 落最终实际通道 `stream`，warn 日志留 `offline unavailable, falling back to stream`），因此桌面端默认通道在无 aria2 部署上仍可用；**显式** `channel=offline` 不回退，失败原因原样下发（`hint=upstream_error`，error 含 aria2 RPC 拒绝原文），调用方需自行降级重试。**（v1.13 生产现状：Mango Drive 端点已部署 aria2 sidecar，offline/auto/stream 三通道真实可用；offline 产物名规则见下。）**
+- **offline 落盘名（v1.13）**：OpenList 离线任务**不可重命名**——落盘文件名 = 直链 URL 末段路径（aria2 `determineFilename`：percent-decode，源带 Content-Disposition 时以其为准；路径型直链两者一致且等于源文件真实名）。请求里的 `name` **仅 stream 通道生效**（File-Path 头）；offline 任务快照的 `file_name`/`dest_path` 由服务端改写为真实产物名（`43a4075`），桌面端展示以快照为准。同源并发 offline 在目标目录同名覆盖（aria2 的 `.1` 冲突后缀只发生在单任务临时目录内，跨任务不生效）。
 - **快照幂等**：`done` 原子计数，二次快照（handler 内 Get→Snapshot）不回零；成功终态 `Done=Size=实际字节`。
 - **转存上限**：单文件 `transfer.max_bytes`（0=默认 64GiB，负=不限）。offline 在提交远端前按源大小硬校验：超限拒绝（`Unsupported`，error 含上限字节数），**大小未知时显式 offline 亦拒绝**（远端无法回滚；auto 改走 stream 由实收字节兜底）；stream 既预检 `Content-Length` 也在**每条下载途中按实收字节截断**（chunked/无长度源无法绕过）。`GET /api/v1/storage` 对不限（负值）回报 `max_bytes=0`，桌面端按 `0 = 不限` 展示（v1.11 记为「展示口径差异」者即此，v1.12 定为契约）。
 - **任务可观测**：任务内存态保留 `keep_tasks`(200)/`keep_task_after`(24h)；浏览器断开不中断已受理任务（独立 ctx）。
@@ -343,6 +344,7 @@ pxed 上行有限且多设备共享：stream 路径线程数 = `min(用户设置
 
 ## 变更记录
 
+- **v1.13（2026-11-10）**：**offline 通道生产可用 + 真实落盘名契约（服务端 `43a4075`，桌面端零改动）**。① Mango Drive 端点部署 aria2 sidecar（GoogleDrive 仓 `62de330`：共享 openlist 网络命名空间、RPC 密钥仅主机 .env、temp/aria2 权限模型 65534:1001+setgid+UMASK 002）——显式 offline / auto / stream 三通道 74B 生产探针全 done、产物落池核验；auto 不再需要回退兜底（保留为韧性逻辑）。② 生产探针暴露快照谎报缺陷：OpenList 离线不可重命名，落盘名 = URL 末段（aria2 percent-decode / Content-Disposition 优先），请求 `name` 仅 stream 生效——服务端在 AddOffline 成功后把快照 `file_name`/`dest_path` 改写为真实产物名，桌面端转存记录从此指向真实文件。③ 已知限制更新：offline 远端任务状态不回传（乐观 done）依旧成立；新增「同源并发 offline 目标同名覆盖」。
 - **v1.12（2026-11-09）**：**M4 转存契约与生产实测对齐（服务端 `3aac3ee`，桌面端零改动）**。对生产用同一 74B 源跑 stream/offline/auto 三通道探针，定位并根因修复：① **P1 auto 在无 aria2 部署上必失败**：OpenList 侧 `add_offline_download` 返回 500 `failed init offline download tool aria2: ... localhost:6800 connection refused`，而 auto 对小文件（默认 <8GiB）本就选 offline → 桌面端默认通道 100% 失败，stream 明明可用。修复：`auto` 选中的 offline 提交失败时 warn 并回退 stream，快照 `channel` 落**最终实际通道**；显式 offline 仍不回退（§5.4 offline 可用性前提）。② 转存上限语义补全并落规格（v1.11 已实现，本轮提供生产证据）：offline 提交远端前硬校验、大小未知显式拒收、stream 预检 + 途中实收字节截断。③ 任务请求/快照增加可选 `client` 观测字段。④ storage `max_bytes` 负值→0 定为契约（0=不限），标注 v1.11「展示口径差异」结项。⑤ 生产探针证据：stream 74B `done=74`、产物落盘；修复前 offline/auto 均 `hint=upstream_error` 且无产物。规格同步修正 offline 任务状态不回传仍为已知限制（显式 offline 成功时 `done=size` 为乐观值，客户端按「已受理」语义展示）。
 - **v1.11（2026-11-09，已被 v1.12 覆盖部分契约）**：**M4 契约补规格（桌面端 v0.1.10/0.1.11）**。M4 三层（自建云盘接入）此前只在 vault 记录，规格缺位——本轮把 §5.4（storage/transfer 端点契约 + channel 语义 + 快照幂等 + 转存上限 + 解析浏览链 + 桌面直连下载 + 红线延伸）与 §9 M4 里程碑正式写入。随批：MANGO 补入按平台线程设置列表（v0.1.11，修复「下载线程数无法按平台调整、落全局默认」）；登记已知限制：offline 通道远端 aria2 任务状态不回传（转存记录对其为「已受理」语义），storage 端点 max_bytes 对 ≤0 回报默认值的展示口径差异。
 - **v1.10（2026-11-05）**：**测试隔离根治 + 去重查找索引（桌面端 v0.1.9，服务端零改动）**。① 测试 JVM 数据目录整体重定向（`tasks.withType<Test>` 注入 `YUNX_DESKTOP_DATA_DIR`→`build/test-data`）：Log 门面/AppContext 等单例在测试中只写构建产物目录，不再污染真实用户目录（线上排障时曾把引擎测试的假错误「推送被拒」写进真实 `yunx-desktop.log` 干扰判读）。重定向**暴露并根治一颗潜伏缺陷**：引擎 `syncOnce` 就绪判定原经 `isSyncReady()` 直连真实 `PanRouterTokenStore`，其解密密钥在 `<dbDir>/credential.key`——引擎测试一直隐性依赖用户真实 token+密钥才通过；改为经 `tokenProvider` 注入缝判定（生产默认实现不变，测试可注入）。② 去重查找索引迁移：`idx_bookmark_link` / `idx_link_history_url`——重复归一 pull 每条远端变更都要按 link/url 查本地，首次大积压同步（数千条×全表扫）线性放大；真库测试同步断言索引存在。`:desktop:test` **172/172** 绿（+1 URL 真库用例）。
