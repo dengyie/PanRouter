@@ -1,6 +1,7 @@
 package service
 
 import (
+	"encoding/json"
 	"errors"
 	"io"
 	"net/http"
@@ -200,8 +201,54 @@ func TestAutoOfflineFailureFallsBackToStream(t *testing.T) {
 	if snap.Channel != string(ChannelStream) {
 		t.Fatalf("回退后 channel=%s want stream", snap.Channel)
 	}
+	if snap.FileName != "n.bin" || snap.DestPath != "/Pool/n.bin" {
+		t.Fatalf("回退后快照必须还原 stream 命名, got file=%s path=%s", snap.FileName, snap.DestPath)
+	}
 	if atomic.LoadInt64(&puts) != 1 || atomic.LoadInt64(&putBody) != 300 {
 		t.Fatalf("stream PUT 次数=%d 字节=%d, want 1/300", puts, putBody)
+	}
+}
+
+// offline 不支持重命名:落盘名 = URL 末段(aria2 规则)。快照必须写真实产物名,
+// 否则转存记录指向不存在的文件(生产探针实证:请求 mango-aria2-offline.bin,
+// 实际落盘 welcome.txt)。
+func TestOfflineSnapshotUsesLandedName(t *testing.T) {
+	var gotMkdir, gotOffline string
+	ol := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body struct{ Path string }
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		switch r.URL.Path {
+		case "/api/fs/mkdir":
+			gotMkdir = body.Path
+			_, _ = w.Write([]byte(`{"code":200,"message":"success"}`))
+		case "/api/fs/add_offline_download":
+			gotOffline = body.Path
+			_, _ = w.Write([]byte(`{"code":200,"message":"success","data":{"tasks":[{"id":"1"}]}}`))
+		default:
+			t.Errorf("unexpected openlist call: %s %s", r.Method, r.URL.Path)
+		}
+	}))
+	defer ol.Close()
+
+	// fakeDriver 直链 = upstream/file → 末段 "file",与分享内文件名 n.bin 不同。
+	tr, share := newTransferFixture(t, "http://up.invalid/base", ol.URL)
+	task, err := tr.Submit(TransferRequest{SourceURL: share, Channel: ChannelOffline, DestDir: "/Pool", UA: "UA/1"})
+	if err != nil {
+		t.Fatalf("submit: %v", err)
+	}
+	waitDone(t, tr, task.ID)
+	snap := tr.Get(task.ID)
+	if snap.State != "done" {
+		t.Fatalf("state=%s err=%s", snap.State, snap.Error)
+	}
+	if snap.FileName != "file" {
+		t.Fatalf("快照 file_name=%s want 真实落盘名 file (URL 末段)", snap.FileName)
+	}
+	if snap.DestPath != "/Pool/file" {
+		t.Fatalf("快照 dest_path=%s want /Pool/file", snap.DestPath)
+	}
+	if gotMkdir != "/Pool" || gotOffline != "/Pool" {
+		t.Fatalf("OpenList 调用 path: mkdir=%q offline=%q want /Pool", gotMkdir, gotOffline)
 	}
 }
 

@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"sort"
 	"strconv"
 	"strings"
@@ -673,6 +674,15 @@ func (s *Transfer) transferOffline(ctx context.Context, task *TransferTask, src 
 	if err != nil {
 		return err
 	}
+	// OpenList 离线不支持重命名:落盘文件名 = URL 末段路径(aria2 命名规则,
+	// percent-decode 后;源带 Content-Disposition 时以其为准——路径型直链两者一致)。
+	// 快照必须写真实产物名/路径,不能沿用请求的 name(否则转存记录指向不存在的文件)。
+	if landed := offlineLandedName(offlineURL); landed != "" {
+		task.mu.Lock()
+		task.FileName = landed
+		task.DestPath = pathDir(destPath) + "/" + landed
+		task.mu.Unlock()
+	}
 	// OpenList 离线端点异步建任务,成功时空响应体亦属正常;任务由远端队列接管。
 	// task.log 可能为 nil(直接构造 TransferTask 的调用方),日志只是附加观测,不能因此 panic。
 	if len(tasks) > 0 && task.log != nil {
@@ -680,6 +690,27 @@ func (s *Transfer) transferOffline(ctx context.Context, task *TransferTask, src 
 	}
 	task.set(src.size)
 	return nil
+}
+
+// offlineLandedName 计算 offline 通道的真实落盘文件名:URL 末段路径百分号解码。
+// 解析失败或为空返回 ""(调用方保留请求名兜底;URL 以 / 结尾时 aria2 落 index.html,
+// 该形态直链本就不应进入离线通道)。
+func offlineLandedName(raw string) string {
+	u, err := url.Parse(raw)
+	if err != nil || u.Path == "" {
+		return ""
+	}
+	name := u.Path
+	if i := strings.LastIndex(name, "/"); i >= 0 {
+		name = name[i+1:]
+	}
+	if name == "" {
+		return ""
+	}
+	if dec, err := url.PathUnescape(name); err == nil {
+		name = dec
+	}
+	return name
 }
 
 // clientLabel 归一化调用方标识:去控制字符、限长 64,空值省略。
