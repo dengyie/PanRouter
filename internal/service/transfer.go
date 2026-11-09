@@ -532,10 +532,23 @@ func (s *Transfer) watchOfflineArtifact(task *TransferTask, destPath string, exp
 	}
 	poll := cfg.OfflineConfirmPoll
 	if poll <= 0 {
-		poll = 30 * time.Second
+		poll = 10 * time.Second
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), after)
 	defer cancel()
+	check := func() bool {
+		obj, err := s.driveAPI().Get(ctx, destPath)
+		return err == nil && obj != nil && obj.Size >= expect
+	}
+	confirm := func() {
+		s.log.Infow("offline artifact confirmed",
+			"id", task.ID, "dest", destPath, "size", expect)
+	}
+	// 立即首查:小文件(或重传时产物已在)等不到第一个 tick,占用窗口可以秒级收口。
+	if check() {
+		confirm()
+		return
+	}
 	tick := time.NewTicker(poll)
 	defer tick.Stop()
 	for {
@@ -548,10 +561,8 @@ func (s *Transfer) watchOfflineArtifact(task *TransferTask, destPath string, exp
 			if s.Get(task.ID) == nil {
 				return // 任务已出保留窗口被清理
 			}
-			obj, err := s.driveAPI().Get(ctx, destPath)
-			if err == nil && obj != nil && obj.Size >= expect {
-				s.log.Infow("offline artifact confirmed",
-					"id", task.ID, "dest", destPath, "size", obj.Size)
+			if check() {
+				confirm()
 				return
 			}
 		}

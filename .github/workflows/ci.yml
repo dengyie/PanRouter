@@ -29,6 +29,11 @@ jobs:
       - name: Test
         run: go test ./... -count=1
 
+      # 竞态与测试顺序检测:转存链路带并发面(同名守卫/落池确认器/直链客户端),
+      # 本机 32 位无法 -race,由 CI 侧兜底。shuffle 抓测试间耦合。
+      - name: Test with race detector
+        run: go test -race -shuffle=on ./... -count=1
+
   deploy:
     name: Deploy to pxed
     needs: test

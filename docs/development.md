@@ -415,6 +415,7 @@ iframe / modern / 密码分享三条流;最终 CDN 对非浏览器客户端先 a
 
 - 原则:CI 不打真实网盘;driver 合约测试用 httptest 回放响应样本;网盘改版时先补样本再修代码,回归全绿
 - 现有覆盖:service 决策表(表驱动)、singleflight 收敛与并发闸(峰值在途断言)、driver 合约(quark 转存链/stoken/Cookie、lanzou 三流/CDN)、httpx(SSRF/重定向/acw/超时)、web 托管(fstest.MapFS + 保留路径 + Accept 语义)、e2e(装配级)、repo/errors/config 单测
+- 竞态与顺序(2026-11-10):CI 增 `go test -race -shuffle=on ./...`——本 session 转存链新增并发面(同名守卫 claim/release、offline 落池确认器 goroutine、直链客户端),本机 32 位无法 -race,由 CI 兜底;shuffle 抓测试间耦合
 - 缺口:§15 每项标注的回归测试;limiter/metrics/breaker 目前仅经集成覆盖,无直接包测试
 
 ---

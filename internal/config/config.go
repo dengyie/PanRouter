@@ -90,7 +90,7 @@ type Transfer struct {
 	// OfflineConfirmAfter offline 任务落池确认窗口:受理即 done(契约),产物是否
 	// 真实落池由后台确认器观测;窗口内未确认仅告警不改状态。0 = 默认 2h,负 = 关闭。
 	OfflineConfirmAfter time.Duration `mapstructure:"offline_confirm_after"`
-	// OfflineConfirmPoll 落池确认轮询间隔;0 = 默认 30s。仅测试会调小。
+	// OfflineConfirmPoll 落池确认轮询间隔(决定同名路径冲突窗口的检测延迟);0 = 默认 10s。仅测试会调小。
 	OfflineConfirmPoll time.Duration `mapstructure:"offline_confirm_poll"`
 }
 
@@ -159,7 +159,7 @@ func Default() *Config {
 	c.Transfer.KeepTasks = 200
 	c.Transfer.KeepTaskAfter = 24 * time.Hour
 	c.Transfer.OfflineConfirmAfter = 2 * time.Hour
-	c.Transfer.OfflineConfirmPoll = 30 * time.Second
+	c.Transfer.OfflineConfirmPoll = 10 * time.Second
 	return c
 }
 
