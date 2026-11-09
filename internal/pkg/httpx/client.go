@@ -149,12 +149,17 @@ func (c *Client) privateGuard(req *http.Request, host string) error {
 }
 
 // SuffixMatch 判断 host 是否命中后缀白名单(大小写不敏感)。
+// "*" 是全放行哨兵:仅用于「公网直链直传」一类场景——每跳重定向仍过 privateGuard,
+// 私网在 DNS 与拨号两层都会被拒,哨兵只放开「跨哪个公网 host」的维度。
 func SuffixMatch(host string, allow []string) bool {
 	host = strings.ToLower(host)
 	for _, a := range allow {
 		a = strings.ToLower(strings.TrimSpace(a))
 		if a == "" {
 			continue
+		}
+		if a == "*" {
+			return true
 		}
 		a = strings.TrimPrefix(a, ".")
 		if host == a || strings.HasSuffix(host, "."+a) {

@@ -68,6 +68,10 @@ type Transfer struct {
 
 // NewTransfer 装配转存编排。upstream 为 Relay 的 per-pan 客户端(带各自重定向白名单);
 // drive 仅用于探测 Mango Drive 端点,内网地址需要 AllowPrivate。
+// FIDDirect 是直链直传的 FID 约定值:SourceURL 即任意公网 http(s) 直链,
+// 不经网盘解析,直接进转存管线(stream 由服务端拉,offline 由远端 aria2 拉)。
+const FIDDirect = "direct"
+
 func NewTransfer(cfg *config.Provider, resolver *Resolver, upstream map[string]*httpx.Client,
 	store *repo.Store, aes aesCipher, met *metrics.Registry, log *loggerType) (*Transfer, error) {
 	dcl, err := httpx.New(httpx.Options{
@@ -77,7 +81,22 @@ func NewTransfer(cfg *config.Provider, resolver *Resolver, upstream map[string]*
 	if err != nil {
 		return nil, fmt.Errorf("transfer client: %w", err)
 	}
-	return &Transfer{cfg: cfg, resolver: resolver, upstream: upstream, drive: dcl,
+	// direct 客户端:直链直传专用。禁止私网(拨号级 + 每跳重定向 DNS 级双保险),
+	// 公网跨域 302 放行(github release → objects.githubusercontent.com 一类);
+	// 无总超时,响应头超时仍受 Timeout 约束。AllowPrivate 仅供测试 fixture 打开。
+	direct, err := httpx.New(httpx.Options{
+		Timeout: 30 * time.Second, AllowPrivate: cfg.Get().Transfer.DirectAllowPrivate,
+		RedirectAllow: []string{"*"}, NoBodyTimeout: true,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("direct transfer client: %w", err)
+	}
+	ups := make(map[string]*httpx.Client, len(upstream)+1)
+	for k, v := range upstream {
+		ups[k] = v
+	}
+	ups["direct"] = direct
+	return &Transfer{cfg: cfg, resolver: resolver, upstream: ups, drive: dcl,
 		store: store, aes: aes, met: met, log: log, tasks: map[string]*TransferTask{}}, nil
 }
 
@@ -468,10 +487,14 @@ type transferSource struct {
 
 // resolveSource 把分享链接解析成直链 + 提取链约束。
 // FID 为空时先展开分享取第一个文件:目录分享的批量转存由客户端逐个提交(可观测、可重试)。
+// FID == "direct" 时 SourceURL 即公网直链,跳过网盘解析(见 resolveDirectSource)。
 func (s *Transfer) resolveSource(ctx context.Context, req TransferRequest) (*transferSource, error) {
 	ua := req.UA
 	if ua == "" {
 		ua = mangodrive.BrowserUA
+	}
+	if req.FID == FIDDirect {
+		return s.resolveDirectSource(ctx, req.SourceURL, ua)
 	}
 	fid := req.FID
 	pan := ""
@@ -524,6 +547,86 @@ func (s *Transfer) resolveSource(ctx context.Context, req TransferRequest) (*tra
 		upstream:  pan,
 		needHdr:   NeedHeaders(link.UA, link.Referer, string(cookie), ua),
 	}, nil
+}
+
+// resolveDirectSource 把公网直链装配成 transferSource(fid=direct 直链直传)。
+// SSRF 防护:探测请求经 direct 客户端(AllowPrivate=false),私网地址在拨号层被拒;
+// 探测同时拿到大小,给 chooseChannel 做 offline 上限预检。探测失败即拒绝,
+// 不放行「先受理再失败」的直链——offline 通道会把 URL 交给远端 aria2 拉取,
+// 本机探测是唯一能在提交前拦住私网直链的闸门。
+func (s *Transfer) resolveDirectSource(ctx context.Context, rawURL, ua string) (*transferSource, error) {
+	u, err := url.Parse(rawURL)
+	if err != nil || u.Host == "" {
+		return nil, driver.NewErr(driver.KindUnsupported, "直链格式无效", nil)
+	}
+	if u.User != nil {
+		return nil, driver.NewErr(driver.KindUnsupported, "直链不应携带用户凭据", nil)
+	}
+	size, perr := s.probeDirectSize(ctx, rawURL, ua)
+	if perr != nil {
+		return nil, perr
+	}
+	name := cleanName(offlineLandedName(rawURL))
+	return &transferSource{
+		file: &ResolveFileResult{
+			Pan: "direct", FID: FIDDirect, FileName: name,
+			DirectURL: rawURL, ExpiresAt: time.Now().Add(time.Hour),
+		},
+		meta:     LinkMeta{UA: ua},
+		name:     name,
+		size:     size,
+		upstream: "direct",
+	}, nil
+}
+
+// probeDirectSize 探测直链大小:HEAD 取 Content-Length,不支持则 GET Range:0-0
+// 取 Content-Range 总长。私网直链在这里被 direct 客户端拒绝(SSRF 闸门)。
+func (s *Transfer) probeDirectSize(ctx context.Context, rawURL, ua string) (int64, error) {
+	cl := s.upstream["direct"]
+	blocked := func(err error) bool {
+		return err != nil && (strings.Contains(err.Error(), "blocked private") ||
+			strings.Contains(err.Error(), "resolves to private"))
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodHead, rawURL, nil)
+	if err != nil {
+		return 0, driver.NewErr(driver.KindUnsupported, "直链格式无效", err)
+	}
+	req.Header.Set("User-Agent", ua)
+	if resp, err := cl.DoStream(req); err == nil {
+		defer resp.Body.Close()
+		if resp.StatusCode == http.StatusOK && resp.ContentLength > 0 {
+			return resp.ContentLength, nil
+		}
+	} else if blocked(err) {
+		return 0, driver.NewErr(driver.KindUnsupported, "直链指向私网地址,已拒绝(SSRF 防护)", nil)
+	}
+	req2, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
+	if err != nil {
+		return 0, driver.NewErr(driver.KindUnsupported, "直链格式无效", err)
+	}
+	req2.Header.Set("User-Agent", ua)
+	req2.Header.Set("Range", "bytes=0-0")
+	resp, err := cl.DoStream(req2)
+	if err != nil {
+		if blocked(err) {
+			return 0, driver.NewErr(driver.KindUnsupported, "直链指向私网地址,已拒绝(SSRF 防护)", nil)
+		}
+		return 0, driver.NewErr(driver.KindUpstream, "直链不可达", err)
+	}
+	defer resp.Body.Close()
+	switch {
+	case resp.StatusCode == http.StatusPartialContent:
+		if cr := resp.Header.Get("Content-Range"); cr != "" {
+			if i := strings.LastIndex(cr, "/"); i >= 0 {
+				if n, e := strconv.ParseInt(cr[i+1:], 10, 64); e == nil && n > 0 {
+					return n, nil
+				}
+			}
+		}
+	case resp.StatusCode == http.StatusOK && resp.ContentLength > 0:
+		return resp.ContentLength, nil
+	}
+	return 0, nil
 }
 
 // cleanName 去掉路径成分与 OpenList 不接受的控制字符。

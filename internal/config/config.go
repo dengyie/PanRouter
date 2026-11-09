@@ -84,6 +84,9 @@ type Transfer struct {
 	// 桌面端据此拼解析链接,不必内置域名;空 = 由 domain_routes 里
 	// mangodrive 的首个域名推导。
 	PublicBase string `mapstructure:"public_base"`
+	// DirectAllowPrivate 允许直链直传(fid=direct)访问私网地址。
+	// 仅测试 fixture 使用:生产必须 false,私网直链在探测阶段即拒绝(SSRF 防护)。
+	DirectAllowPrivate bool `mapstructure:"direct_allow_private"`
 }
 
 type Log struct {
