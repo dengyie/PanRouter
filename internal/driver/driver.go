@@ -26,6 +26,7 @@ const (
 	KindInterfaceChanged Kind = "interface_changed" // 返回结构解析失败(接口改版)
 	KindUpstream         Kind = "upstream_error"    // 上游 5xx/网络错误
 	KindUnsupported      Kind = "unsupported"       // 功能暂不支持(如带密码蓝奏云)
+	KindConflict         Kind = "conflict"          // 目标冲突(如同名转存进行中)
 )
 
 // Error 是 driver 返回的唯一错误类型,Kind 驱动 service 层的重试/熔断/提示决策。

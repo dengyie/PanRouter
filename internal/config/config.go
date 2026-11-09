@@ -87,6 +87,11 @@ type Transfer struct {
 	// DirectAllowPrivate 允许直链直传(fid=direct)访问私网地址。
 	// 仅测试 fixture 使用:生产必须 false,私网直链在探测阶段即拒绝(SSRF 防护)。
 	DirectAllowPrivate bool `mapstructure:"direct_allow_private"`
+	// OfflineConfirmAfter offline 任务落池确认窗口:受理即 done(契约),产物是否
+	// 真实落池由后台确认器观测;窗口内未确认仅告警不改状态。0 = 默认 2h,负 = 关闭。
+	OfflineConfirmAfter time.Duration `mapstructure:"offline_confirm_after"`
+	// OfflineConfirmPoll 落池确认轮询间隔;0 = 默认 30s。仅测试会调小。
+	OfflineConfirmPoll time.Duration `mapstructure:"offline_confirm_poll"`
 }
 
 type Log struct {
@@ -153,6 +158,8 @@ func Default() *Config {
 	c.Transfer.AutoStreamBytes = 8 << 30
 	c.Transfer.KeepTasks = 200
 	c.Transfer.KeepTaskAfter = 24 * time.Hour
+	c.Transfer.OfflineConfirmAfter = 2 * time.Hour
+	c.Transfer.OfflineConfirmPoll = 30 * time.Second
 	return c
 }
 

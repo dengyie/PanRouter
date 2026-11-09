@@ -62,8 +62,9 @@ type Transfer struct {
 	drive    *httpx.Client            // 调 OpenList:内网地址,须 AllowPrivate
 	seq      int64
 
-	mu    sync.RWMutex
-	tasks map[string]*TransferTask
+	mu         sync.RWMutex
+	tasks      map[string]*TransferTask
+	activeDest map[string]string // destPath → 占用它的任务 id(并发同名写守卫)
 }
 
 // NewTransfer 装配转存编排。upstream 为 Relay 的 per-pan 客户端(带各自重定向白名单);
@@ -97,7 +98,8 @@ func NewTransfer(cfg *config.Provider, resolver *Resolver, upstream map[string]*
 	}
 	ups["direct"] = direct
 	return &Transfer{cfg: cfg, resolver: resolver, upstream: ups, drive: dcl,
-		store: store, aes: aes, met: met, log: log, tasks: map[string]*TransferTask{}}, nil
+		store: store, aes: aes, met: met, log: log,
+		tasks: map[string]*TransferTask{}, activeDest: map[string]string{}}, nil
 }
 
 // TransferRequest 是一次转存请求。SourceURL 可以是任意受支持网盘的分享链接。
@@ -418,6 +420,24 @@ func (s *Transfer) Run(ctx context.Context, task *TransferTask, req TransferRequ
 	task.Channel = string(channel)
 	task.mu.Unlock()
 
+	// 同目标并发写守卫:同一落盘路径同时只允许一个任务在写。offline 的真实写入
+	// (aria2 下载 → OpenList 上传)在 PanRouter 任务 done 之后仍在进行,所以 offline
+	// 的占用维持到产物落池确认或确认窗口超时,由确认器 goroutine 释放(见 watchOfflineArtifact)。
+	final := finalDestPath(channel, src, destPath)
+	if err := s.claimDest(task.ID, final); err != nil {
+		return err
+	}
+	held := final
+	releaseOnce := false
+	release := func() {
+		if releaseOnce {
+			return
+		}
+		releaseOnce = true
+		s.releaseDest(held, task.ID)
+	}
+	defer release()
+
 	switch channel {
 	case ChannelOffline:
 		err := s.transferOffline(ctx, task, src, destPath)
@@ -426,16 +446,115 @@ func (s *Transfer) Run(ctx context.Context, task *TransferTask, req TransferRequ
 			// (localhost:6800 refused)或远端拒收时,auto 必须回退 stream,
 			// 否则桌面端默认通道(AUTO)在无 aria2 的部署上全部失败。
 			// 显式 offline 不回退:调用方明确要求省带宽,失败原因必须可见。
+			// 回退后真实写入路径变回 destPath(stream 命名),换占。
 			s.log.Warnw("offline unavailable, falling back to stream",
 				"id", task.ID, "err", err)
 			task.mu.Lock()
 			task.Channel = string(ChannelStream)
 			task.mu.Unlock()
+			release()
+			if cerr := s.claimDest(task.ID, destPath); cerr != nil {
+				return cerr
+			}
+			held = destPath
+			releaseOnce = false
 			return s.transferStream(ctx, task, src, destPath)
 		}
-		return err
+		if err != nil {
+			return err
+		}
+		// offline 受理成功:占用交给确认器(产物落池/超时/任务被清理时释放)。
+		// 注意不能用外层 release 闭包(其 releaseOnce 已置位防止 defer 重复释放),
+		// 确认器退出时必须直接释放。
+		releaseOnce = true
+		go func() {
+			defer s.releaseDest(final, task.ID)
+			s.watchOfflineArtifact(task, final, src.size)
+		}()
+		return nil
 	default:
 		return s.transferStream(ctx, task, src, destPath)
+	}
+}
+
+// finalDestPath 计算任务的最终落盘路径:offline 落盘名 = 直链 URL 末段(§5.4
+// offline 落盘名),stream 沿用解析名。冲突守卫与快照改写共用本函数,防止口径漂移。
+func finalDestPath(channel TransferChannel, src *transferSource, destPath string) string {
+	if channel == ChannelOffline && src.file != nil {
+		u := src.serverURL
+		if u == "" {
+			u = src.file.DirectURL
+		}
+		if ln := offlineLandedName(u); ln != "" {
+			return pathDir(destPath) + "/" + ln
+		}
+	}
+	return destPath
+}
+
+// claimDest 活跃任务目标路径互斥:同路径并发写(典型:stream PUT 与 offline 的
+// OpenList 上传互踩)会让离线任务上传失败并整单重试,白白重拉整个源。
+// 先完成再提交的串行同路径不受限(语义 = 覆盖)。
+func (s *Transfer) claimDest(taskID, destPath string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if owner, ok := s.activeDest[destPath]; ok && owner != taskID {
+		return driver.NewErr(driver.KindConflict,
+			"目标路径已有进行中的转存任务:"+destPath, nil)
+	}
+	s.activeDest[destPath] = taskID
+	return nil
+}
+
+// releaseDest 释放目标路径占用;非持有者调用是 no-op(幂等)。
+func (s *Transfer) releaseDest(destPath, taskID string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.activeDest[destPath] == taskID {
+		delete(s.activeDest, destPath)
+	}
+}
+
+// watchOfflineArtifact offline 受理即乐观 done(契约),真实落池由本确认器观测:
+// 产物以不小于预期的大小出现 → info 收口;确认窗口内未现 → warn。
+// 只做观测,不改任务状态(桌面端契约不受影响)。任务被清理时提前退出。
+func (s *Transfer) watchOfflineArtifact(task *TransferTask, destPath string, expect int64) {
+	if expect <= 0 {
+		return
+	}
+	cfg := s.cfg.Get().Transfer
+	after := cfg.OfflineConfirmAfter
+	if after == 0 {
+		after = 2 * time.Hour
+	}
+	if after < 0 {
+		return // 显式关闭
+	}
+	poll := cfg.OfflineConfirmPoll
+	if poll <= 0 {
+		poll = 30 * time.Second
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), after)
+	defer cancel()
+	tick := time.NewTicker(poll)
+	defer tick.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			s.log.Warnw("offline artifact not confirmed within window",
+				"id", task.ID, "dest", destPath, "expect", expect, "window", after)
+			return
+		case <-tick.C:
+			if s.Get(task.ID) == nil {
+				return // 任务已出保留窗口被清理
+			}
+			obj, err := s.driveAPI().Get(ctx, destPath)
+			if err == nil && obj != nil && obj.Size >= expect {
+				s.log.Infow("offline artifact confirmed",
+					"id", task.ID, "dest", destPath, "size", obj.Size)
+				return
+			}
+		}
 	}
 }
 
@@ -777,13 +896,13 @@ func (s *Transfer) transferOffline(ctx context.Context, task *TransferTask, src 
 	if err != nil {
 		return err
 	}
-	// OpenList 离线不支持重命名:落盘文件名 = URL 末段路径(aria2 命名规则,
-	// percent-decode 后;源带 Content-Disposition 时以其为准——路径型直链两者一致)。
-	// 快照必须写真实产物名/路径,不能沿用请求的 name(否则转存记录指向不存在的文件)。
-	if landed := offlineLandedName(offlineURL); landed != "" {
+	// 快照改写与冲突守卫共用 finalDestPath 口径:offline 落盘名 = URL 末段
+	// (aria2 percent-decode;源带 Content-Disposition 时以其为准)。快照必须写
+	// 真实产物名/路径,不能沿用请求的 name(否则转存记录指向不存在的文件)。
+	if final := finalDestPath(ChannelOffline, src, destPath); final != destPath {
 		task.mu.Lock()
-		task.FileName = landed
-		task.DestPath = pathDir(destPath) + "/" + landed
+		task.FileName = final[strings.LastIndex(final, "/")+1:]
+		task.DestPath = final
 		task.mu.Unlock()
 	}
 	// OpenList 离线端点异步建任务,成功时空响应体亦属正常;任务由远端队列接管。

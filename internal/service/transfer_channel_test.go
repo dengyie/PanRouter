@@ -224,6 +224,8 @@ func TestOfflineSnapshotUsesLandedName(t *testing.T) {
 		case "/api/fs/add_offline_download":
 			gotOffline = body.Path
 			_, _ = w.Write([]byte(`{"code":200,"message":"success","data":{"tasks":[{"id":"1"}]}}`))
+		case "/api/fs/get": // 落池确认器轮询:始终未落池,保持静默轮询即可
+			_, _ = w.Write([]byte(`{"code":200,"message":"success","data":{"size":0,"is_dir":false}}`))
 		default:
 			t.Errorf("unexpected openlist call: %s %s", r.Method, r.URL.Path)
 		}
