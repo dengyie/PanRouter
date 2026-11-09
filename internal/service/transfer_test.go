@@ -145,7 +145,7 @@ func TestTransferAutoChannelSelection(t *testing.T) {
 	if err != nil {
 		t.Fatalf("submit: %v", err)
 	}
-	waitDone(t, tr, task.ID)
+	waitState(t, tr, task.ID, "pending", "done", "failed")
 	if tr.Get(task.ID).Channel != string(ChannelOffline) {
 		t.Fatalf("auto should pick offline for constraint-free link, got %s", tr.Get(task.ID).Channel)
 	}
@@ -198,12 +198,23 @@ func TestTransferStreamUnknownLengthFallsBackChunked(t *testing.T) {
 
 func waitDone(t *testing.T, tr *Transfer, id string) {
 	t.Helper()
+	waitState(t, tr, id, "done", "failed")
+}
+
+// waitState 等到任务进入给定状态之一;offline 任务受理后先停在 pending,
+// 产物落池/超时才收口,断言中途状态时用它。
+func waitState(t *testing.T, tr *Transfer, id string, states ...string) {
+	t.Helper()
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
-		if s := tr.Get(id); s != nil && (s.State == "done" || s.State == "failed") {
-			return
+		if s := tr.Get(id); s != nil {
+			for _, want := range states {
+				if s.State == want {
+					return
+				}
+			}
 		}
 		time.Sleep(20 * time.Millisecond)
 	}
-	t.Fatalf("task %s did not finish", id)
+	t.Fatalf("task %s did not reach state %v", id, states)
 }

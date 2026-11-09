@@ -87,8 +87,9 @@ type Transfer struct {
 	// DirectAllowPrivate 允许直链直传(fid=direct)访问私网地址。
 	// 仅测试 fixture 使用:生产必须 false,私网直链在探测阶段即拒绝(SSRF 防护)。
 	DirectAllowPrivate bool `mapstructure:"direct_allow_private"`
-	// OfflineConfirmAfter offline 任务落池确认窗口:受理即 done(契约),产物是否
-	// 真实落池由后台确认器观测;窗口内未确认仅告警不改状态。0 = 默认 2h,负 = 关闭。
+	// OfflineConfirmAfter offline 任务落池确认窗口:端点受理后任务停在 pending,
+	// 后台确认器观测到产物才收口 done(带真实大小),窗口内未落池收口 failed 并释放
+	// 同路径写占用。0 = 默认 2h,负 = 关闭(退回受理即 done,仅告警)。
 	OfflineConfirmAfter time.Duration `mapstructure:"offline_confirm_after"`
 	// OfflineConfirmPoll 落池确认轮询间隔(决定同名路径冲突窗口的检测延迟);0 = 默认 10s。仅测试会调小。
 	OfflineConfirmPoll time.Duration `mapstructure:"offline_confirm_poll"`

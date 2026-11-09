@@ -120,10 +120,23 @@ type TransferRequest struct {
 	Client string `json:"client,omitempty"`
 }
 
+// 任务状态。offline 通道的 done 不在提交成功时给:远端 aria2 刚建任务,
+// 字节还在路上,此时报 done 是假完成(同路径会被锁到落池确认前,产物也可能
+// 永远不出现)。受理成功后任务停在 pending,由 watchOfflineArtifact 观测到
+// 产物才收口 done(真实落盘大小),确认窗口内未落池收口 failed。
+const (
+	stateQueued  = "queued"
+	stateRunning = "running"
+	// statePending offline 端点已受理,产物尚未落池确认;写守卫仍占用目标路径。
+	statePending = "pending"
+	stateDone    = "done"
+	stateFailed  = "failed"
+)
+
 // TransferTask 是转存任务的可观测快照。
 type TransferTask struct {
 	ID        string    `json:"id"`
-	State     string    `json:"state"` // queued|running|done|failed
+	State     string    `json:"state"` // queued|running|pending|done|failed
 	Channel   string    `json:"channel"`
 	SourceURL string    `json:"source_url"`
 	DestPath  string    `json:"dest_path"`
@@ -148,23 +161,50 @@ func (t *TransferTask) set(delta int64) {
 	atomic.AddInt64(&t.done, delta)
 }
 
-func (t *TransferTask) finish(state, errMsg, hint string) {
+// finishDone 收口成功。size>0 表示已从产物确认真实大小(覆盖进度计数);
+// size 为 0 走 io.Pipe 流式的既有口径,用搬运计数。
+func (t *TransferTask) finishDone(size int64) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	t.State = state
+	t.State = stateDone
+	t.Error = ""
+	t.Hint = ""
+	t.EndedAt = time.Now()
+	if size > 0 {
+		atomic.StoreInt64(&t.done, size)
+		t.Size = size
+		t.Done = size
+	} else if n := atomic.LoadInt64(&t.done); n > 0 {
+		t.Size = n
+		t.Done = n
+	}
+	if t.met != nil {
+		t.met.Inc("panrouter_transfer_total", map[string]string{"state": stateDone, "channel": t.Channel})
+	}
+}
+
+// markPending 标记 offline 端点已受理、产物尚未落池:任务停在 pending,
+// 由确认器收口成 done(真实落盘大小)或 failed(确认窗口内未落池)。
+// 必须在启动确认器之前调用,否则确认器可能先收口 done 再被压回 pending。
+func (t *TransferTask) markPending() {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.State = statePending
+	t.Error = ""
+	t.Hint = ""
+	t.EndedAt = time.Time{}
+}
+
+// finishFailed 收口失败。
+func (t *TransferTask) finishFailed(errMsg, hint string) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.State = stateFailed
 	t.Error = errMsg
 	t.Hint = hint
 	t.EndedAt = time.Now()
-	// 成功即 Done=Size:done 是搬运计数,终值不落会让轮询永远停在 0%。
-	// Size 在此覆盖为实际字节(解析期登记的可能是 0 或过期值)。
-	if state == "done" {
-		if n := atomic.LoadInt64(&t.done); n > 0 {
-			t.Size = n
-			t.Done = n
-		}
-	}
 	if t.met != nil {
-		t.met.Inc("panrouter_transfer_total", map[string]string{"state": state, "channel": t.Channel})
+		t.met.Inc("panrouter_transfer_total", map[string]string{"state": stateFailed, "channel": t.Channel})
 	}
 }
 
@@ -291,11 +331,20 @@ func (s *Transfer) Submit(req TransferRequest) (*TransferTask, error) {
 		// 否则 resolver 按游客处理,不读账号 Cookie → auth_expired。
 		rctx = WithAuthed(rctx, true)
 		if err := s.Run(rctx, task, req); err != nil {
-			task.finish("failed", err.Error(), hintOf(err))
+			task.finishFailed(err.Error(), hintOf(err))
 			s.log.Warnw("transfer failed", "id", task.ID, "err", err)
 			return
 		}
-		task.finish("done", "", "")
+		// offline 的状态由确认器在 Run 内收口(pending / done / failed),
+		// 这里不再碰任务状态,只打日志。
+		task.mu.Lock()
+		ch := task.Channel
+		task.mu.Unlock()
+		if ch == string(ChannelOffline) {
+			s.log.Infow("offline accepted, awaiting artifact", "id", task.ID, "dest_path", task.DestPath)
+			return
+		}
+		task.finishDone(0)
 		s.log.Infow("transfer done", "id", task.ID, "dest_path", task.DestPath, "size", task.Size)
 	}()
 	return task, nil
@@ -314,7 +363,7 @@ func (s *Transfer) pruneLocked() {
 	var terminal []terminalTask
 	for _, t := range s.tasks {
 		t.mu.Lock()
-		done := t.State == "done" || t.State == "failed"
+		done := t.State == stateDone || t.State == stateFailed
 		ended := t.EndedAt
 		old := done && !ended.IsZero() && now.Sub(ended) > keepTaskAfter
 		t.mu.Unlock()
@@ -469,6 +518,8 @@ func (s *Transfer) Run(ctx context.Context, task *TransferTask, req TransferRequ
 		// 注意不能用外层 release 闭包(其 releaseOnce 已置位防止 defer 重复释放),
 		// 确认器退出时必须直接释放。
 		releaseOnce = true
+		// 先转 pending 再启动确认器:顺序反过来会有竞态(确认器先 done 再被压回)。
+		task.markPending()
 		go func() {
 			defer s.releaseDest(final, task.ID)
 			s.watchOfflineArtifact(task, final, src.size)
@@ -517,20 +568,19 @@ func (s *Transfer) releaseDest(destPath, taskID string) {
 	}
 }
 
-// watchOfflineArtifact offline 受理即乐观 done(契约),真实落池由本确认器观测:
-// 产物以不小于预期的大小出现 → info 收口;确认窗口内未现 → warn。
-// 只做观测,不改任务状态(桌面端契约不受影响)。任务被清理时提前退出。
 func (s *Transfer) watchOfflineArtifact(task *TransferTask, destPath string, expect int64) {
-	if expect <= 0 {
-		return
-	}
 	cfg := s.cfg.Get().Transfer
 	after := cfg.OfflineConfirmAfter
 	if after == 0 {
 		after = 2 * time.Hour
 	}
 	if after < 0 {
-		return // 显式关闭
+		// 显式关闭产物确认:回落到旧的「受理即 done」语义,但必须告警,
+		// 因为此时同路径写锁会立即释放而 aria2 可能仍在落盘。
+		s.log.Warnw("offline artifact confirmation disabled, accepting optimistically",
+			"id", task.ID, "dest", destPath)
+		task.finishDone(0)
+		return
 	}
 	poll := cfg.OfflineConfirmPoll
 	if poll <= 0 {
@@ -538,17 +588,23 @@ func (s *Transfer) watchOfflineArtifact(task *TransferTask, destPath string, exp
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), after)
 	defer cancel()
-	check := func() bool {
+	// landed 观测产物:必须是非目录且非空;源大小已知时还要不小于它。
+	// expect<=0 时等任何非空文件出现即确认,size>=0 的分目录不能作数。
+	landed := func() (int64, bool) {
 		obj, err := s.driveAPI().Get(ctx, destPath)
-		return err == nil && obj != nil && obj.Size >= expect
-	}
-	confirm := func() {
-		s.log.Infow("offline artifact confirmed",
-			"id", task.ID, "dest", destPath, "size", expect)
+		if err != nil || obj == nil || obj.IsDir || obj.Size <= 0 {
+			return 0, false
+		}
+		if expect > 0 && obj.Size < expect {
+			return 0, false
+		}
+		return obj.Size, true
 	}
 	// 立即首查:小文件(或重传时产物已在)等不到第一个 tick,占用窗口可以秒级收口。
-	if check() {
-		confirm()
+	if size, ok := landed(); ok {
+		s.log.Infow("offline artifact confirmed",
+			"id", task.ID, "dest", destPath, "size", size)
+		task.finishDone(size)
 		return
 	}
 	tick := time.NewTicker(poll)
@@ -558,13 +614,17 @@ func (s *Transfer) watchOfflineArtifact(task *TransferTask, destPath string, exp
 		case <-ctx.Done():
 			s.log.Warnw("offline artifact not confirmed within window",
 				"id", task.ID, "dest", destPath, "expect", expect, "window", after)
+			task.finishFailed("artifact not landed within window: "+destPath,
+				string(driver.KindUpstream))
 			return
 		case <-tick.C:
 			if s.Get(task.ID) == nil {
-				return // 任务已出保留窗口被清理
+				return
 			}
-			if check() {
-				confirm()
+			if size, ok := landed(); ok {
+				s.log.Infow("offline artifact confirmed",
+					"id", task.ID, "dest", destPath, "size", size)
+				task.finishDone(size)
 				return
 			}
 		}

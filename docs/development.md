@@ -1,4 +1,4 @@
-# PanRouter 开发文档 v2.1(2026-11-04)
+# PanRouter 开发文档 v2.3(2026-11-10)
 
 > 本文以当前实现为基准重写,取代原《方案设计》(docs/design.md v1.1.x,已删除)。
 > 编写原则:**已实现行为、已知问题、接口契约、重构计划分开表述**——旧方案中未实现的规划统一移入 §17 路线图,不再与现状混排;代码注释不再引用本文档章节号。
@@ -217,6 +217,34 @@ Relay.Serve:验签 → GetFreshLink → 解密 Cookie → 构造上游请求(UA/
 - 隐私边界:同步默认关闭,桌面端用户显式开启;下载记录脱敏(不含本机路径/请求头),数据仅存自部署服务端
 
 ---
+
+### 7.7 转存任务状态机与同目标写守卫
+
+`TransferTask.state` 全集:`queued | running | pending | done | failed`,`done`/`failed` 为真终态。
+
+| 状态 | 含义 | 同路径写占用 |
+| --- | --- | --- |
+| `queued` | 已登记,后台协程尚未开跑 | 未占用 |
+| `running` | 解析源/搬运字节中(stream) | 占用 |
+| `pending` | offline 端点已受理,产物尚未落池 | 占用 |
+| `done` | 已确认写入目标路径(产物已确认存在) | 释放 |
+| `failed` | 不可恢复失败(含确认窗口超时) | 释放 |
+
+**offline 通道不再「受理即 done」**(v2.3 根因修复):
+
+- 端点提交成功后任务停在 `pending`,`activeDest` 对目标路径的占用由确认器持有;
+- 确认器(`watchOfflineArtifact`)按 `transfer.offline_confirm_poll`(默认 30s)轮询产物:`!is_dir && size > 0 && (expect <= 0 || size >= expect)` → 收口 `done`,并用**真实落盘 size** 回填快照;
+- 超过 `transfer.offline_confirm_after`(默认 2h)仍未见产物 → 收口 `failed`(`hint=upstream_error`)并 Warn(含 expect/window),同路径写占用随之释放;
+- 配置为负数 = 关闭产物确认:回退到「受理即 done」并打 Warn,不再静默;
+- 快照命名在受理瞬间已定型(offline 落盘名 = URL 末段 / stream 落盘名 = 接受名),客户端 `pending` 期间即可看到真实 `dest_path`,无需等确认。
+
+为什么要改:旧契约下 offline 任务已报 `done` 而目标路径仍被写占用卡住,桌面端看到 done 就再提交同名 → 收到 `conflict`;生产查记显示 34 条后台转存中 6 条是这种误判重提(首次写入仍在进行,最长占用近 20min)。
+
+状态语义对桌面端(`TransferTask` in `PanRouterTransferModels.kt`):
+
+- `isTerminal = done || failed`;不包含 `pending`;
+- `isRunning = queued || running || pending`;桌面端按 `isRunning` 决定是否继续轮询,所以 `pending` 必须入列,否则在产物真正落池前停抽;
+- `stateLabelOf(pending) = "落池中"`。
 
 ## 8. 错误契约
 
@@ -454,6 +482,7 @@ iframe / modern / 密码分享三条流;最终 CDN 对非浏览器客户端先 a
 
 ## 变更记录
 
-- **v2.2(2026-11-10)**:M4 转存链路三轮生产迭代收口(契约权威源=桌面仓 INTEGRATION-PANROUTER.md v1.15,本页记服务端内部口径):① max_bytes 硬上限全覆盖(offline 提交前校验/stream 预检+途中实收截断)+ prune 竞态修复(`5914f89`);② auto 选中的 offline 提交失败自动回退 stream,显式 offline 原样报错(`3aac3ee`);③ 直链直传 `fid=direct`(受理前探测、SSRF 双保险、跨域公网 302 放行,`a346df8`);④ 同目标并发写守卫(destPath 互斥,offline 占用维持到落池确认/窗口超时,新增 `conflict` kind)+ offline 落池确认器(只观测不改状态,`36afa15`);⑤ 生产实测:公网文件矩阵 4/4 sha256 MATCH(含 1GiB stream)、守卫 GUARD/RELEASE 双 OK
+- **v2.3(2026-11-10)**:offline 通道状态机根因修复——「受理即 done」改为 `pending → done`(真实落盘 size)/ `failed`(确认窗口超时,`upstream_error`)。证据:生产 34 条后台转存中 6 条 `conflict` 由同路径二次提交造成(首任务已乐观 done 但仍持写占用,最长占用近 20min);`activeDest` 语义不变(claim/release 归确认器 goroutine 的 defer)。兼容性:`pending` 期间桌面端须继续轮询(`isRunning` 已纳入,`isTerminal` 不含),文案「落池中」;`offline_confirm_after` 配负数回退「受理即 done」并打 Warn。新增 §7.7 状态机与守卫表；确认器立即首查 + 默认轮询 10s（与 `d14f27a` 合并）;测试:`TestDestConflictOfflineHoldsUntilConfirm`(pending 期间拒收 → 确认真实 size/300 → 放行)、`TestDestConflictOfflineTimeoutReleases`(超时 failed + 路径释放)、`TestOfflineSnapshotUsesLandedName` / `TestDirectOfflineTransfer` / `TestTransferAutoChannelSelection` 由 `waitDone` 改为 `waitState(..., "pending")`。
+- **v2.2(2026-11-10)**:M4 转存链路三轮生产迭代收口(契约权威源=桌面仓 INTEGRATION-PANROUTER.md v1.15,本页记服务端内部口径):① max_bytes 硬上限全覆盖(offline 提交前校验/stream 预检+途中实收截断)+ prune 竞态修复(`5914f89`);② auto 选中的 offline 提交失败自动回退 stream,显式 offline 原样报错(`3aac3ee`);③ 直链直传 `fid=direct`(受理前探测、SSRF 双保险、跨域公网 302 放行,`a346df8`);④ 同目标并发写守卫(destPath 互斥,offline 占用维持到落池确认/窗口超时,新增 `conflict` kind)+ offline 落池确认器(`36afa15`;v2.3 起改为收口器);⑤ 生产实测:公网文件矩阵 4/4 sha256 MATCH(含 1GiB stream)、守卫 GUARD/RELEASE 双 OK
 - **v2.1(2026-11-04)**:新增设备历史同步端点 `POST|GET /api/v1/sync`(M3,§7.6)+ `sync_items` 表(§9)+ 管理页「设备同步数据」浏览区块;payload 不透明存储,服务端只做 LWW 仲裁与墓碑传播,两仓零共享代码边界不破
 - **v2.0(2026-10-05)**:以实际实现为基准重写,取代《方案设计》v1.1.x(已删除);现状/已知问题/契约/路线图分开表述;新增 §15 深度评审结论与分阶段重构计划;代码注释不再引用章节号

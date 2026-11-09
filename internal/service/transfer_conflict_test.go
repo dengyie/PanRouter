@@ -86,10 +86,10 @@ func TestDestConflictStreamVsStream(t *testing.T) {
 	}
 }
 
-
-// offline 的占用维持到产物落池确认:offline 任务 PanRouter 侧已 done 后,
-// aria2/上传仍在进行——此窗口内同路径的新任务必须拒收(生产矩阵实测场景);
-// 确认器观测到产物后释放,后续任务放行。
+// offline 产物落池前任务必须停在 pending(不能乐观 done):
+// pending 期间同路径的新任务要被拒收——这正是生产上「同路径二次提交抢在
+// 首次上传落盘前、却又看到 done 于是放心提交」的根因。确认器观测到产物后
+// 收口 done 并带上真实落盘大小,pending 期间的拒绝也不得堆成新记录。
 func TestDestConflictOfflineHoldsUntilConfirm(t *testing.T) {
 	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodHead {
@@ -141,7 +141,11 @@ func TestDestConflictOfflineHoldsUntilConfirm(t *testing.T) {
 	}
 
 	t1 := sub(ChannelOffline)
-	waitDone(t, tr, t1.ID) // 乐观 done,确认器仍占用 /Pool/same.bin
+	// 新契约:offline 受理后停在 pending,确认器仍占用 /Pool/same.bin。
+	waitState(t, tr, t1.ID, "pending")
+	if snap := tr.Get(t1.ID); snap.State != "pending" {
+		t.Fatalf("产物未落池前不得 done, got state=%s", snap.State)
+	}
 
 	t2 := sub(ChannelStream)
 	waitDone(t, tr, t2.ID)
@@ -150,8 +154,12 @@ func TestDestConflictOfflineHoldsUntilConfirm(t *testing.T) {
 			snap.State, snap.Hint, snap.Error)
 	}
 
-	atomic.StoreInt64(&fsSize, 300) // 产物落池 → 确认器放行
-	time.Sleep(300 * time.Millisecond)
+	atomic.StoreInt64(&fsSize, 300) // 产物落池 → 确认器收口 done 并放行
+	waitDone(t, tr, t1.ID)
+	if snap := tr.Get(t1.ID); snap.State != "done" || snap.Size != 300 {
+		t.Fatalf("确认后应收口 done/真实大小, got state=%s size=%d err=%s",
+			snap.State, snap.Size, snap.Error)
+	}
 
 	t3 := sub(ChannelStream)
 	waitDone(t, tr, t3.ID)
@@ -160,7 +168,8 @@ func TestDestConflictOfflineHoldsUntilConfirm(t *testing.T) {
 	}
 }
 
-// 确认窗口超时:产物迟迟未现也要释放占用(不能永久锁死路径),仅告警不改状态。
+// 确认窗口超时:产物迟迟未现也收口 failed(不能再假装 done),
+// 同时释放同路径占用,避免路径被永久锁死。
 func TestDestConflictOfflineTimeoutReleases(t *testing.T) {
 	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodHead {
@@ -202,8 +211,13 @@ func TestDestConflictOfflineTimeoutReleases(t *testing.T) {
 	if err != nil {
 		t.Fatalf("submit: %v", err)
 	}
-	waitDone(t, tr, t1.ID)
-	time.Sleep(500 * time.Millisecond) // 确认窗口(200ms)超时释放
+	waitState(t, tr, t1.ID, "pending", "failed") // 确认窗口(200ms)超时 → failed
+	time.Sleep(500 * time.Millisecond)
+
+	if snap := tr.Get(t1.ID); snap.State != "failed" || snap.Hint != "upstream_error" {
+		t.Fatalf("产物未落池应收口 failed(upstream_error), got state=%s hint=%s err=%s",
+			snap.State, snap.Hint, snap.Error)
+	}
 
 	t2, err := tr.Submit(TransferRequest{
 		SourceURL: up.URL + "/same.bin", FID: FIDDirect,
@@ -215,9 +229,5 @@ func TestDestConflictOfflineTimeoutReleases(t *testing.T) {
 	waitDone(t, tr, t2.ID)
 	if snap := tr.Get(t2.ID); snap.State != "done" {
 		t.Fatalf("超时释放后同路径应放行, got state=%s err=%s", snap.State, snap.Error)
-	}
-	// 超时不回改 t1 状态:done 语义(受理)不受确认器影响。
-	if snap := tr.Get(t1.ID); snap.State != "done" {
-		t.Fatalf("确认器不得回改任务状态, got %s", snap.State)
 	}
 }

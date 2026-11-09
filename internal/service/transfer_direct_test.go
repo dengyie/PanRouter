@@ -5,8 +5,8 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
-	"strconv"
 	"net/url"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -121,11 +121,9 @@ func TestDirectOfflineTransfer(t *testing.T) {
 	if err != nil {
 		t.Fatalf("submit: %v", err)
 	}
-	waitDone(t, tr, task.ID)
+	// offline 受理后停在 pending(产物未落池):命名/调用参数在受理瞬间即已确定。
+	waitState(t, tr, task.ID, "pending")
 	snap := tr.Get(task.ID)
-	if snap.State != "done" {
-		t.Fatalf("state=%s err=%s", snap.State, snap.Error)
-	}
 	if snap.FileName != "archive.tar.gz" || snap.DestPath != "/Pool/archive.tar.gz" {
 		t.Fatalf("快照命名: file=%s path=%s (URL 末段)", snap.FileName, snap.DestPath)
 	}

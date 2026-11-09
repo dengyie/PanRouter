@@ -233,16 +233,15 @@ func TestOfflineSnapshotUsesLandedName(t *testing.T) {
 	defer ol.Close()
 
 	// fakeDriver 直链 = upstream/file → 末段 "file",与分享内文件名 n.bin 不同。
+	// 落盘命名的断言必须在受理后立刻取快照:pending 期间快照已写好 URL 末段名,
+	// 确认窗口(默认 2h)内任务不会被清理。
 	tr, share := newTransferFixture(t, "http://up.invalid/base", ol.URL)
 	task, err := tr.Submit(TransferRequest{SourceURL: share, Channel: ChannelOffline, DestDir: "/Pool", UA: "UA/1"})
 	if err != nil {
 		t.Fatalf("submit: %v", err)
 	}
-	waitDone(t, tr, task.ID)
+	waitState(t, tr, task.ID, "pending")
 	snap := tr.Get(task.ID)
-	if snap.State != "done" {
-		t.Fatalf("state=%s err=%s", snap.State, snap.Error)
-	}
 	if snap.FileName != "file" {
 		t.Fatalf("快照 file_name=%s want 真实落盘名 file (URL 末段)", snap.FileName)
 	}
