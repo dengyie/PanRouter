@@ -1,6 +1,6 @@
 # YunX-Desktop × PanRouter 深度整合开发规格
 
-> 状态：v1.15（2026-11-10，同目标并发写守卫 + offline 落池确认器，服务端 `36afa15`）
+> 状态：v1.16（2026-11-10，直链跨域 302 链生产实测 + h2 tar-pit 根因修复，服务端 `f67a87a`）
 > 本文是「云析桌面版二次开发 + PanRouter 深度整合」的工程规格（Engineering Spec）。
 > 生产运维与拓扑以 Obsidian《PanRouter 部署与运维》为准；PanRouter 服务端契约以仓内
 > `panrouter/docs/development.md` v2.1 为准。三份文档冲突时以各自领域的最新 canonical 为准并回写对齐。
@@ -219,7 +219,7 @@ desktop/src/main/kotlin/com/yunx/app/
 - **channel 语义**：`stream`（服务端拉上游 → 流式 PUT，兼容任意提取链约束）/ `offline`（OpenList 侧 aria2 直拉，仅公开直链，需 UA/Referer/Cookie 或 BindIP 的源拒收）/ `auto`（默认；有约束或 BindIP 或 `size ≥ transfer.auto_stream_bytes` 走 stream，否则 offline）。
 - **offline 可用性前提（v1.12）**：offline 依赖 OpenList 宿主侧的 aria2 RPC（`http://localhost:6800/jsonrpc`）——**未部署 aria2 的端点上 offline 必然失败**。`auto` 选中的 offline 提交失败时**自动回退 stream**（任务快照 `channel` 落最终实际通道 `stream`，warn 日志留 `offline unavailable, falling back to stream`），因此桌面端默认通道在无 aria2 部署上仍可用；**显式** `channel=offline` 不回退，失败原因原样下发（`hint=upstream_error`，error 含 aria2 RPC 拒绝原文），调用方需自行降级重试。**（v1.13 生产现状：Mango Drive 端点已部署 aria2 sidecar，offline/auto/stream 三通道真实可用；offline 产物名规则见下。）**
 - **offline 落盘名（v1.13）**：OpenList 离线任务**不可重命名**——落盘文件名 = 直链 URL 末段路径（aria2 `determineFilename`：percent-decode，源带 Content-Disposition 时以其为准；路径型直链两者一致且等于源文件真实名）。请求里的 `name` **仅 stream 通道生效**（File-Path 头）；offline 任务快照的 `file_name`/`dest_path` 由服务端改写为真实产物名（`43a4075`），桌面端展示以快照为准。同源并发 offline 在目标目录同名覆盖（aria2 的 `.1` 冲突后缀只发生在单任务临时目录内，跨任务不生效）。
-- **直链直传 `fid="direct"`（v1.14，服务端 `a346df8`）**：`source_url` 即任意**公网** http(s) 直链，不经网盘解析直接进转存管线，三通道全适用。受理前探测（HEAD，回退 `GET Range:0-0`）拿大小供通道预检，**探测失败即拒绝**（不受理再失败）；落盘名 = URL 末段 percent-decode（三通道统一，请求 `name` 可覆盖 stream 命名）。**SSRF 防护**：专用 direct 客户端 `AllowPrivate=false`（拨号级拦私网）+ 每跳重定向 DNS 级 `privateGuard`（双保险）；跨域公网 302 放行（`SuffixMatch` 支持 `"*"` 哨兵，github release → objects.githubusercontent.com 一类）；URL 携带 userinfo 拒绝。`transfer.direct_allow_private` 配置仅供测试 fixture，生产必须 false。**已知限制**：① 同目标同名并发写（v1.15 已由冲突守卫根治，见下）；② 个别源站对非浏览器 TLS 指纹敏感（实测 `nbg1-speed.hetzner.com` 对 Go 客户端直接 EOF，curl 可通）——表现为 `直链不可达`，换源即可。
+- **直链直传 `fid="direct"`（v1.14，服务端 `a346df8`）**：`source_url` 即任意**公网** http(s) 直链，不经网盘解析直接进转存管线，三通道全适用。受理前探测（HEAD，回退 `GET Range:0-0`）拿大小供通道预检，**探测失败即拒绝**（不受理再失败）；落盘名 = URL 末段 percent-decode（三通道统一，请求 `name` 可覆盖 stream 命名）。**SSRF 防护**：专用 direct 客户端 `AllowPrivate=false`（拨号级拦私网）+ 每跳重定向 DNS 级 `privateGuard`（双保险）；跨域公网 302 放行（`SuffixMatch` 支持 `"*"` 哨兵，github release → objects.githubusercontent.com 一类）；URL 携带 userinfo 拒绝。`transfer.direct_allow_private` 配置仅供测试 fixture，生产必须 false。**已知限制**：① 同目标同名并发写（v1.15 已由冲突守卫根治，见下）；② 个别源站对非浏览器 TLS 指纹敏感（实测 `nbg1-speed.hetzner.com` 对 Go 客户端直接 EOF，curl 可通）——表现为 `直链不可达`，换源即可；③ **h2 tar-pit（v1.16 已根治，`f67a87a`）**：GitHub 等站点对数据中心 IP 的 h2 下载型 GET 挂起不回响应头（探测 HEAD 正常、搬运 GET 挂 30s）——直链客户端已强制 HTTP/1.1 并对拉流瞬态错误重试一次，**GitHub release 资产跨域 302 链生产实测 sha256 MATCH**。
 - **同目标并发写守卫（v1.15，服务端 `36afa15`）**：同一落盘路径同时只允许一个任务在写——冲突任务受理后立即失败（`state=failed`，**`hint=conflict`**，error 含目标路径，客户端可稍后重试）。offline 的占用**维持到产物落池确认或窗口超时**（`transfer.offline_confirm_after`，默认 2h，负值关闭）——offline 在 PanRouter 侧 `done` 之后 aria2/上传仍在进行，Run 退出就释放挡不住真实冲突窗口（生产实测教训：stream PUT 与 offline 上传互踩致离线任务整单重试白拉 1GB）。串行同路径不受限（语义 = 覆盖）；auto 回退（offline→stream）正确换占。
 - **offline 落池确认器（v1.15）**：offline 受理即 `done` 的乐观语义不变；服务端后台按 `fs/get` 轮询观测真实落池——产物以预期大小出现 → info 收口，窗口内未现 → warn（**只观测不改状态**，桌面端契约零影响；`transfer.offline_confirm_poll` 默认 30s）。
 - **快照幂等**：`done` 原子计数，二次快照（handler 内 Get→Snapshot）不回零；成功终态 `Done=Size=实际字节`。
@@ -345,6 +345,7 @@ pxed 上行有限且多设备共享：stream 路径线程数 = `min(用户设置
 
 ---
 
+- **v1.16（2026-11-10）**：**直链跨域 302 链生产实测 + h2 tar-pit 根因修复（服务端 `f67a87a`，桌面端零改动）**。迭代轮矩阵：GitHub release 资产 auto→offline done（aria2 跨域跟随，size 精确）；stream 首测必败——`http2: timeout awaiting response headers`（GitHub 对数据中心 IP 的 h2 下载型 GET tar-pit，探测 HEAD 正常）。修复：直链客户端强制 HTTP/1.1（`httpx.ForceHTTP1`，任意公网源更稳，单流大文件无 h2 收益）+ 拉流瞬态错误重试一次（尚未写字节，无副作用）。复测：stream done size=done 字节精确 + **宿主 sha256 MATCH**（`60a420ad…`）。同轮验证：坏域名/错误源干净失败、并发不同文件互不误伤、确认器释放正常、CI `-race -shuffle` 全绿。
 ## 变更记录
 
 - **v1.15（2026-11-10）**：**同目标并发写守卫 + offline 落池确认器（服务端 `36afa15`，桌面端零改动）**。公网矩阵实测暴露的同目标同名并发写互踩（stream PUT × offline 上传 → 离线任务整单重试白拉 1GB）根因收口：① destPath 粒度活跃任务互斥，冲突受理即失败（`hint=conflict`，新增 KindConflict）；offline 占用维持到产物落池确认/窗口超时（`offline_confirm_after` 默认 2h，负值关闭）；② 落池确认器 `fs/get` 轮询只观测不改状态（乐观 done 契约不变）；③ 生产实测 GUARD OK：offline 占用窗口内 stream 同路径被拒（`conflict`），换目录任务不受影响；④ 单测 3 例（并发拒收/确认后放行/超时释放且不回改状态）。
