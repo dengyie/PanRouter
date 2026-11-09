@@ -24,6 +24,11 @@ import (
 
 // newTransferFixture 装配 Resolver(假网盘直链指向 upstream)+ Transfer(OpenList 指向 openlist)。
 func newTransferFixture(t *testing.T, upstreamURL, openlistURL string) (*Transfer, string) {
+	return newTransferFixtureMut(t, upstreamURL, openlistURL, nil)
+}
+
+// newTransferFixtureMut 在标准 fixture 上允许测试覆写配置(单文件上限/auto 阈值等)。
+func newTransferFixtureMut(t *testing.T, upstreamURL, openlistURL string, mut func(*config.Config)) (*Transfer, string) {
 	t.Helper()
 	store, err := repo.Open(t.TempDir() + "/t.db")
 	if err != nil {
@@ -34,6 +39,9 @@ func newTransferFixture(t *testing.T, upstreamURL, openlistURL string) (*Transfe
 	cfg := config.Default()
 	cfg.Transfer.Endpoint = openlistURL
 	cfg.Transfer.Token = "tok"
+	if mut != nil {
+		mut(cfg)
+	}
 	cfgp := &config.Provider{}
 	cfgp.Set(cfg)
 

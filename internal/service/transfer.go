@@ -92,6 +92,8 @@ type TransferRequest struct {
 	Channel TransferChannel `json:"channel"`
 	// UA 调用方 UA:决定提取链约束与 302 可行性。
 	UA string `json:"ua"`
+	// Client 可选的调用方标识(如 desktop/v0.1.11),只进任务快照便于服务端排查。
+	Client string `json:"client,omitempty"`
 }
 
 // TransferTask 是转存任务的可观测快照。
@@ -106,6 +108,7 @@ type TransferTask struct {
 	Done      int64     `json:"done"`
 	Error     string    `json:"error,omitempty"`
 	Hint      string    `json:"hint,omitempty"`
+	Client    string    `json:"client,omitempty"`
 	StartedAt time.Time `json:"started_at"`
 	EndedAt   time.Time `json:"ended_at,omitempty"`
 
@@ -162,6 +165,7 @@ func (t *TransferTask) Snapshot() TransferTask {
 		Done:      done,
 		Error:     t.Error,
 		Hint:      t.Hint,
+		Client:    t.Client,
 		StartedAt: t.StartedAt,
 		EndedAt:   t.EndedAt,
 	}
@@ -244,6 +248,7 @@ func (s *Transfer) Submit(req TransferRequest) (*TransferTask, error) {
 		State:     "queued",
 		Channel:   string(channel),
 		SourceURL: req.SourceURL,
+		Client:    clientLabel(req.Client),
 		StartedAt: time.Now(),
 		met:       s.met,
 		log:       s.log,
@@ -276,28 +281,35 @@ func (s *Transfer) Submit(req TransferRequest) (*TransferTask, error) {
 func (s *Transfer) pruneLocked() {
 	now := time.Now()
 	keepTasks, keepTaskAfter := s.keepPolicy()
-	var terminal []*TransferTask
+	// 终结任务的 EndedAt 在 finish 里写入:必须在 t.mu 内读取并连同任务一起
+	// 快照,否则排序阶段会在锁外读 EndedAt 形成数据竞争(-race 可复现)。
+	type terminalTask struct {
+		ref   *TransferTask
+		ended time.Time
+	}
+	var terminal []terminalTask
 	for _, t := range s.tasks {
 		t.mu.Lock()
 		done := t.State == "done" || t.State == "failed"
-		old := done && !t.EndedAt.IsZero() && now.Sub(t.EndedAt) > keepTaskAfter
+		ended := t.EndedAt
+		old := done && !ended.IsZero() && now.Sub(ended) > keepTaskAfter
 		t.mu.Unlock()
 		if old {
 			delete(s.tasks, t.ID)
 			continue
 		}
 		if done {
-			terminal = append(terminal, t)
+			terminal = append(terminal, terminalTask{ref: t, ended: ended})
 		}
 	}
 	if len(terminal) <= keepTasks {
 		return
 	}
 	sort.Slice(terminal, func(i, j int) bool {
-		return terminal[i].EndedAt.After(terminal[j].EndedAt)
+		return terminal[i].ended.After(terminal[j].ended)
 	})
 	for i := keepTasks; i < len(terminal); i++ {
-		delete(s.tasks, terminal[i].ID)
+		delete(s.tasks, terminal[i].ref.ID)
 	}
 }
 
@@ -315,7 +327,7 @@ func (s *Transfer) keepPolicy() (int, time.Duration) {
 }
 
 // autoStreamBytes channel=auto 时改用 stream(本机中转)的文件大小阈值;
-// 配置为负视为「全部走 offline」,0 走默认 8GiB。
+// 配置为负视为「全部走 offline」(仅受 max_bytes 与提取链约束限制),0 走默认 8GiB。
 func (s *Transfer) autoStreamBytes() int64 {
 	n := s.cfg.Get().Transfer.AutoStreamBytes
 	switch {
@@ -377,12 +389,10 @@ func (s *Transfer) Run(ctx context.Context, task *TransferTask, req TransferRequ
 	task.DestPath = destPath
 	task.mu.Unlock()
 
-	channel := req.Channel
-	if channel == "" || channel == ChannelAuto {
-		channel = ChannelStream
-		if !src.needHdr && !src.meta.BindIP && src.size < s.autoStreamBytes() {
-			channel = ChannelOffline
-		}
+	channel, err := chooseChannel(req.Channel, src.needHdr, src.meta.BindIP,
+		src.size, s.autoStreamBytes(), s.maxTransferBytes())
+	if err != nil {
+		return err
 	}
 	task.mu.Lock()
 	task.Channel = string(channel)
@@ -394,6 +404,39 @@ func (s *Transfer) Run(ctx context.Context, task *TransferTask, req TransferRequ
 	default:
 		return s.transferStream(ctx, task, src, destPath)
 	}
+}
+
+// chooseChannel 决定最终通道(约束与阈值语义见 §5.4):
+//   - 提取链有约束(UA/Referer/Cookie/BindIP)→ stream,offline 无法携带;
+//   - auto_stream_bytes 负值 → 全部 offline;source 大小未知或 ≥ 阈值 → stream;
+//   - maxBytes 是不可越过的硬上限(>0 生效):offline 在搬运开始前就能校验,
+//     大小未知无法证明不超限 → auto 改 stream(由实收字节兜底),显式 offline 报错。
+//
+// 显式 offline 在超限时也报错而不是静默改道,避免调用方以为占了省带宽的通道。
+func chooseChannel(req TransferChannel, needHdr, bindIP bool, size, autoThreshold, maxBytes int64) (TransferChannel, error) {
+	ch := req
+	if ch == "" || ch == ChannelAuto {
+		ch = ChannelStream
+		if !needHdr && !bindIP {
+			if autoThreshold <= 0 || (size > 0 && size < autoThreshold) {
+				ch = ChannelOffline
+			}
+		}
+	}
+	// offline 由远端 aria2 直拉,不受本机流式读取的实收字节校验约束。
+	if ch == ChannelOffline && maxBytes > 0 && (size <= 0 || size > maxBytes) {
+		if req == ChannelOffline {
+			if size <= 0 {
+				return "", driver.NewErr(driver.KindUnsupported,
+					"源文件大小未知,离线通道无法校验转存上限;请改用 stream 通道", nil)
+			}
+			return "", driver.NewErr(driver.KindUnsupported,
+				"文件超过转存上限:"+strconv.FormatInt(maxBytes, 10)+" 字节", nil)
+		}
+		// auto:大小未知/超限时改走 stream,由真实 Content-Length 或实收字节兜底。
+		ch = ChannelStream
+	}
+	return ch, nil
 }
 
 // ---- 执行 ----
@@ -526,24 +569,36 @@ func (s *Transfer) transferStream(ctx context.Context, task *TransferTask, src *
 	}
 	// 长度以实际上游响应头为准:解析时登记的大小可能与真实字节不符(转码/分包),
 	// 未知则按 -1 走 chunked,绝不伪造 Content-Length 让 PUT 断流。
+	limit := s.maxTransferBytes()
 	size := resp.ContentLength
 	if size <= 0 {
 		size = 0
 	}
-	if limit := s.maxTransferBytes(); limit > 0 && size > limit {
+	if limit > 0 && size > limit {
 		return driver.NewErr(driver.KindUnsupported, "文件超过转存上限:"+strconv.FormatInt(limit, 10)+" 字节", nil)
 	}
 
 	pr, pw := io.Pipe()
 	go func() {
-		_, cErr := io.Copy(pw, &progressReader{r: resp.Body, task: task})
+		_, cErr := io.Copy(pw, &progressReader{r: resp.Body, task: task, max: limit})
 		pw.CloseWithError(cErr)
 	}()
 	if err := s.driveAPI().Put(ctx, destPath, size, pr); err != nil {
 		_ = pr.CloseWithError(err)
+		// 上游 chunked(无 Content-Length)时只有实收字节能证明超限:
+		// Put 的报错可能只是「请求体提前中断」,对外统一回 max_bytes 语义。
+		if limit > 0 && atomic.LoadInt64(&task.done) > limit {
+			return driver.NewErr(driver.KindUnsupported,
+				"文件超过转存上限:"+strconv.FormatInt(limit, 10)+" 字节", err)
+		}
 		return err
 	}
-	if done := atomic.LoadInt64(&task.done); size > 0 && done != size {
+	done := atomic.LoadInt64(&task.done)
+	if limit > 0 && done > limit {
+		return driver.NewErr(driver.KindUnsupported,
+			"文件超过转存上限:"+strconv.FormatInt(limit, 10)+" 字节", nil)
+	}
+	if size > 0 && done != size {
 		return driver.NewErr(driver.KindUpstream,
 			"上传字节数不一致:期望 "+strconv.FormatInt(size, 10)+" 实收 "+strconv.FormatInt(done, 10), nil)
 	}
@@ -564,15 +619,22 @@ func (s *Transfer) maxTransferBytes() int64 {
 }
 
 // progressReader 统计已搬运字节(经 TransferTask.done 原子共享给快照)。
+// max>0 时兼任硬上限:超出即返回错误让 io.Copy 中断,避免无 Content-Length
+// 的上游(chunked)绕过 max_bytes 把超大文件整段搬进私有盘。
 type progressReader struct {
 	r    io.Reader
 	task *TransferTask
+	max  int64
 }
 
 func (p *progressReader) Read(b []byte) (int, error) {
 	n, err := p.r.Read(b)
 	if n > 0 {
 		p.task.set(int64(n))
+	}
+	if n > 0 && p.max > 0 && atomic.LoadInt64(&p.task.done) > p.max {
+		return n, driver.NewErr(driver.KindUnsupported,
+			"文件超过转存上限:"+strconv.FormatInt(p.max, 10)+" 字节", nil)
 	}
 	return n, err
 }
@@ -599,11 +661,28 @@ func (s *Transfer) transferOffline(ctx context.Context, task *TransferTask, src 
 		return err
 	}
 	// OpenList 离线端点异步建任务,成功时空响应体亦属正常;任务由远端队列接管。
-	if len(tasks) > 0 && task != nil {
+	// task.log 可能为 nil(直接构造 TransferTask 的调用方),日志只是附加观测,不能因此 panic。
+	if len(tasks) > 0 && task.log != nil {
 		task.log.Infow("offline task created", "id", task.ID, "remote", tasks[0].ID, "url", offlineURL)
 	}
 	task.set(src.size)
 	return nil
+}
+
+// clientLabel 归一化调用方标识:去控制字符、限长 64,空值省略。
+func clientLabel(s string) string {
+	s = strings.TrimSpace(s)
+	var b strings.Builder
+	for _, r := range s {
+		if r < 0x20 || r == 0x7f {
+			continue
+		}
+		b.WriteRune(r)
+		if b.Len() >= 64 {
+			break
+		}
+	}
+	return b.String()
 }
 
 // cleanStorePath 归一化 OpenList 内的绝对路径。

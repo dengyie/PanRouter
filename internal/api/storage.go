@@ -17,15 +17,26 @@ func (d *Deps) handleStorageInfo(w http.ResponseWriter, _ *http.Request) {
 		writeJSON(w, http.StatusOK, out)
 		return
 	}
-	maxBytes := d.Cfg.Get().Transfer.MaxBytes
-	if maxBytes <= 0 {
-		maxBytes = defaultStorageMaxBytes
-	}
 	out["enabled"] = true
 	out["public_base"] = base
 	out["dest_dir"] = d.Transfer.DefaultDest()
-	out["max_bytes"] = maxBytes
+	out["max_bytes"] = storageMaxBytes(d.Cfg.Get().Transfer.MaxBytes)
 	writeJSON(w, http.StatusOK, out)
+}
+
+// storageMaxBytes 把 transfer.max_bytes 映射成对外契约语义:
+// 正值原样;0 = 默认上限;负值(服务端不限)对客户端报 0,表示「不限」。
+//
+// 不能直接透传负值:客户端(桌面端 StorageInfo)按 `0 = 不限` 理解,
+// 负值会被当成具体上限比对,反而把任意文件都判超限 —— 契约两端口径必须一致。
+func storageMaxBytes(cfgMax int64) int64 {
+	if cfgMax < 0 {
+		return 0
+	}
+	if cfgMax == 0 {
+		return defaultStorageMaxBytes
+	}
+	return cfgMax
 }
 
 // defaultStorageMaxBytes 与 service 层的转存上限默认值保持一致(64GiB)。

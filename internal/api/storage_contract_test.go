@@ -85,6 +85,39 @@ func TestStorageInfoDisabledWithoutBase(t *testing.T) {
 	}
 }
 
+// max_bytes 两端口径必须一致:服务端配置负值 = 不限,对客户端报 0(客户端 0 才表示不限)。
+// 直接透传负值会让客户端把 -1 当具体上限,任何文件都判超限。
+func TestStorageInfoMaxBytesContract(t *testing.T) {
+	cases := []struct {
+		name   string
+		cfgMax int64
+		want   int64
+	}{
+		{name: "未配置走默认 64GiB", cfgMax: 0, want: 64 << 30},
+		{name: "正值原样下发", cfgMax: 5 << 30, want: 5 << 30},
+		{name: "负值(不限)对客户端报 0", cfgMax: -1, want: 0},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ts, token := newStorageEnv(t, func(c *config.Config) {
+				c.Transfer.MaxBytes = tc.cfgMax
+			})
+			st, body := doRaw(t, ts, token, "GET", "/api/v1/storage", "")
+			if st != http.StatusOK {
+				t.Fatalf("status=%d body=%v", st, body)
+			}
+			got, ok := body["max_bytes"]
+			if !ok {
+				t.Fatalf("缺少 max_bytes: %v", body)
+			}
+			n, ok := got.(float64)
+			if !ok || int64(n) != tc.want {
+				t.Fatalf("max_bytes=%v want %d", got, tc.want)
+			}
+		})
+	}
+}
+
 // 未登录不可读(与 transfer 其它端点一致)。
 func TestStorageInfoRequiresAuth(t *testing.T) {
 	ts, _ := newStorageEnv(t, nil)

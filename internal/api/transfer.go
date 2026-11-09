@@ -31,11 +31,19 @@ func (d *Deps) handleTransferMangodrive(w http.ResponseWriter, r *http.Request) 
 
 // GET /api/v1/transfer 任务列表。
 func (d *Deps) handleListTransfers(w http.ResponseWriter, r *http.Request) {
+	if d.Transfer == nil {
+		writeErr(w, driver.NewErr(driver.KindUnsupported, "转存未启用", nil))
+		return
+	}
 	writeJSON(w, http.StatusOK, map[string]any{"code": 200, "tasks": d.Transfer.List()})
 }
 
 // GET /api/v1/transfer/{id} 单任务进度。
 func (d *Deps) handleGetTransfer(w http.ResponseWriter, r *http.Request) {
+	if d.Transfer == nil {
+		writeErr(w, driver.NewErr(driver.KindUnsupported, "转存未启用", nil))
+		return
+	}
 	t := d.Transfer.Get(chi.URLParam(r, "id"))
 	if t == nil {
 		writeErr(w, driver.NewErr(driver.KindNotFound, "转存任务不存在", nil))
