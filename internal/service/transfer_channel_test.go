@@ -155,3 +155,83 @@ func TestStreamAbortsChunkedOversizeMidTransfer(t *testing.T) {
 		t.Fatalf("超限文件被完整转发, OpenList 收到 %d 字节", got)
 	}
 }
+
+// auto 选中的 offline 端点不可用(典型:OpenList 未部署 aria2,localhost:6800 refused)
+// 时必须回退 stream,否则桌面端默认通道在无 aria2 的部署上全部失败。
+// 显式 offline 不回退:调用方明确要求省带宽,失败原因必须原样可见。
+func TestAutoOfflineFailureFallsBackToStream(t *testing.T) {
+	payload := strings.Repeat("s", 300)
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Length", "300")
+		_, _ = w.Write([]byte(payload))
+	}))
+	defer up.Close()
+
+	var puts int64
+	var putBody int64
+	ol := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/api/fs/mkdir":
+			_, _ = w.Write([]byte(`{"code":200,"message":"success"}`))
+		case r.URL.Path == "/api/fs/add_offline_download":
+			// 复刻生产实际响应:OpenList 报 aria2 RPC 不可达。
+			_, _ = w.Write([]byte(`{"code":500,"message":"failed init offline download tool aria2: failed get aria2 version: Post \"http://localhost:6800/jsonrpc\": dial tcp 127.0.0.1:6800: connect: connection refused"}`))
+		case r.Method == http.MethodPut && r.URL.Path == "/api/fs/put":
+			atomic.AddInt64(&puts, 1)
+			n, _ := io.Copy(io.Discard, r.Body)
+			atomic.AddInt64(&putBody, n)
+			_, _ = w.Write([]byte(`{"code":200,"message":"success"}`))
+		default:
+			t.Errorf("unexpected openlist call: %s %s", r.Method, r.URL.Path)
+		}
+	}))
+	defer ol.Close()
+
+	tr, share := newTransferFixture(t, up.URL, ol.URL)
+	task, err := tr.Submit(TransferRequest{SourceURL: share, DestDir: "/Pool", UA: "UA/1"})
+	if err != nil {
+		t.Fatalf("submit: %v", err)
+	}
+	waitDone(t, tr, task.ID)
+	snap := tr.Get(task.ID)
+	if snap.State != "done" {
+		t.Fatalf("auto 应在 offline 不可用后回退 stream, state=%s channel=%s err=%s", snap.State, snap.Channel, snap.Error)
+	}
+	if snap.Channel != string(ChannelStream) {
+		t.Fatalf("回退后 channel=%s want stream", snap.Channel)
+	}
+	if atomic.LoadInt64(&puts) != 1 || atomic.LoadInt64(&putBody) != 300 {
+		t.Fatalf("stream PUT 次数=%d 字节=%d, want 1/300", puts, putBody)
+	}
+}
+
+// 显式 offline 的失败不得被静默吞掉改成 stream(否则调用方误以为走了省带宽通道)。
+func TestExplicitOfflineDoesNotFallBack(t *testing.T) {
+	var puts int64
+	ol := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/api/fs/mkdir":
+			_, _ = w.Write([]byte(`{"code":200,"message":"success"}`))
+		case r.URL.Path == "/api/fs/add_offline_download":
+			_, _ = w.Write([]byte(`{"code":500,"message":"failed init offline download tool aria2: connection refused"}`))
+		case r.Method == http.MethodPut:
+			atomic.AddInt64(&puts, 1)
+			_, _ = w.Write([]byte(`{"code":200}`))
+		}
+	}))
+	defer ol.Close()
+
+	tr, share := newTransferFixture(t, "http://127.0.0.1:1", ol.URL)
+	task, err := tr.Submit(TransferRequest{SourceURL: share, Channel: ChannelOffline, DestDir: "/Pool", UA: "UA/1"})
+	if err != nil {
+		t.Fatalf("submit: %v", err)
+	}
+	waitDone(t, tr, task.ID)
+	snap := tr.Get(task.ID)
+	if snap.State != "failed" {
+		t.Fatalf("显式 offline 不可用应失败, got state=%s channel=%s", snap.State, snap.Channel)
+	}
+	if atomic.LoadInt64(&puts) != 0 {
+		t.Fatalf("显式 offline 不应回退 stream, got %d PUT", puts)
+	}
+}

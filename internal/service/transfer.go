@@ -400,7 +400,20 @@ func (s *Transfer) Run(ctx context.Context, task *TransferTask, req TransferRequ
 
 	switch channel {
 	case ChannelOffline:
-		return s.transferOffline(ctx, task, src, destPath)
+		err := s.transferOffline(ctx, task, src, destPath)
+		if err != nil && req.Channel != ChannelOffline {
+			// auto 选中的 offline 只是「优先尝试省带宽」:端点未部署 aria2
+			// (localhost:6800 refused)或远端拒收时,auto 必须回退 stream,
+			// 否则桌面端默认通道(AUTO)在无 aria2 的部署上全部失败。
+			// 显式 offline 不回退:调用方明确要求省带宽,失败原因必须可见。
+			s.log.Warnw("offline unavailable, falling back to stream",
+				"id", task.ID, "err", err)
+			task.mu.Lock()
+			task.Channel = string(ChannelStream)
+			task.mu.Unlock()
+			return s.transferStream(ctx, task, src, destPath)
+		}
+		return err
 	default:
 		return s.transferStream(ctx, task, src, destPath)
 	}
