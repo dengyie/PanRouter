@@ -453,5 +453,6 @@ iframe / modern / 密码分享三条流;最终 CDN 对非浏览器客户端先 a
 
 ## 变更记录
 
+- **v2.2(2026-11-10)**:M4 转存链路三轮生产迭代收口(契约权威源=桌面仓 INTEGRATION-PANROUTER.md v1.15,本页记服务端内部口径):① max_bytes 硬上限全覆盖(offline 提交前校验/stream 预检+途中实收截断)+ prune 竞态修复(`5914f89`);② auto 选中的 offline 提交失败自动回退 stream,显式 offline 原样报错(`3aac3ee`);③ 直链直传 `fid=direct`(受理前探测、SSRF 双保险、跨域公网 302 放行,`a346df8`);④ 同目标并发写守卫(destPath 互斥,offline 占用维持到落池确认/窗口超时,新增 `conflict` kind)+ offline 落池确认器(只观测不改状态,`36afa15`);⑤ 生产实测:公网文件矩阵 4/4 sha256 MATCH(含 1GiB stream)、守卫 GUARD/RELEASE 双 OK
 - **v2.1(2026-11-04)**:新增设备历史同步端点 `POST|GET /api/v1/sync`(M3,§7.6)+ `sync_items` 表(§9)+ 管理页「设备同步数据」浏览区块;payload 不透明存储,服务端只做 LWW 仲裁与墓碑传播,两仓零共享代码边界不破
 - **v2.0(2026-10-05)**:以实际实现为基准重写,取代《方案设计》v1.1.x(已删除);现状/已知问题/契约/路线图分开表述;新增 §15 深度评审结论与分阶段重构计划;代码注释不再引用章节号
