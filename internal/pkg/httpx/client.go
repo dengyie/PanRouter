@@ -30,6 +30,10 @@ type Options struct {
 	// NoBodyTimeout: 中转流场景去掉 client 级总超时(http.Client.Timeout 包含读体全程,
 	// 会截断长下载);响应头到达仍受 ResponseHeaderTimeout=Timeout 约束。
 	NoBodyTimeout bool
+	// ForceHTTP1: 强制 HTTP/1.1(禁 ALPN h2)。面向任意公网源的直链客户端使用——
+	// 部分站点(GitHub 等)对数据中心 IP 的 h2 下载型 GET 有 tar-pit(挂起不回响应头),
+	// HTTP/1.1 实测可用;大文件单流下载也吃不到 h2 多路复用的收益。
+	ForceHTTP1 bool
 }
 
 // Result 是已读完响应体的结果(用于 JSON API 调用)。
@@ -57,7 +61,7 @@ func New(opts Options) (*Client, error) {
 	dialer := &net.Dialer{Timeout: 15 * time.Second, KeepAlive: 30 * time.Second, Control: controlFn(opts.AllowPrivate)}
 	tr := &http.Transport{
 		DialContext:           dialer.DialContext,
-		ForceAttemptHTTP2:     true,
+		ForceAttemptHTTP2:     !opts.ForceHTTP1,
 		TLSHandshakeTimeout:   10 * time.Second,
 		MaxIdleConnsPerHost:   8,
 		IdleConnTimeout:       90 * time.Second,

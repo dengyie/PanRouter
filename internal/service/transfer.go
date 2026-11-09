@@ -85,9 +85,11 @@ func NewTransfer(cfg *config.Provider, resolver *Resolver, upstream map[string]*
 	// direct 客户端:直链直传专用。禁止私网(拨号级 + 每跳重定向 DNS 级双保险),
 	// 公网跨域 302 放行(github release → objects.githubusercontent.com 一类);
 	// 无总超时,响应头超时仍受 Timeout 约束。AllowPrivate 仅供测试 fixture 打开。
+	// ForceHTTP1:GitHub 等站点对数据中心 IP 的 h2 下载型 GET 会 tar-pit(挂起
+	// 不回响应头,生产实测),HTTP/1.1 实测可用;单流大文件也用不到 h2 多路复用。
 	direct, err := httpx.New(httpx.Options{
 		Timeout: 30 * time.Second, AllowPrivate: cfg.Get().Transfer.DirectAllowPrivate,
-		RedirectAllow: []string{"*"}, NoBodyTimeout: true,
+		RedirectAllow: []string{"*"}, NoBodyTimeout: true, ForceHTTP1: true,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("direct transfer client: %w", err)
@@ -793,20 +795,38 @@ func (s *Transfer) transferStream(ctx context.Context, task *TransferTask, src *
 	if fetchURL == "" {
 		fetchURL = src.file.DirectURL
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, fetchURL, nil)
-	if err != nil {
-		return driver.NewErr(driver.KindUpstream, "构造上游请求失败", err)
+	buildReq := func() (*http.Request, error) {
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, fetchURL, nil)
+		if err != nil {
+			return nil, err
+		}
+		if src.meta.UA != "" {
+			req.Header.Set("User-Agent", src.meta.UA)
+		}
+		if src.meta.Referer != "" {
+			req.Header.Set("Referer", src.meta.Referer)
+		}
+		if src.meta.Cookie != "" {
+			req.Header.Set("Cookie", src.meta.Cookie)
+		}
+		return req, nil
 	}
-	if src.meta.UA != "" {
-		req.Header.Set("User-Agent", src.meta.UA)
+	// 公网直链的瞬态网络错误(h2 tar-pit/连接复位/对端闪断)重试一次:
+	// 此刻尚未向 OpenList 写入任何字节,重试无副作用。
+	var resp *http.Response
+	var err error
+	for attempt := 0; attempt < 2; attempt++ {
+		req, berr := buildReq()
+		if berr != nil {
+			return driver.NewErr(driver.KindUpstream, "构造上游请求失败", berr)
+		}
+		resp, err = up.DoStream(req)
+		if err == nil {
+			break
+		}
+		s.log.Warnw("upstream fetch failed, retrying", "upstream", src.upstream,
+			"attempt", attempt+1, "err", err.Error())
 	}
-	if src.meta.Referer != "" {
-		req.Header.Set("Referer", src.meta.Referer)
-	}
-	if src.meta.Cookie != "" {
-		req.Header.Set("Cookie", src.meta.Cookie)
-	}
-	resp, err := up.DoStream(req)
 	if err != nil {
 		return driver.NewErr(driver.KindUpstream, "上游直链请求失败", err)
 	}
