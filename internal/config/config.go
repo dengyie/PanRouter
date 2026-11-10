@@ -89,9 +89,12 @@ type Transfer struct {
 	DirectAllowPrivate bool `mapstructure:"direct_allow_private"`
 	// OfflineConfirmAfter offline 任务落池确认窗口:端点受理后任务停在 pending,
 	// 后台确认器观测到产物才收口 done(带真实大小),窗口内未落池收口 failed 并释放
-	// 同路径写占用。0 = 默认 2h,负 = 关闭(退回受理即 done,仅告警)。
+	// 同路径写占用。窗口计时期间只要远端任务已失败(取消/报错)就立刻 failed,不空等;
+	// 窗口到期前还会对父目录 fs/list 对账一次(产物被 Content-Disposition 改名时据此
+	// 收口 done 并回写真实文件名)。0 = 默认 2h,负 = 关闭(退回受理即 done,仅告警)。
 	OfflineConfirmAfter time.Duration `mapstructure:"offline_confirm_after"`
-	// OfflineConfirmPoll 落池确认轮询间隔(决定同名路径冲突窗口的检测延迟);0 = 默认 10s。仅测试会调小。
+	// OfflineConfirmPoll 落池确认轮询间隔(决定同名路径冲突窗口的检测延迟);
+	// 0 = 默认 10s。仅测试会调小。每轮除 fs/get 外还按 6 倍间隔做父目录对账。
 	OfflineConfirmPoll time.Duration `mapstructure:"offline_confirm_poll"`
 }
 

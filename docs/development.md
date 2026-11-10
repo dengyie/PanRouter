@@ -233,10 +233,13 @@ Relay.Serve:验签 → GetFreshLink → 解密 Cookie → 构造上游请求(UA/
 **offline 通道不再「受理即 done」**(v2.3 根因修复):
 
 - 端点提交成功后任务停在 `pending`,`activeDest` 对目标路径的占用由确认器持有;
-- 确认器(`watchOfflineArtifact`)按 `transfer.offline_confirm_poll`(默认 30s)轮询产物:`!is_dir && size > 0 && (expect <= 0 || size >= expect)` → 收口 `done`,并用**真实落盘 size** 回填快照;
-- 超过 `transfer.offline_confirm_after`(默认 2h)仍未见产物 → 收口 `failed`(`hint=upstream_error`)并 Warn(含 expect/window),同路径写占用随之释放;
+- 确认器(`watchOfflineArtifact`)按 `transfer.offline_confirm_poll`(默认 10s)轮询产物,命中 `!is_dir && size > 0 && (size >= expect 或产物 mtime 不早于任务起始)` → 收口 `done`,并用**真实落盘 size** 回填快照;
+- 每轮除 `fs/get` 探预测路径外,还按约 6 倍轮询间隔对父目录做 `fs/list` 对账:产物若被上游按 HTTP `Content-Disposition` 改名落盘,对账能找回真实文件并把快照 `dest_path` 指向它;
+- 远端任务轮询(`/api/task/offline_download/undone`)发现已取消/报错 → 立即收口 `failed`(`hint=upstream_error`,文案带远端原因),不空占 2h pending;
+- 超过 `transfer.offline_confirm_after`(默认 2h)仍未见产物 → 最后对账一次,仍无则收口 `failed`(`hint=upstream_error`)并 Warn(含 expect/window),同路径写占用随之释放;
+- 源大小未知(`expect<=0`)时不做「同名非空文件就算产物」:产物 mtime 必须不早于任务起始时刻(容忍 2min 时钟偏差),避免把同名旧残留误判成新产物;
 - 配置为负数 = 关闭产物确认:回退到「受理即 done」并打 Warn,不再静默;
-- 快照命名在受理瞬间已定型(offline 落盘名 = URL 末段 / stream 落盘名 = 接受名),客户端 `pending` 期间即可看到真实 `dest_path`,无需等确认。
+- pending 期间快照 `size=0`、进度未知;确认后才有真实大小/进度(桌面端 `progress` 对 pending 返回 null,用不确定进度条)。
 
 为什么要改:旧契约下 offline 任务已报 `done` 而目标路径仍被写占用卡住,桌面端看到 done 就再提交同名 → 收到 `conflict`;生产查记显示 34 条后台转存中 6 条是这种误判重提(首次写入仍在进行,最长占用近 20min)。
 
@@ -244,7 +247,7 @@ Relay.Serve:验签 → GetFreshLink → 解密 Cookie → 构造上游请求(UA/
 
 - `isTerminal = done || failed`;不包含 `pending`;
 - `isRunning = queued || running || pending`;桌面端按 `isRunning` 决定是否继续轮询,所以 `pending` 必须入列,否则在产物真正落池前停抽;
-- `stateLabelOf(pending) = "落池中"`。
+- `progress` 对 `pending` 返回 null(字节未落池,不给确定进度);`stateLabelOf(pending) = "落池中"`。
 
 ## 8. 错误契约
 

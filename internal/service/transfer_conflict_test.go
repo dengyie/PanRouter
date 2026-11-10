@@ -119,6 +119,10 @@ func TestDestConflictOfflineHoldsUntilConfirm(t *testing.T) {
 			_ = json.NewDecoder(r.Body).Decode(&body)
 			_, _ = w.Write([]byte(`{"code":200,"message":"success","data":{"name":"` +
 				body.Path + `","size":` + strconv.FormatInt(atomic.LoadInt64(&fsSize), 10) + `,"is_dir":false}}`))
+		case r.URL.Path == "/api/fs/list":
+			_, _ = w.Write([]byte(`{"code":200,"message":"success","data":{"content":[],"total":0}}`))
+		case r.URL.Path == "/api/task/offline_download/undone":
+			_, _ = w.Write([]byte(`{"code":200,"message":"success","data":[]}`))
 		default:
 			t.Errorf("unexpected openlist call: %s %s", r.Method, r.URL.Path)
 		}
@@ -193,6 +197,10 @@ func TestDestConflictOfflineTimeoutReleases(t *testing.T) {
 			_, _ = w.Write([]byte(`{"code":200,"message":"success"}`))
 		case r.URL.Path == "/api/fs/get":
 			_, _ = w.Write([]byte(`{"code":200,"message":"success","data":{"size":0,"is_dir":false}}`))
+		case r.URL.Path == "/api/fs/list":
+			_, _ = w.Write([]byte(`{"code":200,"message":"success","data":{"content":[],"total":0}}`))
+		case r.URL.Path == "/api/task/offline_download/undone":
+			_, _ = w.Write([]byte(`{"code":200,"message":"success","data":[]}`))
 		default:
 			t.Errorf("unexpected openlist call: %s %s", r.Method, r.URL.Path)
 		}
