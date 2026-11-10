@@ -17,6 +17,7 @@ import (
 
 	"github.com/dengyie/panrouter/internal/config"
 	"github.com/dengyie/panrouter/internal/driver"
+	"github.com/dengyie/panrouter/internal/driver/mangodrive"
 	"github.com/dengyie/panrouter/internal/pkg/breaker"
 	"github.com/dengyie/panrouter/internal/pkg/crypto"
 	"github.com/dengyie/panrouter/internal/pkg/limiter"
@@ -502,9 +503,15 @@ func (r *Resolver) buildRef(key, fid string, own bool) (*driver.FileRef, error) 
 			}
 		}
 	}
-	if len(ref.Ext) == 0 {
+	if len(ref.Ext) == 0 && isHashFid(fid) {
 		// 哈希 fid 无法从上下文推导路径时,任何一条同 fid 历史缓存都是恢复源。
-		if hist, herr := r.store.FindLinkByFID(fid); herr == nil && hist != nil && hist.Ext != "" {
+		// 仅哈希形态启用:path 形态未命中由 driverStat 兜底,不必扫历史表;
+		// 也杜绝其它驱动形态 fid 撞名时把无关 Ext 注入 FileRef。
+		hist, herr := r.store.FindLinkByFID(fid)
+		if herr != nil {
+			return nil, fmt.Errorf("query link history: %w", herr)
+		}
+		if hist != nil && hist.Ext != "" {
 			var ext map[string]string
 			if json.Unmarshal([]byte(hist.Ext), &ext) == nil && ext["path"] != "" {
 				ref.Ext = ext
@@ -540,12 +547,26 @@ func (r *Resolver) fileMeta(key, fid string, ref *driver.FileRef) (string, int64
 		}
 	}
 	// 哈希 fid 在本分享查不到名字时,同 fid 的历史缓存行有完整元数据。
-	if hist, herr := r.store.FindLinkByFID(fid); herr == nil && hist != nil {
-		var ext map[string]string
-		_ = json.Unmarshal([]byte(hist.Ext), &ext)
-		return hist.FileName, hist.Size, ext, nil
+	// 残缺行(FileName 空)不算命中,落到调用方的 driverStat 兜底。
+	if isHashFid(fid) {
+		hist, herr := r.store.FindLinkByFID(fid)
+		if herr != nil {
+			return "", 0, nil, fmt.Errorf("query link history: %w", herr)
+		}
+		if hist != nil && hist.FileName != "" {
+			var ext map[string]string
+			_ = json.Unmarshal([]byte(hist.Ext), &ext)
+			return hist.FileName, hist.Size, ext, nil
+		}
 	}
 	return "", 0, ref.Ext, nil
+}
+
+// isHashFid 哈希形态 fid 判定(mangodrive 对超长路径生成 "p:<sha1>",不可逆)。
+// 仅哈希形态启用历史反查:path 形态 fid 未命中由 driverStat 兜底,省一次全局扫;
+// 同时保证其它驱动形态的 fid 不会撞名进 mangodrive 的历史恢复路径。
+func isHashFid(fid string) bool {
+	return strings.HasPrefix(fid, mangodrive.FidHashPrefix)
 }
 
 // driverStat 回问 driver:把 rawURL 当作文件路径解析,命中 fid 时取名字与大小。

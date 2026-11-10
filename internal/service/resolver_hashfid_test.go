@@ -100,3 +100,40 @@ func TestResolveFileHashFidNoHistoryFails(t *testing.T) {
 		t.Fatal("expected failure without any history, got success")
 	}
 }
+
+// DB 故障不得降级成误导性的驱动 404:store 关闭后,提链必须报「查询」类错误,
+// 而不是把哈希当路径去 Get 得到「Mango Drive 路径不存在」(评审 P2 的契约回归)。
+func TestResolveFileHashFidDBErrorPropagates(t *testing.T) {
+	d := newHashFidDriver("/Pool/never-listed/deep/long.bin")
+	resolver, store := newTestResolver(t, d, config.DriverCommon{Enabled: true, LimitQPS: 1000, DownloadConc: 3})
+	ctx := WithAuthed(context.Background(), true)
+	_ = store.Close() // 注入 DB 故障
+
+	_, err := resolver.ResolveFile(ctx, testShareURL+"/", "", d.fid, false, "")
+	if err == nil {
+		t.Fatal("expected DB error to propagate, got success")
+	}
+	if strings.Contains(err.Error(), "Mango Drive 路径不存在") {
+		t.Fatalf("DB failure degraded to driver 404: %v", err)
+	}
+	if !strings.Contains(err.Error(), "query") {
+		t.Fatalf("error should mention the failed query, got: %v", err)
+	}
+}
+
+// path 形态 fid 未命中时不得触发历史反查(门控回归):错误目录 + path fid 必须走
+// driver 的空 Ext 404,错误信息里不得出现历史反查的报错前缀。
+func TestResolveFilePathFidSkipsHistoryLookup(t *testing.T) {
+	d := newHashFidDriver("/Pool/never-listed/deep/long.bin")
+	resolver, _ := newTestResolver(t, d, config.DriverCommon{Enabled: true, LimitQPS: 1000, DownloadConc: 3})
+	ctx := WithAuthed(context.Background(), true)
+
+	// path 形态 fid + 错误目录(根 url):门控生效 → 不反查 → driver 空 Ext 404
+	_, err := resolver.ResolveFile(ctx, testShareURL+"/", "", "/Pool/some/other/path.bin", false, "")
+	if err == nil {
+		t.Fatal("expected failure for path fid with wrong dir, got success")
+	}
+	if strings.Contains(err.Error(), "query link history") {
+		t.Fatalf("path fid must not trigger history lookup: %v", err)
+	}
+}

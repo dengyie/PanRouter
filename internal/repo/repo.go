@@ -39,7 +39,9 @@ type Share struct {
 type Link struct {
 	ID         uint   `gorm:"primaryKey" json:"id"`
 	ShareKey   string `gorm:"uniqueIndex:idx_share_fid;size:64" json:"share_key"`
-	FID        string `gorm:"column:fid;uniqueIndex:idx_share_fid;size:128" json:"fid"`
+	// FID 双索引:与 ShareKey 组成业务唯一键;单列索引支撑 FindLinkByFID 的
+	// 哈希 fid 全局反查(该查询不带 share_key,无单列索引即全表扫描)。
+	FID        string `gorm:"column:fid;uniqueIndex:idx_share_fid;index;size:128" json:"fid"`
 	FileName   string `gorm:"size:512" json:"file_name"`
 	Size       int64  `json:"size"`
 	DirectLink string `gorm:"type:text" json:"-"`
