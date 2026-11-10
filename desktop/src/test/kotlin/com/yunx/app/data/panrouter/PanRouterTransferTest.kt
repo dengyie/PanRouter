@@ -223,6 +223,12 @@ class PanRouterTransferTest {
         )
         assertTrue(pending.isRunning)
         assertFalse(pending.isTerminal)
+        assertNull(pending.progress)
+
+        // pending 即使已知源端预测大小，也不能显示确定进度（字节还没落池）。
+        val pendingSized = pending.copy(size = 100L, done = 100L)
+        assertNull(pendingSized.progress)
+        assertEquals(1f, pendingSized.copy(state = TransferTask.STATE_RUNNING).progress)
 
         assertEquals("排队中", TransferTask.stateLabelOf(TransferTask.STATE_QUEUED))
         assertEquals("搬运中", TransferTask.stateLabelOf(TransferTask.STATE_RUNNING))

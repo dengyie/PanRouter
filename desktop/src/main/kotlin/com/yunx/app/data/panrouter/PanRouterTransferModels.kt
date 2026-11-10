@@ -60,9 +60,18 @@ data class TransferTask(
     val isTerminal: Boolean get() = state == STATE_DONE || state == STATE_FAILED
     val isRunning: Boolean get() = state == STATE_RUNNING || state == STATE_QUEUED || state == STATE_PENDING
 
-    /** 0..1；未知总大小（size <= 0）时为 null，界面用不确定进度条 */
+    /**
+     * 0..1；未知总大小（size <= 0）时为 null，界面用不确定进度条。
+     *
+     * pending（离线受理、产物尚未落池）同样返回 null：此时已知的 size 只是源端
+     * 预测大小，字节并没有落到私有盘，给出确定进度会让用户误以为已经搬完。
+     */
     val progress: Float?
-        get() = if (size > 0L) (done.toDouble() / size.toDouble()).toFloat().coerceIn(0f, 1f) else null
+        get() = when {
+            state == STATE_PENDING -> null
+            size > 0L -> (done.toDouble() / size.toDouble()).toFloat().coerceIn(0f, 1f)
+            else -> null
+        }
 
     companion object {
         const val STATE_QUEUED = "queued"
