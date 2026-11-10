@@ -55,21 +55,25 @@ jobs:
         run: .\portable-package.ps1
 
       - name: 打包为 zip
-        shell: powershell
+        # Windows PowerShell 5.1 读无 BOM 临时脚本按 ANSI 解码:run: 块含非 ASCII(中文)
+        # 必然乱码解析失败(仓库文件加 BOM 无效——runner 写临时脚本时会剥掉)。
+        # 因此本步骤改用 pwsh(UTF-8 默认),脚本体同时去掉非 ASCII 双保险。
+        shell: pwsh
         run: |
           $name = "YunX-Desktop-portable-${{ github.event.pull_request.number || github.run_number }}"
-          # 进入 release 目录再打包，使 zip 根目录直接是 YunX-Desktop\（解开即可双击 exe）
+          # cd into release so zip root is YunX-Desktop\ (unzip then double-click exe)
           Push-Location .\release
           try {
             & 7z a -tzip -mx=5 "..\$name.zip" "YunX-Desktop" | Out-Null
-            if ($LASTEXITCODE -ne 0) { throw "7z 打包失败" }
+            if ($LASTEXITCODE -ne 0) { throw "7z pack failed" }
           } finally {
             Pop-Location
           }
           $mb = [math]::Round((Get-Item "$name.zip").Length / 1MB, 1)
           Write-Host "artifact: $name.zip ($mb MB)"
-          # 用无 BOM 的 UTF-8 追加，避免 GITHUB_STEP_SUMMARY 首行出现 BOM 乱码
-          [System.IO.File]::AppendAllText($env:GITHUB_STEP_SUMMARY, "### 便携包已生成：$name.zip（$mb MB）`n")
+          # UTF-8 no-BOM append keeps GITHUB_STEP_SUMMARY free of BOM garbling
+          $summary = "### Portable package: $name.zip ($mb MB)" + [char]10
+          [System.IO.File]::AppendAllText($env:GITHUB_STEP_SUMMARY, $summary)
 
       - name: 上传产物
         uses: actions/upload-artifact@v4
