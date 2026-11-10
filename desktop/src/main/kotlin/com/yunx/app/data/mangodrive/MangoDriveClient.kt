@@ -78,9 +78,10 @@ class MangoDriveClient(
     }
 
     /**
-     * fid 是否为哈希形态（服务端对超长路径生成 "p:<sha1>"，不可逆）：
-     * 哈希 fid 推不出父目录，提链时直接用列目录时的真实 dirPath，
-     * 服务端再以历史缓存反查兜底（resolver buildRef）。
+     * fid 是否为哈希形态（服务端对超长路径生成 "p:<sha1>"，不可逆）。
+     * 契约辅助方法（与服务端 `mangodrive.FidHashPrefix` 门控对应）：
+     * 客户端提链不按形态分流——无论何种形态一律携带列目录时的真实 dirPath
+     * （服务端快照直查；历史反查仅兜底且只覆盖每目录 auto-link 前 8 个）。
      */
     fun isHashFid(fid: String): Boolean = !fid.startsWith("/")
 

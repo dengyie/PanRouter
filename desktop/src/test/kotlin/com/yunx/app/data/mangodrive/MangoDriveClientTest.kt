@@ -190,9 +190,10 @@ class MangoDriveClientTest {
     }
 
     /**
-     * isHashFid 契约："/" 开头 = 路径形态（可推父目录，零回查提链）；
-     * 其余（"p:<sha1>" 哈希 / 空串）= 哈希形态，交服务端历史缓存反查。
-     * 回归锚点：enqueueEach 按它选择提链目录（hash→"/"，path→真实所在目录）。
+     * isHashFid 契约："/" 开头 = 路径形态；其余（"p:<sha1>" 哈希 / 空串）= 哈希形态。
+     * v1.22 起客户端提链不再按形态分流（一律携带真实目录——历史反查兜底只覆盖
+     * 每目录 auto-link 前 8 个，生产实测 9+ 必 404）；本测试锁定形态判定本身，
+     * 与服务端 `mangodrive.FidHashPrefix` 门控共用同一契约。
      */
     @Test
     fun `isHashFid distinguishes path-form and hash-form fids`() {

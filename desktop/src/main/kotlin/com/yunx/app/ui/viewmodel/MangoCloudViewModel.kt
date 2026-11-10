@@ -302,8 +302,9 @@ class MangoCloudViewModel(
     /**
      * 递归列出文件夹内全部文件：三元组 (相对路径, fid, 所在目录)。
      * 目录必须显式携带：fid 是长路径时服务端会哈希化（"p:<sha1>"，不可逆），
-     * 提链时 parentDirOf 推不出父目录——列目录时就知道的 dirPath 是唯一可靠定位。
-     * 返回值 = 因超出层级上限（8 层）未下探的子目录数（静默丢文件 → 明示给用户）。
+     * 提链永远用列目录时就知道的 dirPath——服务端快照直查命中全部文件；
+     * 绝不按 fid 形态分流（历史反查兜底只覆盖每目录 auto-link 前 8 个，
+     * 生产实测 9+ 必 404）。返回值 = 超出层级上限（8 层）未下探的子目录数。
      */
     private suspend fun collectFiles(
         dirPath: String,
@@ -346,10 +347,11 @@ class MangoCloudViewModel(
                         if (downloadCancelRequested) return@withPermit
                         folderProgress = "正在加入下载 ${processed.incrementAndGet()}/${tasks.size}"
                         runCatching {
-                            // 哈希 fid（"p:" 前缀）推不出父目录，交给服务端按历史缓存反查；
-                            // 路径形态 fid 直接用所在目录，零回查。
-                            val dir = if (client.isHashFid(task.fid)) "/" else task.dir
-                            val link = client.link(dir, task.fid).getOrThrow()
+                            // 一律携带真实所在目录提链：服务端分享快照含全部文件节点，
+                            // 哈希 fid 也直接命中（不依赖 auto-link 配额——每目录只有
+                            // 前 8 个文件会产生 links 历史行，第 9+ 个走历史反查必 404，
+                            // 生产实测复现）。历史反查仅作服务端兜底。
+                            val link = client.link(task.dir, task.fid).getOrThrow()
                             downloadManager.enqueue(
                                 url = downloadUrlOf(link),
                                 fileName = task.rel,
