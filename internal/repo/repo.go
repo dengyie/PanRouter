@@ -39,9 +39,10 @@ type Share struct {
 type Link struct {
 	ID         uint   `gorm:"primaryKey" json:"id"`
 	ShareKey   string `gorm:"uniqueIndex:idx_share_fid;size:64" json:"share_key"`
-	// FID 双索引:与 ShareKey 组成业务唯一键;单列索引支撑 FindLinkByFID 的
-	// 哈希 fid 全局反查(该查询不带 share_key,无单列索引即全表扫描)。
-	FID        string `gorm:"column:fid;uniqueIndex:idx_share_fid;index;size:128" json:"fid"`
+	// FID 双索引:与 ShareKey 组成业务唯一键;复合索引 (fid, created_at) 支撑
+	// FindLinkByFID 的哈希 fid 全局反查——过滤与 created_at 排序全走索引,
+	// 免去 TEMP B-TREE(单列索引只能免全表扫,排序仍要临时 B 树)。
+	FID        string `gorm:"column:fid;uniqueIndex:idx_share_fid;index:idx_fid_created,priority:1;size:128" json:"fid"`
 	FileName   string `gorm:"size:512" json:"file_name"`
 	Size       int64  `json:"size"`
 	DirectLink string `gorm:"type:text" json:"-"`
@@ -53,7 +54,7 @@ type Link struct {
 	BindIP     bool      `json:"bind_ip"`
 	ExpiresAt  time.Time `json:"expires_at"`
 	Ext        string    `gorm:"type:text" json:"-"` // JSON: driver FileRef.Ext
-	CreatedAt  time.Time `json:"created_at"`
+	CreatedAt  time.Time `gorm:"index:idx_fid_created,priority:2" json:"created_at"`
 }
 
 type Download struct {

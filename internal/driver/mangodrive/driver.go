@@ -21,7 +21,8 @@ const (
 	// 过期由 Resolver.GetFreshLink 走 singleflight 续签。
 	rawLinkTTL = 20 * time.Minute
 	// maxListPages 单目录翻页上界,防异常响应把解析拖死。
-	maxListPages = 20
+	// 50 × 200 = 单目录 1 万条上界(实测 250 文件双页正常);命中上界说明目录异常,宁截断不拖死。
+	maxListPages = 50
 	// listPageSize 单页条数(OpenList 上限 500)。
 	listPageSize = 200
 )
