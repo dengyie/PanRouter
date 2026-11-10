@@ -191,6 +191,25 @@ func (s *Store) GetLink(shareKey, fid string) (*Link, error) {
 	return &l, nil
 }
 
+// FindLinkByFID 跨 share_key 按 fid 找最近一条直链缓存。
+// 用途:mangodrive 等驱动对长路径生成哈希 fid("p:<sha1>"),哈希不可逆——
+// 调用方只拿到 fid 时(如客户端由 parentDirOf 推不出父目录、直接以 fid 提链),
+// 从任何一条历史缓存行的 Ext 里都能恢复真实路径。返回 (nil, nil) = 没有历史。
+func (s *Store) FindLinkByFID(fid string) (*Link, error) {
+	if fid == "" {
+		return nil, nil
+	}
+	var l Link
+	err := s.db.Where("fid = ?", fid).Order("created_at DESC").First(&l).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &l, nil
+}
+
 // GetShare 按 share_key 读取分享快照。
 // 契约:不存在返回 (nil, nil),DB 故障返回 error。
 func (s *Store) GetShare(shareKey string) (*Share, error) {

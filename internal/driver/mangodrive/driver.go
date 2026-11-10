@@ -81,13 +81,17 @@ func cleanPath(p string) string {
 	return p
 }
 
+// fidHashPrefix 哈希 fid 的前缀:哈希不可逆,客户端由它推不出父目录,
+// 服务端直链提链依赖分享快照回放(ref.Ext["path"])或历史缓存反查。
+const fidHashPrefix = "p:"
+
 // fidFor 生成稳定 FID:短路径直接用路径(便于人工排查),超长路径取哈希。
 func fidFor(p string) string {
 	if len(p) <= 100 {
 		return p
 	}
 	h := sha1.Sum([]byte(p))
-	return "p:" + hex.EncodeToString(h[:])
+	return fidHashPrefix + hex.EncodeToString(h[:])
 }
 
 // ResolveShare 解析一个存储路径(目录 → 列表,文件 → 单元素)。

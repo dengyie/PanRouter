@@ -468,6 +468,11 @@ func (r *Resolver) ResolveFile(ctx context.Context, rawURL, pwd, fid string, own
 
 // buildRef 组装 FileRef:优先用已缓存 link 的 ext,其次从分享快照的节点里取。
 // DB 故障向上传播;只有记录确实不存在时才允许降级为空上下文。
+//
+// 哈希 fid 兜底:mangodrive 对超长路径生成不可逆哈希 fid("p:<sha1>"),调用方
+// (桌面端 parentDirOf 推不出父目录时)只能以任意 url + 裸 fid 提链,此时
+// 本分享的缓存/快照都查不到 path。links 表按 fid 全局扫一条历史行——当初
+// auto-link 它的分享快照把真实路径写进了 Ext["path"],从那里恢复。
 func (r *Resolver) buildRef(key, fid string, own bool) (*driver.FileRef, error) {
 	ref := &driver.FileRef{Own: own, FID: fid, ShareKey: key}
 	if own {
@@ -485,16 +490,24 @@ func (r *Resolver) buildRef(key, fid string, own bool) (*driver.FileRef, error) 
 		if err != nil {
 			return nil, fmt.Errorf("query share snapshot: %w", err)
 		}
-		if sh == nil {
-			return ref, nil
-		}
-		var nodes []driver.FileNode
-		if json.Unmarshal([]byte(sh.RawTree), &nodes) == nil {
-			for _, n := range nodes {
-				if n.FID == fid {
-					ref.Ext = n.Ext
-					break
+		if sh != nil {
+			var nodes []driver.FileNode
+			if json.Unmarshal([]byte(sh.RawTree), &nodes) == nil {
+				for _, n := range nodes {
+					if n.FID == fid {
+						ref.Ext = n.Ext
+						break
+					}
 				}
+			}
+		}
+	}
+	if len(ref.Ext) == 0 {
+		// 哈希 fid 无法从上下文推导路径时,任何一条同 fid 历史缓存都是恢复源。
+		if hist, herr := r.store.FindLinkByFID(fid); herr == nil && hist != nil && hist.Ext != "" {
+			var ext map[string]string
+			if json.Unmarshal([]byte(hist.Ext), &ext) == nil && ext["path"] != "" {
+				ref.Ext = ext
 			}
 		}
 	}
@@ -525,6 +538,12 @@ func (r *Resolver) fileMeta(key, fid string, ref *driver.FileRef) (string, int64
 				}
 			}
 		}
+	}
+	// 哈希 fid 在本分享查不到名字时,同 fid 的历史缓存行有完整元数据。
+	if hist, herr := r.store.FindLinkByFID(fid); herr == nil && hist != nil {
+		var ext map[string]string
+		_ = json.Unmarshal([]byte(hist.Ext), &ext)
+		return hist.FileName, hist.Size, ext, nil
 	}
 	return "", 0, ref.Ext, nil
 }
