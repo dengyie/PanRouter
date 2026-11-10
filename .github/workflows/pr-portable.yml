@@ -1,4 +1,4 @@
-name: PR 便携包构建
+﻿name: PR 便携包构建
 
 # 目的：任何 PR（含 fork）提交后自动构建免安装便携包并作为 artifact 上传，
 # 维护者不必本地拉取代码即可下载 zip 直接试运行。不构建 Inno Setup 安装程序。
