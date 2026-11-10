@@ -132,6 +132,75 @@ func TestDirectOfflineTransfer(t *testing.T) {
 	}
 }
 
+// 请求 name 对 direct 直链的覆盖契约(v1.14 规格但 direct 路径漏实现):
+// stream 用请求 name 落盘;offline 远端不可重命名,落盘名仍由 URL 末段决定。
+func TestDirectNameOverrideStreamNotOffline(t *testing.T) {
+	payload := strings.Repeat("d", 2046)
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodHead {
+			w.Header().Set("Content-Length", strconv.Itoa(len(payload)))
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		w.Header().Set("Content-Length", strconv.Itoa(len(payload)))
+		_, _ = w.Write([]byte(payload))
+	}))
+	defer up.Close()
+
+	var gotPath string
+	ol := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/api/fs/mkdir":
+			_, _ = w.Write([]byte(`{"code":200,"message":"success"}`))
+		case r.URL.Path == "/api/fs/add_offline_download":
+			_, _ = w.Write([]byte(`{"code":200,"message":"success","data":{"tasks":[{"id":"1"}]}}`))
+		case r.Method == http.MethodPut && r.URL.Path == "/api/fs/put":
+			gotPath = r.Header.Get("File-Path")
+			_, _ = io.Copy(io.Discard, r.Body)
+			_, _ = w.Write([]byte(`{"code":200,"message":"success"}`))
+		case r.URL.Path == "/api/fs/get": // 落池确认器轮询
+			_, _ = w.Write([]byte(`{"code":200,"message":"success","data":{"size":0,"is_dir":false}}`))
+		default:
+			t.Errorf("unexpected openlist call: %s %s", r.Method, r.URL.Path)
+		}
+	}))
+	defer ol.Close()
+
+	tr, _ := newTransferFixtureMut(t, up.URL, ol.URL, func(c *config.Config) {
+		c.Transfer.DirectAllowPrivate = true
+	})
+
+	task, err := tr.Submit(TransferRequest{
+		SourceURL: up.URL + "/pub/orig.bin", FID: FIDDirect,
+		DestDir: "/Pool", Channel: ChannelStream, Name: "custom-name.bin", UA: "UA/1",
+	})
+	if err != nil {
+		t.Fatalf("submit stream: %v", err)
+	}
+	waitDone(t, tr, task.ID)
+	snap := tr.Get(task.ID)
+	if snap.FileName != "custom-name.bin" || snap.DestPath != "/Pool/custom-name.bin" {
+		t.Fatalf("stream 应按请求 name 落盘: file=%s path=%s", snap.FileName, snap.DestPath)
+	}
+	if un, e := url.PathUnescape(gotPath); e != nil || un != "/Pool/custom-name.bin" {
+		t.Fatalf("File-Path=%q want /Pool/custom-name.bin", gotPath)
+	}
+
+	task2, err := tr.Submit(TransferRequest{
+		SourceURL: up.URL + "/pub/orig.bin", FID: FIDDirect,
+		DestDir: "/Pool", Channel: ChannelOffline, Name: "custom-name.bin", UA: "UA/1",
+	})
+	if err != nil {
+		t.Fatalf("submit offline: %v", err)
+	}
+	// offline 受理后停在 pending(产物未落池):命名在受理瞬间即已确定。
+	waitState(t, tr, task2.ID, "pending")
+	snap2 := tr.Get(task2.ID)
+	if snap2.FileName != "orig.bin" || snap2.DestPath != "/Pool/orig.bin" {
+		t.Fatalf("offline 快照应仍为 URL 末段: file=%s path=%s", snap2.FileName, snap2.DestPath)
+	}
+}
+
 // SSRF 闸门:私网直链在生产语义(AllowPrivate=false)下必须在受理前拒绝,
 // 绝不能交给远端 aria2 去拉内网地址。
 func TestDirectPrivateRejected(t *testing.T) {

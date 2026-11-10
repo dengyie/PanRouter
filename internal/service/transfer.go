@@ -155,12 +155,16 @@ type TransferTask struct {
 	log     *loggerType
 	done    int64
 	destDir string
+	// offlineToken 远端离线任务 id(OpenList undones 表的 token)。仅由确认器在
+	// t.mu 内读改写;空 = 远端未返回 id 或已确认/放弃确认。
+	offlineToken string
 }
 
 func (t *TransferTask) set(delta int64) {
 	atomic.AddInt64(&t.done, delta)
 }
 
+// finishDone 收口成功。size>0 表示已从产物确认真实大小(覆盖进度计数);
 // finishDone 收口成功。size>0 表示已从产物确认真实大小(覆盖进度计数);
 // size 为 0 走 io.Pipe 流式的既有口径,用搬运计数。
 func (t *TransferTask) finishDone(size int64) {
@@ -309,7 +313,7 @@ func (s *Transfer) Submit(req TransferRequest) (*TransferTask, error) {
 	}
 	task := &TransferTask{
 		ID:        "t" + time.Now().Format("0206150405") + "-" + strconv.Itoa(int(atomic.AddInt64(&s.seq, 1))),
-		State:     "queued",
+		State:     stateQueued,
 		Channel:   string(channel),
 		SourceURL: req.SourceURL,
 		Client:    clientLabel(req.Client),
@@ -336,16 +340,19 @@ func (s *Transfer) Submit(req TransferRequest) (*TransferTask, error) {
 			return
 		}
 		// offline 的状态由确认器在 Run 内收口(pending / done / failed),
-		// 这里不再碰任务状态,只打日志。
+		// 这里不再碰任务状态,只打日志。确认器在 Run 返回前已启动,可能已经
+		// 改写 DestPath(Content-Disposition 改名对账),所以日志字段必须在锁内取。
 		task.mu.Lock()
 		ch := task.Channel
+		destPath := task.DestPath
 		task.mu.Unlock()
 		if ch == string(ChannelOffline) {
-			s.log.Infow("offline accepted, awaiting artifact", "id", task.ID, "dest_path", task.DestPath)
+			s.log.Infow("offline accepted, awaiting artifact", "id", task.ID, "dest_path", destPath)
 			return
 		}
 		task.finishDone(0)
-		s.log.Infow("transfer done", "id", task.ID, "dest_path", task.DestPath, "size", task.Size)
+		snap := task.Snapshot()
+		s.log.Infow("transfer done", "id", task.ID, "dest_path", snap.DestPath, "size", snap.Size)
 	}()
 	return task, nil
 }
@@ -444,7 +451,7 @@ func hintOf(err error) string {
 // 测试可直接同步调用以断言结果。
 func (s *Transfer) Run(ctx context.Context, task *TransferTask, req TransferRequest) error {
 	task.mu.Lock()
-	task.State = "running"
+	task.State = stateRunning
 	task.mu.Unlock()
 
 	src, err := s.resolveSource(ctx, req)
@@ -589,19 +596,24 @@ func (s *Transfer) watchOfflineArtifact(task *TransferTask, destPath string, exp
 	ctx, cancel := context.WithTimeout(context.Background(), after)
 	defer cancel()
 	// landed 观测产物:必须是非目录且非空;源大小已知时还要不小于它。
-	// expect<=0 时等任何非空文件出现即确认,size>=0 的分目录不能作数。
-	landed := func() (int64, bool) {
-		obj, err := s.driveAPI().Get(ctx, destPath)
+	// expect<=0(大小未知)时「非空」不足以证明是本次产物:同路径的历史残留
+	// (上一次重传/失败任务的半截文件)同样非空,要求 mtime 不早于任务开始时间。
+	landed := func(p string) (int64, bool) {
+		obj, err := s.driveAPI().Get(ctx, p)
 		if err != nil || obj == nil || obj.IsDir || obj.Size <= 0 {
 			return 0, false
 		}
-		if expect > 0 && obj.Size < expect {
+		if expect > 0 {
+			if obj.Size < expect {
+				return 0, false
+			}
+		} else if !freshEnough(obj, task.StartedAt) {
 			return 0, false
 		}
 		return obj.Size, true
 	}
 	// 立即首查:小文件(或重传时产物已在)等不到第一个 tick,占用窗口可以秒级收口。
-	if size, ok := landed(); ok {
+	if size, ok := landed(destPath); ok {
 		s.log.Infow("offline artifact confirmed",
 			"id", task.ID, "dest", destPath, "size", size)
 		task.finishDone(size)
@@ -609,11 +621,26 @@ func (s *Transfer) watchOfflineArtifact(task *TransferTask, destPath string, exp
 	}
 	tick := time.NewTicker(poll)
 	defer tick.Stop()
+	// reconcileEvery 每 N 个 tick 做一次目录对账:名字被上游改名、产物名与 URL
+	// 末段不一致时,只看预测路径会空等到窗口超时再误判 failed。按窗口的 1/6
+	// 摊开(默认 2h/10s → 每 20min 一次,加窗口末期一次,共 7 次),避免对
+	// 大目录反复枚举;测试窗口极短时下限 4 tick。
+	reconcileEvery := int(after/poll) / 6
+	if reconcileEvery < 4 {
+		reconcileEvery = 4
+	}
+	ticks := 0
 	for {
 		select {
 		case <-ctx.Done():
+			// 窗口到期前最后再对账一次:产物可能刚落池、或落在了非预测名下。
+			if size, obj, ok := s.reconcileOfflineArtifact(task, destPath, expect); ok {
+				s.confirmOfflineArtifact(task, obj, size)
+				return
+			}
 			s.log.Warnw("offline artifact not confirmed within window",
-				"id", task.ID, "dest", destPath, "expect", expect, "window", after)
+				"id", task.ID, "dest", destPath, "expect", expect, "window", after,
+				"remote_token", task.offlineToken)
 			task.finishFailed("artifact not landed within window: "+destPath,
 				string(driver.KindUpstream))
 			return
@@ -621,14 +648,125 @@ func (s *Transfer) watchOfflineArtifact(task *TransferTask, destPath string, exp
 			if s.Get(task.ID) == nil {
 				return
 			}
-			if size, ok := landed(); ok {
+			// 远端任务已明确失败(aria2 404 / 白名单拒收):产物永远不会出现,
+			// 立即收口,不留 2h 的 pending 和路径占用。
+			if failed, remoteErr := s.offlineRemoteFailed(ctx, task); failed {
+				s.log.Warnw("offline artifact remote task failed",
+					"id", task.ID, "dest", destPath, "remote_token", task.offlineToken)
+				task.finishFailed("remote offline task failed: "+remoteErr,
+					string(driver.KindUpstream))
+				return
+			}
+			ticks++
+			if size, ok := landed(destPath); ok {
 				s.log.Infow("offline artifact confirmed",
 					"id", task.ID, "dest", destPath, "size", size)
 				task.finishDone(size)
 				return
 			}
+			// 目录对账(改名兜底)按节拍做,比 Get 贵。
+			if ticks%reconcileEvery == 0 {
+				if size, obj, ok := s.reconcileOfflineArtifact(task, destPath, expect); ok {
+					s.confirmOfflineArtifact(task, obj, size)
+					return
+				}
+			}
 		}
 	}
+}
+
+// artifactClockSkew is the cross-host clock tolerance for landing confirmation.
+// mtime is written by the OpenList host while StartedAt comes from the PanRouter host;
+// both rely on NTP, so a small skew must not turn a landed artifact into a failure.
+const artifactClockSkew = 2 * time.Minute
+
+// freshEnough reports whether obj was produced by this task (mtime >= StartedAt-skew).
+// A stale same-name leftover from an earlier run must not count; an unparsable or
+// missing mtime counts as "not fresh" (fail closed).
+func freshEnough(obj *mangodrive.Obj, started time.Time) bool {
+	if obj == nil || strings.TrimSpace(obj.Modified) == "" {
+		return false
+	}
+	mt, err := time.Parse(time.RFC3339Nano, obj.Modified)
+	if err != nil {
+		mt, err = time.Parse(time.RFC3339, obj.Modified)
+	}
+	if err != nil {
+		return false
+	}
+	return !mt.Add(artifactClockSkew).Before(started)
+}
+
+// offlineRemoteFailed looks up the remote queued task behind the token.
+// It returns (true, reason) only when the remote side has definitively failed
+// (so the artifact will never appear). A failed lookup, cap/unavailability,
+// or an already-cleaned task is reported as "unknown" and left to the artifact
+// confirmation -- a monitoring hiccup must never fail a healthy task.
+func (s *Transfer) offlineRemoteFailed(ctx context.Context, task *TransferTask) (bool, string) {
+	task.mu.Lock()
+	token := task.offlineToken
+	task.mu.Unlock()
+	if token == "" {
+		return false, ""
+	}
+	rt, err := s.driveAPI().OfflineTaskByToken(ctx, token)
+	if err != nil || rt == nil {
+		return false, ""
+	}
+	if !rt.Failed() {
+		return false, ""
+	}
+	msg := strings.TrimSpace(rt.Error)
+	if msg == "" {
+		msg = "remote task state " + strconv.Itoa(rt.State)
+	}
+	return true, msg
+}
+
+// reconcileOfflineArtifact lists the destination directory and looks for the
+// artifact this task actually produced. The predicted name (URL tail) is not
+// authoritative: aria2 honors Content-Disposition and applies its own name
+// sanitizing. Matching on predicted path alone would fail an artifact that DID
+// land -- and would hold the write guard on a path nothing occupies.
+// Criteria: non-dir, non-empty, mtime not older than task start; and when expect
+// is known, size >= expect.
+func (s *Transfer) reconcileOfflineArtifact(task *TransferTask, destPath string, expect int64) (int64, *mangodrive.Obj, bool) {
+	dir := pathDir(destPath)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	objs, err := s.driveAPI().List(ctx, dir)
+	if err != nil {
+		s.log.Warnw("offline artifact reconcile list failed",
+			"id", task.ID, "dir", dir, "err", err)
+		return 0, nil, false
+	}
+	for i := range objs {
+		o := &objs[i]
+		if o.IsDir || o.Size <= 0 || !freshEnough(o, task.StartedAt) {
+			continue
+		}
+		if expect > 0 && o.Size < expect {
+			continue
+		}
+		return o.Size, o, true
+	}
+	return 0, nil, false
+}
+
+// confirmOfflineArtifact closes the task with the artifact found by reconciliation:
+// rewrite the snapshot to the real name/path first (the record must point at the
+// file that actually landed), then finish with its real size.
+func (s *Transfer) confirmOfflineArtifact(task *TransferTask, obj *mangodrive.Obj, size int64) {
+	if obj != nil && obj.Name != "" {
+		real := pathDir(task.DestPath) + "/" + obj.Name
+		task.mu.Lock()
+		task.FileName = obj.Name
+		task.DestPath = real
+		task.mu.Unlock()
+		s.log.Infow("offline artifact reconciled",
+			"id", task.ID, "dest", real, "size", size)
+	}
+	task.finishDone(size)
 }
 
 // chooseChannel 决定最终通道(约束与阈值语义见 §5.4):
@@ -686,7 +824,7 @@ func (s *Transfer) resolveSource(ctx context.Context, req TransferRequest) (*tra
 		ua = mangodrive.BrowserUA
 	}
 	if req.FID == FIDDirect {
-		return s.resolveDirectSource(ctx, req.SourceURL, ua)
+		return s.resolveDirectSource(ctx, req.SourceURL, ua, req.Name)
 	}
 	fid := req.FID
 	pan := ""
@@ -746,7 +884,7 @@ func (s *Transfer) resolveSource(ctx context.Context, req TransferRequest) (*tra
 // 探测同时拿到大小,给 chooseChannel 做 offline 上限预检。探测失败即拒绝,
 // 不放行「先受理再失败」的直链——offline 通道会把 URL 交给远端 aria2 拉取,
 // 本机探测是唯一能在提交前拦住私网直链的闸门。
-func (s *Transfer) resolveDirectSource(ctx context.Context, rawURL, ua string) (*transferSource, error) {
+func (s *Transfer) resolveDirectSource(ctx context.Context, rawURL, ua, name string) (*transferSource, error) {
 	u, err := url.Parse(rawURL)
 	if err != nil || u.Host == "" {
 		return nil, driver.NewErr(driver.KindUnsupported, "直链格式无效", nil)
@@ -758,7 +896,13 @@ func (s *Transfer) resolveDirectSource(ctx context.Context, rawURL, ua string) (
 	if perr != nil {
 		return nil, perr
 	}
-	name := cleanName(offlineLandedName(rawURL))
+	// 请求 name 可覆盖落盘名(v1.14 契约:三通道统一,仅 stream 生效;
+	// offline 通道远端 aria2 不可重命名,落盘名仍由 URL 末段/Content-Disposition 决定)。
+	// 注意 cleanName 对空串会回退 transfer_<时间戳>,所以先判空再清洗。
+	if strings.TrimSpace(name) == "" {
+		name = offlineLandedName(rawURL)
+	}
+	name = cleanName(name)
 	return &transferSource{
 		file: &ResolveFileResult{
 			Pan: "direct", FID: FIDDirect, FileName: name,
@@ -998,10 +1142,17 @@ func (s *Transfer) transferOffline(ctx context.Context, task *TransferTask, src 
 	}
 	// OpenList 离线端点异步建任务,成功时空响应体亦属正常;任务由远端队列接管。
 	// task.log 可能为 nil(直接构造 TransferTask 的调用方),日志只是附加观测,不能因此 panic。
-	if len(tasks) > 0 && task.log != nil {
-		task.log.Infow("offline task created", "id", task.ID, "remote", tasks[0].ID, "url", offlineURL)
+	// token 记进任务:确认器据此轮询远端终态,远端已失败则立即收口(不必等窗口超时)。
+	if len(tasks) > 0 {
+		task.mu.Lock()
+		task.offlineToken = tasks[0].ID
+		task.mu.Unlock()
+		if task.log != nil {
+			task.log.Infow("offline task created", "id", task.ID, "remote", tasks[0].ID, "url", offlineURL)
+		}
 	}
-	task.set(src.size)
+	// 进度不在这里预置:受理并不代表字节已落盘,预置会让 pending 显示满进度条
+	// (确认/超时收口时会用真实大小或 0 覆盖)。
 	return nil
 }
 

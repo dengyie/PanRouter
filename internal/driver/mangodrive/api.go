@@ -231,11 +231,65 @@ type OfflineTask struct {
 	ID       string `json:"id"`
 	Name     string `json:"name"`
 	State    int    `json:"state"`
+	Status   string `json:"status"`
 	Progress int    `json:"progress"`
 	Error    string `json:"error"`
 }
 
-// AddOffline 让 OpenList 侧(aria2)自己下载 URL 并落到 p。
+// 离线下载任务状态码(OpenList task 模型;与 /api/task/offline_download/done
+// 实测一致)。转存层据此判断「远端不可能再产出产物」,避免空等确认窗口。
+const (
+	OfflineTaskStatePending   = 0
+	OfflineTaskStateRunning   = 1
+	OfflineTaskStateSucceeded = 2 // "offline download completed, maybe transferring"
+	OfflineTaskStateCancelled = 3
+	OfflineTaskStateError     = 4 // 不再推进,产物不会出现
+)
+
+// Failed 报告远端任务是否已进入「不会再产出文件」的终态。
+// Error 单独判:上游可能先填 Error 再推进 state,只看其一都会漏。
+func (t OfflineTask) Failed() bool {
+	return t.Error != "" ||
+		t.State == OfflineTaskStateCancelled || t.State == OfflineTaskStateError
+}
+
+// Done 报告远端是否已把文件传完(完成态:产物应已可见,可与落池确认竞速)。
+func (t OfflineTask) Done() bool {
+	return t.State == OfflineTaskStateSucceeded && t.Error == ""
+}
+
+// OfflineTasks 读取远端离线下载队列(/api/task/offline_download/undone):尚未
+// 完成的 token 及其状态。入参 token 为空时取全部。OpenList 归属表随任务落库,
+// 重启后 undone 仍可回读,是「远端任务是否还活着」的唯一事实源。
+func (a *API) OfflineTasks(ctx context.Context, token string) ([]OfflineTask, error) {
+	var out []OfflineTask
+	if err := a.do(ctx, http.MethodGet, "/api/task/offline_download/undone", nil, &out); err != nil {
+		return nil, err
+	}
+	if token == "" {
+		return out, nil
+	}
+	for _, t := range out {
+		if t.ID == token {
+			return []OfflineTask{t}, nil
+		}
+	}
+	return nil, nil
+}
+
+// OfflineTaskByToken 查询单个离线任务当前状态;未找到返回 (nil, nil)
+// ——「查不到」不是错误(任务可能已被清理),调用方不应据此判失败。
+func (a *API) OfflineTaskByToken(ctx context.Context, token string) (*OfflineTask, error) {
+	tasks, err := a.OfflineTasks(ctx, token)
+	if err != nil || len(tasks) > 0 {
+		if err != nil {
+			return nil, err
+		}
+		return &tasks[0], nil
+	}
+	return nil, nil
+}
+
 // 仅适用于不需要额外请求头的直链;需要 UA/Cookie/Referer 的源走 Put 通道。
 func (a *API) AddOffline(ctx context.Context, p string, urls []string) ([]OfflineTask, error) {
 	var out struct {
