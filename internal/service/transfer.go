@@ -630,6 +630,9 @@ func (s *Transfer) watchOfflineArtifact(task *TransferTask, destPath string, exp
 		reconcileEvery = 4
 	}
 	ticks := 0
+	// remoteFailCheckEvery 远端失败查询节拍(3 tick):landing 检查保持每 tick,
+	// 失败检测容忍 ≤3×poll 延迟。
+	const remoteFailCheckEvery = 3
 	for {
 		select {
 		case <-ctx.Done():
@@ -649,15 +652,19 @@ func (s *Transfer) watchOfflineArtifact(task *TransferTask, destPath string, exp
 				return
 			}
 			// 远端任务已明确失败(aria2 404 / 白名单拒收):产物永远不会出现,
-			// 立即收口,不留 2h 的 pending 和路径占用。
-			if failed, remoteErr := s.offlineRemoteFailed(ctx, task); failed {
-				s.log.Warnw("offline artifact remote task failed",
-					"id", task.ID, "dest", destPath, "remote_token", task.offlineToken)
-				task.finishFailed("remote offline task failed: "+remoteErr,
-					string(driver.KindUpstream))
-				return
-			}
+			// 立即收口,不留 2h 的 pending 和路径占用。远端查询按 3 tick 节流
+			//(失败检测延迟 ≤3×poll,窗口以小时计,远不敏感):每 tick 全量拉
+			// undone 队列,对同目录多任务/长窗口是不必要的上游放大。
 			ticks++
+			if ticks%remoteFailCheckEvery == 0 {
+				if failed, remoteErr := s.offlineRemoteFailed(ctx, task); failed {
+					s.log.Warnw("offline artifact remote task failed",
+						"id", task.ID, "dest", destPath, "remote_token", task.offlineToken)
+					task.finishFailed("remote offline task failed: "+remoteErr,
+						string(driver.KindUpstream))
+					return
+				}
+			}
 			if size, ok := landed(destPath); ok {
 				s.log.Infow("offline artifact confirmed",
 					"id", task.ID, "dest", destPath, "size", size)
@@ -748,9 +755,49 @@ func (s *Transfer) reconcileOfflineArtifact(task *TransferTask, destPath string,
 		if expect > 0 && o.Size < expect {
 			continue
 		}
+		// 认领守卫:同目录并发转存(claimDest 只互斥同路径)下,目录里可能有
+		// 其他任务的产物——它同样非空/新鲜/够大。认领中的路径(写守卫)与
+		// 其他任务已记录的 destPath 都不是本任务的产物,跳过,防止误归因。
+		if s.destOwnedByOther(dir+"/"+o.Name, task, destPath) {
+			continue
+		}
 		return o.Size, o, true
 	}
 	return 0, nil, false
+}
+
+// destOwnedByOther reports whether p belongs to a different transfer task:
+// actively claimed by one (concurrent same-dir writes are legal, claimDest only
+// excludes the same path), or recorded as the final destPath of a finished task
+// whose artifact landed under its predicted name. The caller's own destPath is
+// never "other", so a same-path retry still reconciles its own leftover.
+func (s *Transfer) destOwnedByOther(p string, task *TransferTask, myDest string) bool {
+	s.mu.Lock()
+	if owner, ok := s.activeDest[p]; ok && owner != task.ID {
+		s.mu.Unlock()
+		return true
+	}
+	// tasks 遍历:DestPath 受各自 task.mu 保护,逐个短锁读;先在 s.mu 内收集
+	// 再出锁比较,避免锁序(s.mu → task.mu)反向导致死锁。
+	type rec struct {
+		dest string
+	}
+	owned := make([]string, 0, len(s.tasks))
+	for id, t := range s.tasks {
+		if id == task.ID {
+			continue
+		}
+		t.mu.Lock()
+		owned = append(owned, t.DestPath)
+		t.mu.Unlock()
+	}
+	s.mu.Unlock()
+	for _, d := range owned {
+		if d == p && p != myDest {
+			return true
+		}
+	}
+	return false
 }
 
 // confirmOfflineArtifact closes the task with the artifact found by reconciliation:

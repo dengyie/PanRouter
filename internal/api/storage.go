@@ -21,6 +21,11 @@ func (d *Deps) handleStorageInfo(w http.ResponseWriter, _ *http.Request) {
 	out["public_base"] = base
 	out["dest_dir"] = d.Transfer.DefaultDest()
 	out["max_bytes"] = storageMaxBytes(d.Cfg.Get().Transfer.MaxBytes)
+	// limit_qps 下发 mangodrive 驱动限速(取整,0=未配置):客户端文件夹批量
+	// 提链的并发度据此自适应(取 1/3 并留裕度),服务端调 QPS 客户端无需改版。
+	if lc := d.Cfg.Get().Drivers["mangodrive"]; lc.LimitQPS > 0 {
+		out["limit_qps"] = int(lc.LimitQPS)
+	}
 	writeJSON(w, http.StatusOK, out)
 }
 

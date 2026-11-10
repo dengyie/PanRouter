@@ -243,3 +243,63 @@ func TestOfflinePendingNotPruned(t *testing.T) {
 		t.Fatalf("pending 任务不应被剪枝, got %v", snap)
 	}
 }
+
+// 同目录并发转存的误归因回归(评审 P2):A 的产物被改名(预测路径 miss,靠对账),
+// B 的产物先以预测名落盘并被记录为 B 的 destPath。对账列表里 B 的文件排在 A 的
+// 改名产物之前——守卫必须跳过「其他任务已记录的 destPath」,让 A 归因自己的产物。
+// 注:fixture 的 list 恒返回 [b-src.bin, a-renamed.bin],B 先提交先对账(b-src 命中
+// 自身认领 = 自归因放行),A 后提交(自身预测路径 miss,第一个候选 b-src 被守卫跳过)。
+func TestOfflineReconcileSkipsOtherTasksArtifacts(t *testing.T) {
+	s := newOfflineStack(t)
+	s.getMiss = true // 预测路径永远 miss:两个任务都只能靠目录对账
+	atomic.StoreInt64(&s.size, 300)
+	// 双文件列表:b-src 排前(无守卫时 A 会误取),a-renamed 排后
+	base := s.ol.URL
+	s.ol.Close()
+	s.ol = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/api/fs/mkdir":
+			_, _ = w.Write([]byte(`{"code":200,"message":"success"}`))
+		case r.URL.Path == "/api/fs/add_offline_download":
+			_, _ = w.Write([]byte(`{"code":200,"message":"success","data":{"tasks":[{"id":"rmt-1","state":1}]}}`))
+		case r.Method == http.MethodPut && r.URL.Path == "/api/fs/put":
+			_, _ = io.Copy(io.Discard, r.Body)
+			_, _ = w.Write([]byte(`{"code":200,"message":"success"}`))
+		case r.URL.Path == "/api/fs/get":
+			_, _ = w.Write([]byte(`{"code":200,"message":"success","data":{"size":0,"is_dir":false}}`))
+		case r.URL.Path == "/api/fs/list":
+			atomic.AddInt64(&s.lists, 1)
+			_, _ = w.Write([]byte(`{"code":200,"message":"success","data":{"content":[{"name":"b-src.bin","size":300,"is_dir":false,"modified":"` + s.getMtime() + `"},{"name":"a-renamed.bin","size":300,"is_dir":false,"modified":"` + s.getMtime() + `"}],"total":2}}`))
+		case r.URL.Path == "/api/task/offline_download/undone":
+			_, _ = w.Write([]byte(`{"code":200,"message":"success","data":` + s.undone + `}`))
+		default:
+			t.Errorf("unexpected openlist call: %s %s", r.Method, r.URL.Path)
+		}
+	}))
+	_ = base
+	tr, _ := newTransferFixtureMut(t, s.up.URL, s.ol.URL, func(c *config.Config) {
+		c.Transfer.DirectAllowPrivate = true
+		c.Transfer.OfflineConfirmAfter = 600 * time.Millisecond
+		c.Transfer.OfflineConfirmPoll = 30 * time.Millisecond
+	})
+
+	// B:源 URL 末段 b-src.bin → 预测 destPath=/Pool/b-src.bin,对账即命中自身认领
+	idB, _ := s.submitOffline(t, tr)
+	waitDone(t, tr, idB)
+	snapB := tr.Get(idB)
+	if snapB.State != "done" || !strings.HasSuffix(snapB.DestPath, "b-src.bin") {
+		t.Fatalf("B 应 done 且指向自身产物, got %s %s err=%s", snapB.State, snapB.DestPath, snapB.Error)
+	}
+
+	// A:源 URL 末段 a-src.bin → 预测 destPath=/Pool/a-src.bin(list 里没有)
+	// 对账候选顺序 [b-src, a-renamed]:守卫跳过 b-src(B 的 destPath),归因 a-renamed
+	idA, _ := s.submitOffline(t, tr)
+	waitDone(t, tr, idA)
+	snapA := tr.Get(idA)
+	if snapA.State != "done" || snapA.Size != 300 {
+		t.Fatalf("A 应 done/300, got %s/%d err=%s", snapA.State, snapA.Size, snapA.Error)
+	}
+	if !strings.HasSuffix(snapA.DestPath, "a-renamed.bin") {
+		t.Fatalf("A 必须归因自己的改名产物, got dest=%s (守卫失效会指向 B 的 b-src.bin)", snapA.DestPath)
+	}
+}
