@@ -298,29 +298,33 @@ class MangoCloudViewModel(
      * 递归列出文件夹内全部文件：三元组 (相对路径, fid, 所在目录)。
      * 目录必须显式携带：fid 是长路径时服务端会哈希化（"p:<sha1>"，不可逆），
      * 提链时 parentDirOf 推不出父目录——列目录时就知道的 dirPath 是唯一可靠定位。
+     * 返回值 = 因超出层级上限（8 层）未下探的子目录数（静默丢文件 → 明示给用户）。
      */
     private suspend fun collectFiles(
         dirPath: String,
         prefix: String,
         out: MutableList<MangoCollectItem>,
         depth: Int
-    ) {
-        if (depth > 8) return
+    ): Int {
+        if (depth > 8) return 1
+        var skipped = 0
         for (item in listFiles(dirPath)) {
             val rel = if (prefix.isEmpty()) item.fname else "$prefix/${item.fname}"
             if (item.isdir) {
-                collectFiles(childPath(dirPath, item.fname), rel, out, depth + 1)
+                skipped += collectFiles(childPath(dirPath, item.fname), rel, out, depth + 1)
             } else {
                 out.add(MangoCollectItem(rel, item.fid, dirPath))
             }
         }
+        return skipped
     }
 
     private suspend fun enqueueEach(
         tasks: List<MangoCollectItem>,
         saveDir: String
-    ): Int {
+    ): Pair<Int, List<String>> {
         var ok = 0
+        val failed = mutableListOf<String>()
         tasks.forEachIndexed { index, task ->
             if (downloadCancelRequested) return@forEachIndexed
             folderProgress = "正在加入下载 ${index + 1}/${tasks.size}"
@@ -338,9 +342,21 @@ class MangoCloudViewModel(
                     saveDir = saveDir
                 )
                 ok++
-            }
+            }.onFailure { if (!downloadCancelRequested) failed.add(task.rel) }
         }
-        return ok
+        return ok to failed
+    }
+
+    /** 汇总入队结果消息：成功数 + 截断提示 + 失败明细（最多展示 3 个）。 */
+    private fun enqueueResultMessage(ok: Int, failed: List<String>, skipped: Int): String {
+        val sb = StringBuilder("已加入 $ok 个下载任务")
+        if (skipped > 0) sb.append("；$skipped 个子目录超 8 层上限未收集")
+        if (failed.isNotEmpty()) {
+            sb.append("；失败 ${failed.size} 个：")
+            sb.append(failed.take(3).joinToString("、"))
+            if (failed.size > 3) sb.append(" 等")
+        }
+        return sb.toString()
     }
 
     fun downloadFolder(saveDir: String = "") {
@@ -352,17 +368,17 @@ class MangoCloudViewModel(
             downloadCancelRequested = false
             try {
                 val tasks = mutableListOf<MangoCollectItem>()
-                collectFiles(childPath(currentPath(), folder.fname), folder.fname, tasks, 0)
+                val skipped = collectFiles(childPath(currentPath(), folder.fname), folder.fname, tasks, 0)
                 if (tasks.isEmpty()) {
-                    cloudMessage = "文件夹为空"
+                    cloudMessage = if (skipped > 0) "文件夹内容超出 8 层上限，未收集到文件" else "文件夹为空"
                     actionFile = null
                     return@launch
                 }
-                val ok = enqueueEach(tasks, saveDir)
+                val (ok, failed) = enqueueEach(tasks, saveDir)
                 if (downloadCancelRequested) {
                     cloudMessage = "已中断下载"
                 } else {
-                    cloudMessage = "已加入 $ok 个下载任务"
+                    cloudMessage = enqueueResultMessage(ok, failed, skipped)
                 }
             } catch (e: Exception) {
                 cloudMessage = e.message ?: "下载文件夹失败"
@@ -385,23 +401,24 @@ class MangoCloudViewModel(
             downloadCancelRequested = false
             try {
                 val tasks = mutableListOf<MangoCollectItem>()
+                var skipped = 0
                 for (file in files) {
                     if (file.isdir) {
-                        collectFiles(childPath(base, file.fname), file.fname, tasks, 0)
+                        skipped += collectFiles(childPath(base, file.fname), file.fname, tasks, 0)
                     } else {
                         tasks.add(MangoCollectItem(file.fname, file.fid, base))
                     }
                 }
                 if (tasks.isEmpty()) {
-                    cloudMessage = "所选文件夹为空"
+                    cloudMessage = if (skipped > 0) "所选内容超出 8 层上限，未收集到文件" else "所选文件夹为空"
                     exitMultiSelect()
                     return@launch
                 }
-                val ok = enqueueEach(tasks, saveDir)
+                val (ok, failed) = enqueueEach(tasks, saveDir)
                 if (downloadCancelRequested) {
                     cloudMessage = "已中断批量下载"
                 } else {
-                    cloudMessage = "已加入 $ok 个下载任务"
+                    cloudMessage = enqueueResultMessage(ok, failed, skipped)
                 }
                 exitMultiSelect()
             } catch (e: Exception) {
