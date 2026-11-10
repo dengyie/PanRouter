@@ -87,7 +87,8 @@ class MangoDriveEndToEndTest {
         assertEquals("服务端返回的文件大小应与夹具一致", fixtureSize, item.size)
 
         // 2) 取单文件直链：url 必须是父目录、fid 定位文件（服务端契约）
-        val link = client.link(client.parentDirOf(item.fid), item.fid).getOrThrow()
+        // v1.23 契约:提链一律显式携带真实所在目录(fixture 目录已知),不再按 fid 形态推父目录
+        val link = client.link(dir, item.fid).getOrThrow()
         assertEquals("直链返回大小应与夹具一致", fixtureSize, link.size)
         assertTrue("应拿到 OpenList 签名直链 direct_url", !link.directUrl.isNullOrBlank())
         assertTrue("direct_url 必须带 UA（否则被 Cloudflare 拦）", link.needHeaders && link.ua.isNotBlank())
@@ -202,7 +203,7 @@ class MangoDriveEndToEndTest {
 }
 
 /** 仅测试用的内存 DAO（不碰真实数据库；独立实现，避免与 DownloadManagerDirectIntegrationTest 的私有 DAO 重名） */
-private class MangoE2eTaskDao : DownloadTaskDao {
+internal class MangoE2eTaskDao : DownloadTaskDao {
     private val state = MutableStateFlow<List<DownloadTaskEntity>>(emptyList())
     private val nextId = AtomicLong(1L)
 

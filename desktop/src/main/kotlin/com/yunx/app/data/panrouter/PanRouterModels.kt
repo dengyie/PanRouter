@@ -113,7 +113,9 @@ data class StorageInfo(
     /** 服务端默认落盘目录；空 = 端点根目录 */
     val destDir: String,
     /** 单文件转存上限（字节）；0 = 服务端不限 */
-    val maxBytes: Long
+    val maxBytes: Long,
+    /** mangodrive 驱动解析限速（QPS）；0/缺失 = 服务端未下发（旧版服务端），客户端用保守默认 */
+    val limitQps: Int
 ) {
     /** 是否可用于拼解析链接（enabled 且有基址） */
     val usable: Boolean get() = enabled && publicBase.isNotBlank()
@@ -132,7 +134,8 @@ internal fun parseStorageInfo(body: JSONObject): StorageInfo {
         enabled = body.optBoolean("enabled", false),
         publicBase = base,
         destDir = (body.optString("dest_dir").takeIf { it.startsWith("/") } ?: "").trimEnd('/'),
-        maxBytes = body.optLong("max_bytes", 0L)
+        maxBytes = body.optLong("max_bytes", 0L),
+        limitQps = body.optInt("limit_qps", 0)
     )
 }
 

@@ -48,6 +48,15 @@ class MangoDriveClient(
         routerClient.storageInfo().getOrNull()?.destDir.orEmpty()
 
     /**
+     * 文件夹批量提链的建议并发度：服务端解析限速（limit_qps）的 1/3，钳制 [1,6]，
+     * 留 2/3 裕度给浏览/转存等其他流量。服务端未下发（旧版本/不可达）时用保守默认 3。
+     */
+    suspend fun resolveConcurrency(): Int {
+        val qps = routerClient.storageInfo().getOrNull()?.limitQps ?: 0
+        return if (qps <= 0) DEFAULT_RESOLVE_CONCURRENCY else (qps / 3).coerceIn(1, 6)
+    }
+
+    /**
      * 端点基址：本地显式覆盖优先，否则向服务端要（`GET /api/v1/storage`），成功后缓存。
      *
      * 桌面端不内置任何部署域名 —— 换一套 OpenList 端点只需改服务端 `transfer` 配置，
@@ -70,13 +79,6 @@ class MangoDriveClient(
         return Result.success(info.publicBase)
     }
 
-    /** 从 fid（存储路径）推导父目录：fid 非路径形态（长路径哈希）时无解，返回 "/" 由服务端兜底 */
-    fun parentDirOf(fid: String): String {
-        if (!fid.startsWith("/")) return "/"
-        val idx = fid.lastIndexOf('/')
-        return if (idx <= 0) "/" else fid.substring(0, idx)
-    }
-
     /**
      * fid 是否为哈希形态（服务端对超长路径生成 "p:<sha1>"，不可逆）。
      * 契约辅助方法（与服务端 `mangodrive.FidHashPrefix` 门控对应）：
@@ -86,6 +88,9 @@ class MangoDriveClient(
     fun isHashFid(fid: String): Boolean = !fid.startsWith("/")
 
     companion object {
+        /** 服务端未下发 limit_qps 时的保守并发默认（限速 10 QPS 部署的实测安全值） */
+        const val DEFAULT_RESOLVE_CONCURRENCY = 3
+
         /** 逐段 URL 编码：保留 "/" 分隔，其余按 RFC 3986（空格 → %20）；空/根/带尾斜杠都归一为根或去尾 */
         internal fun encodePath(path: String): String {
             val p = path.trim().trimEnd('/')

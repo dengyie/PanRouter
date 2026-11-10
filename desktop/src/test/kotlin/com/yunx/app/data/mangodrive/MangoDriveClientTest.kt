@@ -159,14 +159,6 @@ class MangoDriveClientTest {
     }
 
     @Test
-    fun `parentDirOf derives parent and tolerates hashed fid`() {
-        val c = client()
-        assertEquals("/dir", c.parentDirOf("/dir/a.mkv"))
-        assertEquals("/", c.parentDirOf("/a.mkv"))
-        assertEquals("/", c.parentDirOf("p:deadbeef"))
-    }
-
-    @Test
     fun `encodePath keeps root and separators`() {
         assertEquals("/", MangoDriveClient.encodePath(""))
         assertEquals("/", MangoDriveClient.encodePath("/"))

@@ -14,6 +14,7 @@ import com.yunx.app.data.mangodrive.MangoDriveClient
 import com.yunx.app.data.network.model.DownloadLink
 import com.yunx.app.data.network.model.ShareFile
 import com.yunx.app.data.panrouter.RemoteLinkResult
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -144,6 +145,8 @@ class MangoCloudViewModel(
                     pathNames = current.pathNames,
                     dirPath = current.dirPath
                 )
+            } catch (ce: CancellationException) {
+                throw ce
             } catch (e: Exception) {
                 cloudMessage = e.message ?: "刷新失败"
             } finally {
@@ -160,6 +163,8 @@ class MangoCloudViewModel(
         viewModelScope.launch {
             _uiState.value = try {
                 MangoCloudUiState.Loaded(listFiles(path), pathNames, path)
+            } catch (ce: CancellationException) {
+                throw ce
             } catch (e: Exception) {
                 MangoCloudUiState.Error(e.message ?: "加载失败")
             }
@@ -257,6 +262,8 @@ class MangoCloudViewModel(
                     downloadUrl = url,
                     size = if (link.size > 0) link.size else file.fsize
                 )
+            } catch (ce: CancellationException) {
+                throw ce
             } catch (e: Exception) {
                 cloudMessage = e.message ?: "获取直链失败"
             } finally {
@@ -285,6 +292,8 @@ class MangoCloudViewModel(
                 cloudMessage = "已加入下载：${pd.fileName}"
                 actionFile = null
                 downloadTriggered++
+            } catch (ce: CancellationException) {
+                throw ce
             } catch (e: Exception) {
                 cloudMessage = e.message ?: "下载失败"
             } finally {
@@ -331,14 +340,15 @@ class MangoCloudViewModel(
      * 大文件夹要等 N×单次延迟才入完队；并发后总耗时 ≈ N/3。任务落库顺序允许交错
      * （下载列表按文件夹分组展示，组内顺序无业务语义）。
      */
-    private suspend fun enqueueEach(
+    internal suspend fun enqueueEach(
         tasks: List<MangoCollectItem>,
-        saveDir: String
+        saveDir: String,
+        concurrency: Int = MangoDriveClient.DEFAULT_RESOLVE_CONCURRENCY
     ): Pair<Int, List<String>> {
         val ok = AtomicInteger(0)
         val processed = AtomicInteger(0)
         val failed = ConcurrentLinkedQueue<String>()
-        val gate = Semaphore(ENQUEUE_CONCURRENCY)
+        val gate = Semaphore(concurrency.coerceIn(1, 16))
         coroutineScope {
             for (task in tasks) {
                 if (downloadCancelRequested) break
@@ -370,7 +380,7 @@ class MangoCloudViewModel(
     }
 
     /** 汇总入队结果消息：成功数 + 截断提示 + 失败明细（最多展示 3 个）。 */
-    private fun enqueueResultMessage(ok: Int, failed: List<String>, skipped: Int): String {
+    internal fun enqueueResultMessage(ok: Int, failed: List<String>, skipped: Int): String {
         val sb = StringBuilder("已加入 $ok 个下载任务")
         if (skipped > 0) sb.append("；$skipped 个子目录超 8 层上限未收集")
         if (failed.isNotEmpty()) {
@@ -396,12 +406,14 @@ class MangoCloudViewModel(
                     actionFile = null
                     return@launch
                 }
-                val (ok, failed) = enqueueEach(tasks, saveDir)
+                val (ok, failed) = enqueueEach(tasks, saveDir, client.resolveConcurrency())
                 if (downloadCancelRequested) {
                     cloudMessage = "已中断下载"
                 } else {
                     cloudMessage = enqueueResultMessage(ok, failed, skipped)
                 }
+            } catch (ce: CancellationException) {
+                throw ce
             } catch (e: Exception) {
                 cloudMessage = e.message ?: "下载文件夹失败"
             } finally {
@@ -436,13 +448,15 @@ class MangoCloudViewModel(
                     exitMultiSelect()
                     return@launch
                 }
-                val (ok, failed) = enqueueEach(tasks, saveDir)
+                val (ok, failed) = enqueueEach(tasks, saveDir, client.resolveConcurrency())
                 if (downloadCancelRequested) {
                     cloudMessage = "已中断批量下载"
                 } else {
                     cloudMessage = enqueueResultMessage(ok, failed, skipped)
                 }
                 exitMultiSelect()
+            } catch (ce: CancellationException) {
+                throw ce
             } catch (e: Exception) {
                 cloudMessage = e.message ?: "批量下载失败"
             } finally {
@@ -463,9 +477,6 @@ class MangoCloudViewModel(
     }
 
     companion object {
-        /** 递归收集入队的并发度：服务端解析限速 10 QPS，3 并发远低限速且提链延迟 ≈ 1/3 */
-        private const val ENQUEUE_CONCURRENCY = 3
-
         /** 子目录路径：父路径 + "/" + 名（根 "/" 不产生 "//"） */
         internal fun childPath(parent: String, name: String): String {
             val p = parent.trim().trimEnd('/')

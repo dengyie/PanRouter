@@ -100,7 +100,7 @@ class MangoTransferEndToEndTest {
             ?: error("目标目录里找不到转存结果：$destName")
         assertEquals(size, item.size)
 
-        val link = drive.link(drive.parentDirOf(item.fid), item.fid).getOrThrow()
+        val link = drive.link(destDir, item.fid).getOrThrow()
         val url = link.directUrl?.takeIf { it.isNotBlank() } ?: link.effectiveUrl()
         val req = Request.Builder().url(url).get()
         if (link.needHeaders) {
