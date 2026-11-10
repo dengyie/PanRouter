@@ -33,6 +33,13 @@ sealed interface MangoCloudUiState {
     data class Error(val message: String) : MangoCloudUiState
 }
 
+/** 递归收集的待下载项：rel = 相对路径（落盘保持目录结构），fid + dir = 服务端提链定位 */
+internal data class MangoCollectItem(
+    val rel: String,
+    val fid: String,
+    val dir: String
+)
+
 /**
  * Mango Drive 私有聚合云盘浏览 ViewModel（镜像蓝奏云个人盘浏览）。
  *
@@ -287,11 +294,15 @@ class MangoCloudViewModel(
         pendingSaveDir = ""
     }
 
-    /** 递归列出文件夹内全部文件：[相对前缀文件名] → 绝对 fid（只认 fid，路径由服务端解析） */
+    /**
+     * 递归列出文件夹内全部文件：三元组 (相对路径, fid, 所在目录)。
+     * 目录必须显式携带：fid 是长路径时服务端会哈希化（"p:<sha1>"，不可逆），
+     * 提链时 parentDirOf 推不出父目录——列目录时就知道的 dirPath 是唯一可靠定位。
+     */
     private suspend fun collectFiles(
         dirPath: String,
         prefix: String,
-        out: MutableList<Pair<String, String>>,
+        out: MutableList<MangoCollectItem>,
         depth: Int
     ) {
         if (depth > 8) return
@@ -300,24 +311,27 @@ class MangoCloudViewModel(
             if (item.isdir) {
                 collectFiles(childPath(dirPath, item.fname), rel, out, depth + 1)
             } else {
-                out.add(rel to item.fid)
+                out.add(MangoCollectItem(rel, item.fid, dirPath))
             }
         }
     }
 
     private suspend fun enqueueEach(
-        tasks: List<Pair<String, String>>,
+        tasks: List<MangoCollectItem>,
         saveDir: String
     ): Int {
         var ok = 0
-        tasks.forEachIndexed { index, (rel, fid) ->
+        tasks.forEachIndexed { index, task ->
             if (downloadCancelRequested) return@forEachIndexed
             folderProgress = "正在加入下载 ${index + 1}/${tasks.size}"
             runCatching {
-                val link = client.link(client.parentDirOf(fid), fid).getOrThrow()
+                // 哈希 fid（"p:" 前缀）推不出父目录，交给服务端按历史缓存反查；
+                // 路径形态 fid 直接用所在目录，零回查。
+                val dir = if (client.isHashFid(task.fid)) "/" else task.dir
+                val link = client.link(dir, task.fid).getOrThrow()
                 downloadManager.enqueue(
                     url = downloadUrlOf(link),
-                    fileName = rel,
+                    fileName = task.rel,
                     size = if (link.size > 0) link.size else -1L,
                     platform = DownloadPlatform.MANGO,
                     headers = downloadHeadersOf(link),
@@ -337,7 +351,7 @@ class MangoCloudViewModel(
             folderProgress = "正在收集文件…"
             downloadCancelRequested = false
             try {
-                val tasks = mutableListOf<Pair<String, String>>()
+                val tasks = mutableListOf<MangoCollectItem>()
                 collectFiles(childPath(currentPath(), folder.fname), folder.fname, tasks, 0)
                 if (tasks.isEmpty()) {
                     cloudMessage = "文件夹为空"
@@ -370,12 +384,12 @@ class MangoCloudViewModel(
             folderProgress = "正在收集文件…"
             downloadCancelRequested = false
             try {
-                val tasks = mutableListOf<Pair<String, String>>()
+                val tasks = mutableListOf<MangoCollectItem>()
                 for (file in files) {
                     if (file.isdir) {
                         collectFiles(childPath(base, file.fname), file.fname, tasks, 0)
                     } else {
-                        tasks.add(file.fname to file.fid)
+                        tasks.add(MangoCollectItem(file.fname, file.fid, base))
                     }
                 }
                 if (tasks.isEmpty()) {

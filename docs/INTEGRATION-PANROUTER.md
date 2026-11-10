@@ -1,6 +1,6 @@
 # YunX-Desktop × PanRouter 深度整合开发规格
 
-> 状态：v1.16（2026-11-10，直链跨域 302 链生产实测 + h2 tar-pit 根因修复，服务端 `f67a87a`）
+> 状态：v1.17（2026-11-10，云盘长路径哈希 fid 提链 404 根因修复——服务端历史缓存反查 `bc639b8` + 桌面端显式携带目录）
 > 本文是「云析桌面版二次开发 + PanRouter 深度整合」的工程规格（Engineering Spec）。
 > 生产运维与拓扑以 Obsidian《PanRouter 部署与运维》为准；PanRouter 服务端契约以仓内
 > `panrouter/docs/development.md` v2.1 为准。三份文档冲突时以各自领域的最新 canonical 为准并回写对齐。
@@ -225,7 +225,7 @@ desktop/src/main/kotlin/com/yunx/app/
 - **快照幂等**：`done` 原子计数，二次快照（handler 内 Get→Snapshot）不回零；成功终态 `Done=Size=实际字节`。
 - **转存上限**：单文件 `transfer.max_bytes`（0=默认 64GiB，负=不限）。offline 在提交远端前按源大小硬校验：超限拒绝（`Unsupported`，error 含上限字节数），**大小未知时显式 offline 亦拒绝**（远端无法回滚；auto 改走 stream 由实收字节兜底）；stream 既预检 `Content-Length` 也在**每条下载途中按实收字节截断**（chunked/无长度源无法绕过）。`GET /api/v1/storage` 对不限（负值）回报 `max_bytes=0`，桌面端按 `0 = 不限` 展示（v1.11 记为「展示口径差异」者即此，v1.12 定为契约）。
 - **任务可观测**：任务内存态保留 `keep_tasks`(200)/`keep_task_after`(24h)；浏览器断开不中断已受理任务（独立 ctx）。
-- **解析/浏览链**：`mangodrive` driver 把存储路径当分享（FID 即路径，≤100 字符直用、超长 `p:<sha1>`）；浏览 = 目录 URL + fid 定位文件（`url` 给目录、`fid` 给文件，直接给文件路径会 404——桌面端 `MangoDriveClient.link(dirPath, fid)` 契约）；目录分享批量转存由桌面端逐文件提交（可观测、可重试）。
+- **解析/浏览链**：`mangodrive` driver 把存储路径当分享（FID 即路径，≤100 字符直用、超长 `p:<sha1>`）；浏览 = 目录 URL + fid 定位文件（`url` 给目录、`fid` 给文件，直接给文件路径会 404——桌面端 `MangoDriveClient.link(dirPath, fid)` 契约）；目录分享批量转存由桌面端逐文件提交（可观测、可重试）。**哈希 fid 提链契约（v1.17）**：`p:` 前缀 fid 不可逆，客户端推不出父目录——桌面端递归收集时**显式携带所在目录**（`MangoCollectItem(rel, fid, dir)`；路径形态 fid 用 `dir` 提链，哈希 fid 交服务端按 links 表历史缓存行 `Ext["path"]` 反查恢复，`MangoDriveClient.isHashFid` 判定）；服务端对应修复见变更记录（`buildRef`/`fileMeta` 历史反查，生产实测裸哈希 fid 从 404 → 全链恢复）。
 - **桌面直连下载**：`DownloadPlatform.MANGO` 取 `direct_url`（OpenList 签名直链，只签路径 host 可换，支持 Range 206）走本地 ChunkDownloader，**不经 /stream 中转降档**；必须携带返回的 UA。
 - **红线延伸**：桌面端零部署信息（域名/容量/目录全部服务端下发）；OpenList token 只在服务端（加密），桌面端只持 api_token。
 
@@ -345,6 +345,7 @@ pxed 上行有限且多设备共享：stream 路径线程数 = `min(用户设置
 
 ---
 
+- **v1.17（2026-11-10）**：**云盘长路径哈希 fid 提链 404 根因修复（服务端 `bc639b8` + 桌面端携带目录）**。用户报告「云盘没法看文件夹层次、想按文件夹下载」——浏览 UI 与 folder-download 代码路径本就齐全，真缺陷是 mangodrive 对超 100 字节存储路径生成不可逆哈希 fid（`p:<sha1>`，中文路径 ≈33 字即触发），`parentDirOf` 推不出父目录 → 客户端以根目录 url + 裸 fid 提链 → 服务端 driver 把哈希当路径去 OpenList Get → 404，**深层目录内容全部不可下载**。双层修复：① 服务端 `FindLinkByFID`（跨 share_key 取最近历史缓存行）+ `buildRef`/`fileMeta` 历史反查恢复 `Ext["path"]`/元数据（先列过目录就有恢复源）；② 桌面端递归收集显式携带目录 `MangoCollectItem(rel, fid, dir)`，路径形态 fid 零回查、哈希 fid 走服务端恢复（`isHashFid` 判定）。测试：服务端回归 2 例（历史反查成功/无历史正确失败），合并远端 2 个 transfer 修复提交后 `go test ./...` 全量绿；桌面端 `:desktop:test` **191/191** 绿。线上验证（CI 编译产物 bc639b8 部署后）：修复前 404 的 `{"url":"https://drive.example.com/","fid":"p:a5d8…"}` 裸哈希提链成功返回直链。
 - **v1.16（2026-11-10）**：**直链跨域 302 链生产实测 + h2 tar-pit 根因修复（服务端 `f67a87a`，桌面端零改动）**。迭代轮矩阵：GitHub release 资产 auto→offline done（aria2 跨域跟随，size 精确）；stream 首测必败——`http2: timeout awaiting response headers`（GitHub 对数据中心 IP 的 h2 下载型 GET tar-pit，探测 HEAD 正常）。修复：直链客户端强制 HTTP/1.1（`httpx.ForceHTTP1`，任意公网源更稳，单流大文件无 h2 收益）+ 拉流瞬态错误重试一次（尚未写字节，无副作用）。复测：stream done size=done 字节精确 + **宿主 sha256 MATCH**（`60a420ad…`）。同轮验证：坏域名/错误源干净失败、并发不同文件互不误伤、确认器释放正常、CI `-race -shuffle` 全绿。
 ## 变更记录
 

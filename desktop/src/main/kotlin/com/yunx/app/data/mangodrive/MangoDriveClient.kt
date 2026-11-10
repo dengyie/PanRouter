@@ -77,6 +77,13 @@ class MangoDriveClient(
         return if (idx <= 0) "/" else fid.substring(0, idx)
     }
 
+    /**
+     * fid 是否为哈希形态（服务端对超长路径生成 "p:<sha1>"，不可逆）：
+     * 哈希 fid 推不出父目录，提链时直接用列目录时的真实 dirPath，
+     * 服务端再以历史缓存反查兜底（resolver buildRef）。
+     */
+    fun isHashFid(fid: String): Boolean = !fid.startsWith("/")
+
     companion object {
         /** 逐段 URL 编码：保留 "/" 分隔，其余按 RFC 3986（空格 → %20）；空/根/带尾斜杠都归一为根或去尾 */
         internal fun encodePath(path: String): String {
