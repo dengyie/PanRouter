@@ -824,7 +824,7 @@ func (s *Transfer) resolveSource(ctx context.Context, req TransferRequest) (*tra
 		ua = mangodrive.BrowserUA
 	}
 	if req.FID == FIDDirect {
-		return s.resolveDirectSource(ctx, req.SourceURL, ua)
+		return s.resolveDirectSource(ctx, req.SourceURL, ua, req.Name)
 	}
 	fid := req.FID
 	pan := ""
@@ -884,7 +884,7 @@ func (s *Transfer) resolveSource(ctx context.Context, req TransferRequest) (*tra
 // 探测同时拿到大小,给 chooseChannel 做 offline 上限预检。探测失败即拒绝,
 // 不放行「先受理再失败」的直链——offline 通道会把 URL 交给远端 aria2 拉取,
 // 本机探测是唯一能在提交前拦住私网直链的闸门。
-func (s *Transfer) resolveDirectSource(ctx context.Context, rawURL, ua string) (*transferSource, error) {
+func (s *Transfer) resolveDirectSource(ctx context.Context, rawURL, ua, name string) (*transferSource, error) {
 	u, err := url.Parse(rawURL)
 	if err != nil || u.Host == "" {
 		return nil, driver.NewErr(driver.KindUnsupported, "直链格式无效", nil)
@@ -896,7 +896,13 @@ func (s *Transfer) resolveDirectSource(ctx context.Context, rawURL, ua string) (
 	if perr != nil {
 		return nil, perr
 	}
-	name := cleanName(offlineLandedName(rawURL))
+	// 请求 name 可覆盖落盘名(v1.14 契约:三通道统一,仅 stream 生效;
+	// offline 通道远端 aria2 不可重命名,落盘名仍由 URL 末段/Content-Disposition 决定)。
+	// 注意 cleanName 对空串会回退 transfer_<时间戳>,所以先判空再清洗。
+	if strings.TrimSpace(name) == "" {
+		name = offlineLandedName(rawURL)
+	}
+	name = cleanName(name)
 	return &transferSource{
 		file: &ResolveFileResult{
 			Pan: "direct", FID: FIDDirect, FileName: name,
