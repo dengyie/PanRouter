@@ -188,4 +188,19 @@ class MangoDriveClientTest {
         val streamOnly = direct.copy(route = "stream", directUrl = null)
         assertEquals("https://pan.example.com/stream/x", com.yunx.app.ui.viewmodel.MangoCloudViewModel.downloadUrlOf(streamOnly))
     }
+
+    /**
+     * isHashFid 契约："/" 开头 = 路径形态（可推父目录，零回查提链）；
+     * 其余（"p:<sha1>" 哈希 / 空串）= 哈希形态，交服务端历史缓存反查。
+     * 回归锚点：enqueueEach 按它选择提链目录（hash→"/"，path→真实所在目录）。
+     */
+    @Test
+    fun `isHashFid distinguishes path-form and hash-form fids`() {
+        val client = client()
+        assertEquals(false, client.isHashFid("/Pool-Secure/浅层路径.bin"))
+        assertEquals(false, client.isHashFid("/"))
+        assertEquals(true, client.isHashFid("p:516a5cf51d429a145632dfb29cfeb35f28e92ac0"))
+        // 空串不是路径形态：按哈希处理走服务端反查，服务端会干净报错而不是把空串当路径
+        assertEquals(true, client.isHashFid(""))
+    }
 }

@@ -14,10 +14,15 @@ import com.yunx.app.data.mangodrive.MangoDriveClient
 import com.yunx.app.data.network.model.DownloadLink
 import com.yunx.app.data.network.model.ShareFile
 import com.yunx.app.data.panrouter.RemoteLinkResult
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withPermit
+import java.util.concurrent.ConcurrentLinkedQueue
+import java.util.concurrent.atomic.AtomicInteger
 import kotlin.reflect.KClass
 
 /** Mango Drive 浏览 UI 状态（根目录 dirPath = "/"）。 */
@@ -319,32 +324,47 @@ class MangoCloudViewModel(
         return skipped
     }
 
+    /**
+     * 入队一批收集项：小并发（3）提链 + 入队。
+     * 提链是服务端 QPS 限速下的逐文件 HTTP 解析（限速 10，3 并发安全）——串行时
+     * 大文件夹要等 N×单次延迟才入完队；并发后总耗时 ≈ N/3。任务落库顺序允许交错
+     * （下载列表按文件夹分组展示，组内顺序无业务语义）。
+     */
     private suspend fun enqueueEach(
         tasks: List<MangoCollectItem>,
         saveDir: String
     ): Pair<Int, List<String>> {
-        var ok = 0
-        val failed = mutableListOf<String>()
-        tasks.forEachIndexed { index, task ->
-            if (downloadCancelRequested) return@forEachIndexed
-            folderProgress = "正在加入下载 ${index + 1}/${tasks.size}"
-            runCatching {
-                // 哈希 fid（"p:" 前缀）推不出父目录，交给服务端按历史缓存反查；
-                // 路径形态 fid 直接用所在目录，零回查。
-                val dir = if (client.isHashFid(task.fid)) "/" else task.dir
-                val link = client.link(dir, task.fid).getOrThrow()
-                downloadManager.enqueue(
-                    url = downloadUrlOf(link),
-                    fileName = task.rel,
-                    size = if (link.size > 0) link.size else -1L,
-                    platform = DownloadPlatform.MANGO,
-                    headers = downloadHeadersOf(link),
-                    saveDir = saveDir
-                )
-                ok++
-            }.onFailure { if (!downloadCancelRequested) failed.add(task.rel) }
+        val ok = AtomicInteger(0)
+        val processed = AtomicInteger(0)
+        val failed = ConcurrentLinkedQueue<String>()
+        val gate = Semaphore(ENQUEUE_CONCURRENCY)
+        coroutineScope {
+            for (task in tasks) {
+                if (downloadCancelRequested) break
+                launch {
+                    gate.withPermit {
+                        if (downloadCancelRequested) return@withPermit
+                        folderProgress = "正在加入下载 ${processed.incrementAndGet()}/${tasks.size}"
+                        runCatching {
+                            // 哈希 fid（"p:" 前缀）推不出父目录，交给服务端按历史缓存反查；
+                            // 路径形态 fid 直接用所在目录，零回查。
+                            val dir = if (client.isHashFid(task.fid)) "/" else task.dir
+                            val link = client.link(dir, task.fid).getOrThrow()
+                            downloadManager.enqueue(
+                                url = downloadUrlOf(link),
+                                fileName = task.rel,
+                                size = if (link.size > 0) link.size else -1L,
+                                platform = DownloadPlatform.MANGO,
+                                headers = downloadHeadersOf(link),
+                                saveDir = saveDir
+                            )
+                            ok.incrementAndGet()
+                        }.onFailure { if (!downloadCancelRequested) failed.add(task.rel) }
+                    }
+                }
+            }
         }
-        return ok to failed
+        return ok.get() to failed.toList()
     }
 
     /** 汇总入队结果消息：成功数 + 截断提示 + 失败明细（最多展示 3 个）。 */
@@ -441,6 +461,9 @@ class MangoCloudViewModel(
     }
 
     companion object {
+        /** 递归收集入队的并发度：服务端解析限速 10 QPS，3 并发远低限速且提链延迟 ≈ 1/3 */
+        private const val ENQUEUE_CONCURRENCY = 3
+
         /** 子目录路径：父路径 + "/" + 名（根 "/" 不产生 "//"） */
         internal fun childPath(parent: String, name: String): String {
             val p = parent.trim().trimEnd('/')
