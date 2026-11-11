@@ -336,12 +336,25 @@ func (r *Resolver) ResolveShare(ctx context.Context, rawURL, pwd, clientUA strin
 		nodes = nil
 	}
 	key := r.shareKey(pan, rawURL, pwd)
-	raw, _ := json.Marshal(nodes)
+	// ★ 快照落库必须是「有效的 JSON 数组」,不能是 json.Marshal(nil slice) 的
+	//   字面量 "null"。原因:快照里带着 driver 私有上下文(quark 的
+	//   pwd_id/stoken、lanzou 的 share_url/pwd),没有它该分享下所有文件都
+	//   提不了链(quark「缺少夸克分享上下文」)。一次空解析就把快照写成空壳,
+	//   会把**唯一**的上下文来源毁掉。
+	//   故:nil 切片规范成空数组 "[]" —— 空数组是「解析成功但没有节点」的
+	//   诚实表达,不与「null / 解析失败」混淆;repo.UpsertShare 侧另有写保护
+	//   兜底(无有效内容的快照不覆盖已有好快照)。
+	raw := []byte("[]")
+	if nodes != nil {
+		if b, err := json.Marshal(nodes); err == nil {
+			raw = b
+		}
+	}
 	if err := r.store.UpsertShare(&repo.Share{
 		PanType: pan, ShareURL: rawURL, Pwd: pwd, ShareKey: key,
 		RawTree: string(raw), ResolvedAt: time.Now(),
 	}); err != nil {
-		r.log.Warnf("save share: %v", err)
+		r.log.Warnw("save share: %v", err)
 	}
 	items := make([]FileItem, 0, len(nodes))
 	linked, authBlocked, budgetStop := 0, false, false
@@ -514,6 +527,24 @@ func (r *Resolver) buildRef(key, fid string, own bool) (*driver.FileRef, error) 
 			}
 		}
 	}
+	// ★ 坏快照自愈:本分享的快照是「空壳」(raw_tree 为 "null"/"[]" —— 生产
+	//   历史数据确有此形态,成因是 json.Marshal(nil slice) 产出字面量 "null")
+	//   时,快照里读不到任何节点上下文,于是 ref.Ext 仍为空 → driver 报
+	//   「缺少夸克分享上下文」/「缺少蓝奏云分享上下文」,该分享下**所有**文件
+	//   都提不了链。
+	//   自愈来源:同一网盘下**别的 share_key** 的快照。share_key 是
+	//   sha1(pan|url|pwd),同一份分享的「/s/xxx」与「/s/xxx#/list/share/yyy」
+	//   是两个 key、两条快照 —— 另一条里往往还留着完整的 pwd_id/stoken。
+	//   只在同一 pan_type 内扫:不同网盘的 fid 空间互不相通,跨网盘取上下文必然串味。
+	if len(ref.Ext) == 0 && !own {
+		healed, herr := r.healShareContext(key, fid)
+		if herr != nil {
+			return nil, fmt.Errorf("heal share context: %w", herr)
+		}
+		if len(healed) > 0 {
+			ref.Ext = healed
+		}
+	}
 	if len(ref.Ext) == 0 && isHashFid(fid) {
 		// 哈希 fid 无法从上下文推导路径时,任何一条同 fid 历史缓存都是恢复源。
 		// 仅哈希形态启用:path 形态未命中由 driverStat 兜底,不必扫历史表;
@@ -527,6 +558,73 @@ func (r *Resolver) buildRef(key, fid string, own bool) (*driver.FileRef, error) 
 		}
 	}
 	return ref, nil
+}
+
+// healShareNode 在本分享快照是空壳时,从同一网盘**别的** share_key 快照里
+// 找回该 fid 的节点(名字/大小/Ext 上下文:quark 的 pwd_id/stoken、
+// lanzou 的 share_url/pwd)。
+//
+// ★ 这是坏快照唯一的自愈来源:share_key = sha1(pan|url|pwd),同一份分享的
+// 不同 URL 形态(根链接 vs 带 #/list/share/yyy 的深链)是两个 key、两条快照。
+// 一条被写坏("null"/"[]")时,另一条里往往还留着完整上下文。
+//
+// 口径:
+//   - 只在同一 pan_type 内扫(不同网盘 fid 空间互不相通,跨网盘必然串味);
+//   - 只取「有内容」的快照行("null"/"[]"/空串跳过,它们没有节点可言);
+//   - 节点按 fid 精确匹配,且该节点的 Ext 必须携带内容(非空 map);
+//   - 命中即返回,不做「合并多个来源」——不同来源的 stoken 可能互相矛盾,
+//     混用比不混用更危险(夸克 stoken 与 pwd_id 必须同源)。
+func (r *Resolver) healShareNode(key, fid string) (*driver.FileNode, error) {
+	pan := r.panOfShareKey(key)
+	if pan == "" {
+		return nil, nil
+	}
+	shares, err := r.store.ListSharesByPan(pan)
+	if err != nil {
+		return nil, err
+	}
+	for i := range shares {
+		if shares[i].ShareKey == key {
+			continue // 本分享自己的快照已查过
+		}
+		if !repo.RawTreeHasContent(shares[i].RawTree) {
+			continue // 空壳快照没有节点
+		}
+		var nodes []driver.FileNode
+		if json.Unmarshal([]byte(shares[i].RawTree), &nodes) != nil {
+			continue
+		}
+		for j := range nodes {
+			if nodes[j].FID != fid || len(nodes[j].Ext) == 0 {
+				continue
+			}
+			n := nodes[j]
+			return &n, nil
+		}
+	}
+	return nil, nil
+}
+
+// healShareContext 是 healShareNode 的上下文-only 包装。
+func (r *Resolver) healShareContext(key, fid string) (map[string]string, error) {
+	n, err := r.healShareNode(key, fid)
+	if err != nil || n == nil {
+		return nil, err
+	}
+	return n.Ext, nil
+}
+
+// panOfShareKey 从 share_key 反查网盘类型:share_key 是 sha1(pan|url|pwd),
+// 不可逆推,故只能在库内的快照行里比对(按 share_key 命中即得 pan_type)。
+func (r *Resolver) panOfShareKey(key string) string {
+	if key == "" {
+		return ""
+	}
+	sh, err := r.store.GetShare(key)
+	if err != nil || sh == nil {
+		return ""
+	}
+	return sh.PanType
 }
 
 // recoverExtFromHistory 从同 fid 的历史缓存行里恢复 driver 上下文(含真实 path)。
@@ -597,6 +695,13 @@ func (r *Resolver) fileMeta(key, fid string, ref *driver.FileRef) (string, int64
 				}
 			}
 		}
+	}
+	// ★ 坏快照自愈(与 buildRef 同源):本分享快照是空壳时,展示元数据
+	//   (名字/大小)同样拿不到 → 只能回落到兜底名「文件」+0,用户看到的是
+	//   「一个叫文件的 0 字节文件」。从同一网盘别的 share_key 快照里找回
+	//   该 fid 的节点即可(见 healShareNode)。
+	if healed, herr := r.healShareNode(key, fid); herr == nil && healed != nil {
+		return healed.Name, healed.Size, healed.Ext, nil
 	}
 	// 哈希 fid 在本分享查不到名字时,同 fid 的历史缓存行有完整元数据。
 	// 残缺行(FileName 空)不算命中,落到调用方的 driverStat 兜底。

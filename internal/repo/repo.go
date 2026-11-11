@@ -151,6 +151,13 @@ func (s *Store) AddAudit(action, detail string) {
 
 // ---- Share ----
 
+// UpsertShare 落库分享快照。
+//
+// ★ raw_tree 的写保护(与 links.ext 同型):raw_tree 是 driver 节点列表的 JSON,
+// 一次「没拿到节点」的解析(json.Marshal(nil slice) → 字面量 "null")若
+// 无条件覆盖,就把该分享**唯一**的快照清成空壳 —— 而快照里带着
+// quark 的 pwd_id/stoken 等上下文,没有它该分享下所有文件都提不了链
+// (「缺少夸克分享上下文」)。故:raw_tree 无有效内容时**不更新该列**。
 func (s *Store) UpsertShare(sh *Share) error {
 	var exist Share
 	err := s.db.Where("share_key = ?", sh.ShareKey).First(&exist).Error
@@ -161,9 +168,30 @@ func (s *Store) UpsertShare(sh *Share) error {
 		return err
 	}
 	sh.ID = exist.ID
-	return s.db.Model(&exist).Updates(map[string]any{
-		"raw_tree": sh.RawTree, "resolved_at": sh.ResolvedAt,
-	}).Error
+	updates := map[string]any{"resolved_at": sh.ResolvedAt}
+	// 快照有内容才覆盖:空壳快照("null"/"[]"/空串)覆盖好快照 = 把可恢复的
+	// 上下文毁掉。首次落库(不存在旧行)时仍按原样写入,故 Create 分支不受此限。
+	if rawTreeHasContent(sh.RawTree) {
+		updates["raw_tree"] = sh.RawTree
+	}
+	return s.db.Model(&exist).Updates(updates).Error
+}
+
+// RawTreeHasContent 判断分享快照是否携带有效节点内容:非空、非 JSON null、非空数组。
+// "null" 是 json.Marshal(nil slice) 的产物 —— 它作为「有列」存在,读回来时
+// Unmarshal 得到 nil slice,等于没有内容(线上历史数据里确有此形态)。
+// "[]" 同样是「有列无内容」:分享真的空,和「没解析出来」无法区分,一律视为无内容。
+//
+// 导出供 service 层复用(读侧坏快照自愈要按同一口径挑「有内容」的快照行),
+// 避免两处口径漂移。
+func RawTreeHasContent(s string) bool {
+	s = strings.TrimSpace(s)
+	return s != "" && s != "null" && s != "[]"
+}
+
+// rawTreeHasContent 是 RawTreeHasContent 的包内别名(写保护处调用)。
+func rawTreeHasContent(s string) bool {
+	return RawTreeHasContent(s)
 }
 
 // ---- Link ----
@@ -267,6 +295,26 @@ func (s *Store) GetShare(shareKey string) (*Share, error) {
 		return nil, err
 	}
 	return &sh, nil
+}
+
+// ListSharesByPan 列出该网盘的全部分享快照(跨 share_key 的上下文自愈用)。
+//
+// ★ 为什么需要它:share_key = sha1(pan|url|pwd),**URL 形态不同即不同 key** ——
+// 同一份夸克分享,「/s/xxx」与「/s/xxx#/list/share/yyy」是两个 key、两条快照。
+// 于是「某条快照被写坏」不等于「该分享的上下文彻底丢失」:另一形态的快照里
+// 往往还留着完整的 pwd_id/stoken。这是坏快照唯一的自愈来源。
+//
+// 只在同一 pan_type 内扫:不同网盘的 fid 空间互不相通,跨网盘取上下文必然串味。
+// 快照行数量级很小(每个分享上下文一行),按 pan_type 取回即可。
+func (s *Store) ListSharesByPan(panType string) ([]Share, error) {
+	if panType == "" {
+		return nil, nil
+	}
+	var out []Share
+	if err := s.db.Where("pan_type = ?", panType).Order("id").Find(&out).Error; err != nil {
+		return nil, err
+	}
+	return out, nil
 }
 
 // ExpireLink 立即将某条直链标记为过期(上游否决时调用),使下次 GetFreshLink 触发重解析。
