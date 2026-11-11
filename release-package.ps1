@@ -26,6 +26,22 @@ $mb = [math]::Round((Get-Item "$name.zip").Length / 1MB, 1)
 Write-Host "[OK] release asset: $name.zip ($mb MB)"
 
 $notes = "PanRouter 桌面端 $Tag 便携版（免安装，解压即用）。`n`n基于 YunX-Desktop（[tidain/YunX-Desktop](https://github.com/tidain/YunX-Desktop)，AGPL-3.0）二次开发，整合 PanRouter 服务端解析。源码与更新：https://github.com/dengyie/PanRouter"
-gh release create $Tag "$name.zip" --title $Tag --notes $notes
-if ($LASTEXITCODE -ne 0) { throw "gh release create failed with exit $LASTEXITCODE" }
-Write-Host "[OK] Release $Tag published" -ForegroundColor Green
+
+# 幂等发版:tag 被重指向后重推(历史重写/发版重跑)时 Release 已存在,
+# gh release create 会撞名失败——生产实证 v0.1.12 重发即此形态。
+# 已存在 → 覆盖资产(--clobber)并刷新标题与说明;不存在 → 正常创建。
+$releaseExists = $false
+gh release view $Tag *> $null
+if ($LASTEXITCODE -eq 0) { $releaseExists = $true }
+
+if ($releaseExists) {
+    gh release upload $Tag "$name.zip" --clobber
+    if ($LASTEXITCODE -ne 0) { throw "gh release upload failed with exit $LASTEXITCODE" }
+    gh release edit $Tag --title $Tag --notes $notes
+    if ($LASTEXITCODE -ne 0) { throw "gh release edit failed with exit $LASTEXITCODE" }
+    Write-Host "[OK] Release $Tag asset replaced (clobber)" -ForegroundColor Green
+} else {
+    gh release create $Tag "$name.zip" --title $Tag --notes $notes
+    if ($LASTEXITCODE -ne 0) { throw "gh release create failed with exit $LASTEXITCODE" }
+    Write-Host "[OK] Release $Tag published" -ForegroundColor Green
+}
