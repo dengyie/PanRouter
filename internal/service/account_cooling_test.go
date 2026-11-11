@@ -96,3 +96,24 @@ func TestMarkCooldownSetsCoolingAndUntil(t *testing.T) {
 		t.Fatalf("cooldown_until 未写入: %+v", got.CooldownUntil)
 	}
 }
+
+// v2.11.1 回归:banned 是人工/风控终态,「碰巧有效」的探测不得越权复活
+// (与 cooling 同一保护面)。修复前 checkAcc 只保护 cooling,banned 账号
+// 凭据碰巧有效时被写回 ok —— 终态被一次旁路探测打穿。
+func TestCheckKeepsBannedOnValidCredential(t *testing.T) {
+	svc, store, _ := newTestAccService(t)
+	acc, err := svc.Create("fake", "n", "c=1", panKnown)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.MarkAccountStatus(acc.ID, "banned"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := svc.Check(context.Background(), acc.ID, &stubDriver{valid: true}); err != nil {
+		t.Fatalf("check: %v", err)
+	}
+	got, _ := store.GetAccount(acc.ID)
+	if got.Status != "banned" {
+		t.Fatalf("健康检查成功不得复活 banned: status=%q want banned", got.Status)
+	}
+}

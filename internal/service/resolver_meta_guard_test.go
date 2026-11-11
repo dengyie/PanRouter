@@ -5,6 +5,7 @@ package service
 
 import (
 	"context"
+	"fmt"
 	"testing"
 	"time"
 
@@ -161,6 +162,54 @@ func TestHealPrefersNewestSiblingSnapshot(t *testing.T) {
 	case ref := <-cd.refs:
 		if ref.Ext["stoken"] != "NEW-STOKEN" {
 			t.Fatalf("自愈取了旧快照: stoken=%q want NEW-STOKEN", ref.Ext["stoken"])
+		}
+	default:
+		t.Fatal("driver 未被调用")
+	}
+}
+
+// P3:自愈扫描必须有上限(healScanLimit,从最新往回数)。上限内的兄弟快照
+// 照常命中;落到窗口外的老快照不参与自愈 —— 封顶后空壳 miss 的最坏成本是
+// 常数次 JSON 解析,不随 shares 总量增长。
+func TestHealScanLimitBoundsSiblingSearch(t *testing.T) {
+	cd := newCapDriver()
+	resolver, store := newTestResolver(t, cd, config.DriverCommon{Enabled: true, LimitQPS: 1000, DownloadConc: 3})
+
+	selfKey := resolver.shareKey("fake", "https://fake.example/s/lim1", "")
+	if err := store.UpsertShare(&repo.Share{
+		PanType: "fake", ShareURL: "https://fake.example/s/lim1", ShareKey: selfKey, RawTree: "[]",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// 窗口外(id 最小,最老)的快照带着目标节点 —— 若无上限,它会命中;
+	// 上限生效后窗口内没有同 fid 节点,自愈必须落空。
+	outKey := resolver.shareKey("fake", "https://fake.example/s/lim1?form=oldest", "")
+	if err := store.UpsertShare(&repo.Share{
+		PanType: "fake", ShareURL: "https://fake.example/s/lim1?form=oldest", ShareKey: outKey,
+		RawTree: `[{"FID":"fx","Name":"old.bin","Size":1,"IsDir":false,"Ext":{"pwd_id":"lim1"}}]`,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// 灌满窗口:再插 healScanLimit 条比它新的快照(同 pan_type,fid 不同)
+	for i := 0; i < healScanLimit; i++ {
+		u := fmt.Sprintf("https://fake.example/s/lim1?filler=%d", i)
+		k := resolver.shareKey("fake", u, "")
+		if err := store.UpsertShare(&repo.Share{
+			PanType: "fake", ShareURL: u, ShareKey: k,
+			RawTree: `[{"FID":"filler-fid","Name":"f.bin","Size":1,"IsDir":false,"Ext":{"pwd_id":"lim1"}}]`,
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	if _, err := resolver.ResolveFile(WithAuthed(context.Background(), true), "https://fake.example/s/lim1", "", "fx", false, ""); err != nil {
+		t.Fatalf("resolve 不应因自愈落空而失败(驱动直查兜底): %v", err)
+	}
+	// 落空的证据:驱动拿到的 ref.Ext 是空(没有从窗口外快照注入上下文)。
+	select {
+	case ref := <-cd.refs:
+		if ref.Ext["pwd_id"] == "lim1" {
+			t.Fatal("窗口外老快照仍被自愈消费:healScanLimit 未生效")
 		}
 	default:
 		t.Fatal("driver 未被调用")

@@ -635,7 +635,17 @@ func (r *Resolver) healShareNode(key, fid string) (*driver.FileNode, error) {
 	// 逆序消费(id 降序 = 最新快照优先):同一份分享的多条快照里,最新的那条
 	// 上下文最新(quark 的 stoken 有时效)。取最旧的命中会拿过期上下文 ——
 	// 夸克还有 stoken 过期重试兜底,mangodrive 的 path 缺失就直接 404。
-	for i := len(shares) - 1; i >= 0; i-- {
+	//
+	// ★ 扫描上限 healScanLimit:这是「快照空壳」这条异常路径上的防御性扫描,
+	//   命中率随分享总量增长而稀释(自愈找的是同一份分享的另一条快照,通常
+	//   就在最近几条里);上限封顶后,空壳 miss 的最坏成本是常数次 JSON 解析,
+	//   不会随 shares 总量线性膨胀。同 pan_type 超过上限的老快照不参与自愈
+	//   (它们同时也是最不可能有新鲜上下文的)。
+	scanFrom := len(shares) - healScanLimit
+	if scanFrom < 0 {
+		scanFrom = 0
+	}
+	for i := len(shares) - 1; i >= scanFrom; i-- {
 		if shares[i].ShareKey == key {
 			continue // 本分享自己的快照已查过
 		}
@@ -972,6 +982,12 @@ func linkMetaIsPlaceholder(name string, size int64) bool {
 // 上限要盖得住「前面若干行都是坏行(无有效 path)、可用行在更早」的情形,
 // 故取宽松值。扫描按 idx_fid_created 索引序进行,本身廉价。
 const historyScanLimit = 64
+
+// healScanLimit 快照自愈时扫描同 pan_type 分享快照的上限(从最新往回数)。
+// 自愈找的是「同一份分享的另一条快照」(同一 URL 的另一种形态),这类兄弟
+// 快照几乎必然在最近几条里;上限封顶后空壳 miss 的最坏成本是常数次 JSON
+// 解析,不随 shares 总量增长。取值盖住生产量级(个位数 shares)的数百倍冗余。
+const healScanLimit = 64
 
 // isHashFid 哈希形态 fid 判定(mangodrive 对超长路径生成 "p:<sha1>",不可逆)。
 // 仅哈希形态启用历史反查:path 形态 fid 未命中由 driverStat 兜底,省一次全局扫;

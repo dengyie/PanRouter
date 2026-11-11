@@ -91,8 +91,12 @@ func (s *AccountService) checkAcc(ctx context.Context, acc *repo.Account, drv dr
 			// ★ 健康检查成功**不得**解除风控冷却:cooling 的复位路径只有一条
 			//   (PickAccount 里 cooldown_until 到期自动复位),否则一次「碰巧
 			//   有效」的探测就把被风控的账号写回 ok,冷却形同虚设。
-			if acc.Status == "cooling" {
-				status = "cooling"
+			//   banned 同理:banned 是人工/风控终态(该 pan 当前无写入方,保留
+			//   语义供运维手改与仪表盘展示),探测成功不能越权复活 —— 状态机
+			//   的单向逃逸只有冷却到期,其余终态的解除都该走人工路径。
+			switch acc.Status {
+			case "cooling", "banned":
+				status = acc.Status
 			}
 		}
 		if err := s.store.UpdateAccountCheck(acc.ID, status, now, acc.Status); err != nil {
