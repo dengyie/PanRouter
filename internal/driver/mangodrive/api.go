@@ -156,6 +156,16 @@ func (a *API) Get(ctx context.Context, p string) (*Obj, error) {
 }
 
 // List 列目录(自动翻页,上界 maxListPages)。
+//
+// 终止条件有两个,都必须成立才早停:
+//   - 本页不满 per_page → 已是最后一页(上游返回不足一页即到底);
+//   - total > 0 且已取条数 >= total → 已取完上游声明的总数。
+//
+// ★ total 的坑:部分 OpenList 版本/接口形态**不返回 total**(字段缺省 → 0)。
+//   原实现写 `page*listPageSize >= out.Total`,total=0 时该式恒真
+//   (200 >= 0) → 恰好取满一页就停 → 目录超过 per_page(200)时**静默截断**,
+//   后面的文件对客户端完全不可见(表现为「文件夹里少了文件」且无任何报错)。
+//   故 total 只在 > 0 时作为终止判据;total 缺失时只能靠「本页不满」判断到底。
 func (a *API) List(ctx context.Context, p string) ([]Obj, error) {
 	var all []Obj
 	for page := 1; page <= maxListPages; page++ {
@@ -170,7 +180,9 @@ func (a *API) List(ctx context.Context, p string) ([]Obj, error) {
 			return nil, err
 		}
 		all = append(all, out.Content...)
-		if len(out.Content) < listPageSize || page*listPageSize >= out.Total {
+		lastPage := len(out.Content) < listPageSize
+		exhausted := out.Total > 0 && page*listPageSize >= out.Total
+		if lastPage || exhausted {
 			break
 		}
 	}

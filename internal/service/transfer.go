@@ -777,19 +777,26 @@ func (s *Transfer) destOwnedByOther(p string, task *TransferTask, myDest string)
 		s.mu.Unlock()
 		return true
 	}
-	// tasks 遍历:DestPath 受各自 task.mu 保护,逐个短锁读;先在 s.mu 内收集
-	// 再出锁比较,避免锁序(s.mu → task.mu)反向导致死锁。
-	type rec struct {
-		dest string
-	}
+	// tasks 遍历:DestPath/State 受各自 task.mu 保护,逐个短锁读。
+	// 锁序说明:此处持有 s.mu 的同时取 t.mu —— 全仓锁序统一为 s.mu → task.mu
+	// (pruneLocked 同此:s.mu 内遍历取 t.mu),严禁任何 t.mu → s.mu 的反向获取,
+	// 否则两把锁交叉等待死锁。注释勿写成「先收集再出锁」——收集本身就要持 t.mu。
 	owned := make([]string, 0, len(s.tasks))
 	for id, t := range s.tasks {
 		if id == task.ID {
 			continue
 		}
 		t.mu.Lock()
-		owned = append(owned, t.DestPath)
+		// 只认「产物可能已落池」的任务:done(已确认落盘)、pending(远端已受理待确认)、
+		// running(受理瞬间的窄窗)。failed 的产物根本不存在、queued 尚未提交远端 ——
+		// 把它们的 destPath 算进跳过集只会造成误跳过(别的任务的真实产物被挡住),
+		// 让后者对账失败、超窗后被误判为失败。
+		mayHaveArtifact := t.State == stateDone || t.State == statePending || t.State == stateRunning
+		dest := t.DestPath
 		t.mu.Unlock()
+		if mayHaveArtifact {
+			owned = append(owned, dest)
+		}
 	}
 	s.mu.Unlock()
 	for _, d := range owned {

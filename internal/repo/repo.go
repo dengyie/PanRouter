@@ -37,11 +37,16 @@ type Share struct {
 }
 
 type Link struct {
-	ID         uint   `gorm:"primaryKey" json:"id"`
-	ShareKey   string `gorm:"uniqueIndex:idx_share_fid;size:64" json:"share_key"`
+	// ID 主键。SQLite 索引隐含 rowid,故 (fid, created_at) 两列索引已能覆盖
+	// id 列的取值;真正的排序消除靠的是 tiebreaker 方向(id DESC)而非多一列。
+	ID       uint   `gorm:"primaryKey" json:"id"`
+	ShareKey string `gorm:"uniqueIndex:idx_share_fid;size:64" json:"share_key"`
 	// FID 双索引:与 ShareKey 组成业务唯一键;复合索引 (fid, created_at) 支撑
-	// FindLinkByFID 的哈希 fid 全局反查——过滤与 created_at 排序全走索引,
-	// 免去 TEMP B-TREE(单列索引只能免全表扫,排序仍要临时 B 树)。
+	// FindLinkByFID 的哈希 fid 全局反查——过滤与 created_at 排序全走索引。
+	// 消除临时 B 树的关键是 tiebreaker **方向**:GORM First() 追加的是 id 升序,
+	// 与索引降序扫描相反 → SQLite 仍要 "USE TEMP B-TREE FOR RIGHT PART OF ORDER BY";
+	// 改用 Take + 显式 "created_at DESC, id DESC"(与索引同向)后彻底消除。
+	// 回归见 repo_fid_index_test.go(EXPLAIN 断言真实 SQL 无 TEMP B-TREE)。
 	FID        string `gorm:"column:fid;uniqueIndex:idx_share_fid;index:idx_fid_created,priority:1;size:128" json:"fid"`
 	FileName   string `gorm:"size:512" json:"file_name"`
 	Size       int64  `json:"size"`
@@ -198,12 +203,17 @@ func (s *Store) GetLink(shareKey, fid string) (*Link, error) {
 // 用途:mangodrive 等驱动对长路径生成哈希 fid("p:<sha1>"),哈希不可逆——
 // 调用方只拿到 fid 时(如客户端由 parentDirOf 推不出父目录、直接以 fid 提链),
 // 从任何一条历史缓存行的 Ext 里都能恢复真实路径。返回 (nil, nil) = 没有历史。
+//
+// 排序口径:created_at DESC, id DESC(并列时取后写入的那条)。
+// 不用 First():它会强制追加主键 tiebreaker 且方向为 id ASC,与索引
+// (fid, created_at) 的降序扫描不匹配 → EXPLAIN 实测仍出现
+// "USE TEMP B-TREE FOR RIGHT PART OF ORDER BY"。Take + 显式 Order 消除该临时排序。
 func (s *Store) FindLinkByFID(fid string) (*Link, error) {
 	if fid == "" {
 		return nil, nil
 	}
 	var l Link
-	err := s.db.Where("fid = ?", fid).Order("created_at DESC").First(&l).Error
+	err := s.linkByFIDQuery(s.db, fid).Take(&l).Error
 	if errors.Is(err, gorm.ErrRecordNotFound) {
 		return nil, nil
 	}
@@ -211,6 +221,15 @@ func (s *Store) FindLinkByFID(fid string) (*Link, error) {
 		return nil, err
 	}
 	return &l, nil
+}
+
+// linkByFIDQuery 构造 FindLinkByFID 的查询。单独抽出是为了让回归测试能用
+// DryRun 会话取到**真实发出的 SQL**(而不是手抄一份近似 SQL 去 EXPLAIN——
+// 手抄版无法约束 GORM 是否偷偷追加主键 tiebreaker,正是 P1 的漏网之处)。
+func (s *Store) linkByFIDQuery(db *gorm.DB, fid string) *gorm.DB {
+	return db.Where("fid = ?", fid).
+		Order("created_at DESC, id DESC").
+		Limit(1)
 }
 
 // GetShare 按 share_key 读取分享快照。

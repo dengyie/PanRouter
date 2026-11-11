@@ -6,6 +6,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -153,5 +154,111 @@ func TestSwapBaseRewritesInternalLink(t *testing.T) {
 	}
 	if same := swapBase(want, "http://127.0.0.1:15244", "https://drive.example.com"); same != want {
 		t.Fatalf("public link must stay untouched, got %q", same)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// List 翻页回归:上游不返回 total 时不得静默截断
+//
+// 背景:原实现 `page*listPageSize >= out.Total` 作为终止条件。某些 OpenList
+// 版本/接口形态**不返回 total**(字段缺省 → 0),此时 200 >= 0 恒真 →
+// 恰好取满一页(200 条)就 break → 目录超过 200 条时后面的文件对客户端
+// 完全不可见,且无任何报错(表现为「文件夹里少了文件」)。
+//
+// 本用例让上游返回 250 条、total 字段缺省,断言必须翻到第 2 页并取满 250 条。
+// ---------------------------------------------------------------------------
+
+// fakeListNoTotal 模拟「返回 total 缺失」的 fs/list 端点。
+type fakeListNoTotal struct {
+	t      *testing.T
+	srv    *httptest.Server
+	called int
+}
+
+func newFakeListNoTotal(t *testing.T, totalFiles int) *fakeListNoTotal {
+	t.Helper()
+	f := &fakeListNoTotal{t: t}
+	f.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/fs/list" {
+			http.Error(w, `{"code":404,"message":"not found","data":null}`, http.StatusOK)
+			return
+		}
+		var in map[string]any
+		_ = json.NewDecoder(r.Body).Decode(&in)
+		page, _ := in["page"].(float64)
+		perPage, _ := in["per_page"].(float64)
+		if perPage <= 0 {
+			perPage = listPageSize
+		}
+		f.called++
+		start := int(page-1) * int(perPage)
+		end := start + int(perPage)
+		if end > totalFiles {
+			end = totalFiles
+		}
+		var items []string
+		if start < totalFiles {
+			for i := start; i < end; i++ {
+				items = append(items, `{"name":"f`+strconv.Itoa(i)+`","is_dir":false,"size":1}`)
+			}
+		}
+		// ★ 关键:响应里**不含** total 字段(上游形态不返回)
+		_, _ = w.Write([]byte(`{"code":200,"message":"success","data":{"content":[` +
+			strings.Join(items, ",") + `]}}`))
+	}))
+	t.Cleanup(f.srv.Close)
+	return f
+}
+
+func TestListDoesNotTruncateWhenTotalMissing(t *testing.T) {
+	const totalFiles = 250 // > per_page(200):必须翻页
+	f := newFakeListNoTotal(t, totalFiles)
+	api := NewAPI(newClient(t), f.srv.URL, "tok-1")
+
+	objs, err := api.List(context.Background(), "/Pool")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(objs) != totalFiles {
+		t.Fatalf("total 缺失时不得截断: got %d 条, want %d 条(翻页次数=%d)", len(objs), totalFiles, f.called)
+	}
+	if f.called < 2 {
+		t.Fatalf("应至少翻 2 页,实际调用 %d 次", f.called)
+	}
+}
+
+// 上游正常返回 total 时仍按 total 提前终止(不多翻页)。
+func TestListStopsWhenTotalReached(t *testing.T) {
+	var servedPages []int
+	const totalFiles = 250
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var in map[string]any
+		_ = json.NewDecoder(r.Body).Decode(&in)
+		page, _ := in["page"].(float64)
+		servedPages = append(servedPages, int(page))
+		start := (int(page) - 1) * listPageSize
+		end := start + listPageSize
+		if end > totalFiles {
+			end = totalFiles
+		}
+		var items []string
+		for i := start; i < end; i++ {
+			items = append(items, `{"name":"f`+strconv.Itoa(i)+`","is_dir":false,"size":1}`)
+		}
+		// total 正常返回 → 翻到第 2 页取满 250 后必须停止(不翻第 3 页)
+		_, _ = w.Write([]byte(`{"code":200,"message":"success","data":{"content":[` +
+			strings.Join(items, ",") + `],"total":250}}`))
+	}))
+	defer srv.Close()
+	api := NewAPI(newClient(t), srv.URL, "tok-1")
+	objs, err := api.List(context.Background(), "/Pool")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(objs) != totalFiles {
+		t.Fatalf("got %d 条 want %d", len(objs), totalFiles)
+	}
+	if len(servedPages) != 2 {
+		t.Fatalf("total=250 时应翻到第 2 页后停止,实际请求页=%v", servedPages)
 	}
 }

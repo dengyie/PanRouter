@@ -118,6 +118,67 @@ func TestStorageInfoMaxBytesContract(t *testing.T) {
 	}
 }
 
+// limit_qps 下发的取整方向:必须**向上**取整且 >= 1。
+//
+// 原实现 int(x) 截断向下,limit_qps=0.5 → 下发 0 → 客户端视为「未配置」
+// → 用默认并发 3,而服务端实际只允许 0.5 QPS → 客户端并发远超服务端限速,
+// 表现为批量提链被限流拒绝、大文件夹反复失败。
+// 向上取整保证「下发值 >= 实际限速」,客户端只会更保守。
+func TestStorageInfoLimitQPSRoundsUp(t *testing.T) {
+	cases := []struct {
+		name string
+		qps  float64
+		want int
+	}{
+		{name: "整数原样", qps: 10, want: 10},
+		{name: "小数向上取整", qps: 2.5, want: 3},
+		{name: "小数向上取整(非整)", qps: 0.5, want: 1},
+		{name: "极小数不得退化为 0", qps: 0.01, want: 1},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ts, token := newStorageEnv(t, func(c *config.Config) {
+				if c.Drivers == nil {
+					c.Drivers = map[string]config.DriverCommon{}
+				}
+				c.Drivers["mangodrive"] = config.DriverCommon{Enabled: true, LimitQPS: tc.qps}
+			})
+			st, body := doRaw(t, ts, token, "GET", "/api/v1/storage", "")
+			if st != http.StatusOK {
+				t.Fatalf("status=%d body=%v", st, body)
+			}
+			got, ok := body["limit_qps"]
+			if !ok {
+				t.Fatalf("缺少 limit_qps: %v", body)
+			}
+			n, ok := got.(float64)
+			if !ok || int(n) != tc.want {
+				t.Fatalf("limit_qps=%v want %d (配置 %v)", got, tc.want, tc.qps)
+			}
+			if int(n) < 1 {
+				t.Fatalf("limit_qps 不得为 0(客户端会当成「未配置」而用默认并发): %v", got)
+			}
+		})
+	}
+}
+
+// limit_qps 未配置(<=0)时不下发该字段:客户端据此判定「服务端未限速」。
+func TestStorageInfoLimitQPSAbsentWhenUnset(t *testing.T) {
+	ts, token := newStorageEnv(t, func(c *config.Config) {
+		if c.Drivers == nil {
+			c.Drivers = map[string]config.DriverCommon{}
+		}
+		c.Drivers["mangodrive"] = config.DriverCommon{Enabled: true, LimitQPS: 0}
+	})
+	st, body := doRaw(t, ts, token, "GET", "/api/v1/storage", "")
+	if st != http.StatusOK {
+		t.Fatalf("status=%d body=%v", st, body)
+	}
+	if _, ok := body["limit_qps"]; ok {
+		t.Fatalf("未配置限速时不应下发 limit_qps: %v", body)
+	}
+}
+
 // 未登录不可读(与 transfer 其它端点一致)。
 func TestStorageInfoRequiresAuth(t *testing.T) {
 	ts, _ := newStorageEnv(t, nil)

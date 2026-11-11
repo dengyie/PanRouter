@@ -1,6 +1,9 @@
 package api
 
-import "net/http"
+import (
+	"math"
+	"net/http"
+)
 
 // GET /api/v1/storage 返回存储落点(OpenList 兼容端点)的接入信息。
 //
@@ -23,8 +26,20 @@ func (d *Deps) handleStorageInfo(w http.ResponseWriter, _ *http.Request) {
 	out["max_bytes"] = storageMaxBytes(d.Cfg.Get().Transfer.MaxBytes)
 	// limit_qps 下发 mangodrive 驱动限速(取整,0=未配置):客户端文件夹批量
 	// 提链的并发度据此自适应(取 1/3 并留裕度),服务端调 QPS 客户端无需改版。
+	//
+	// ★ 截断方向:必须**向上**取整(ceil)。原实现 int(x) 截断向下:
+	//   limit_qps=2.5 → 下发 2 → 客户端算 2/3=0 → 钳到 1 → 保守(安全);
+	//   但 limit_qps=0.5 → 下发 0 → 客户端视为「未配置」→ 用默认并发 3,
+	//   而服务端实际只允许 0.5 QPS → **客户端并发远超服务端限速**,
+	//   表现为批量提链被服务端限流拒绝、大文件夹反复失败。
+	//   向上取整保证「下发值 >= 实际限速」,客户端据此只会更保守,不会更激进。
+	//   另:ceil 后必须 >= 1,否则同样退化成「未配置」。
 	if lc := d.Cfg.Get().Drivers["mangodrive"]; lc.LimitQPS > 0 {
-		out["limit_qps"] = int(lc.LimitQPS)
+		qps := int(math.Ceil(lc.LimitQPS))
+		if qps < 1 {
+			qps = 1
+		}
+		out["limit_qps"] = qps
 	}
 	writeJSON(w, http.StatusOK, out)
 }
