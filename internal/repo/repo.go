@@ -4,6 +4,7 @@ package repo
 import (
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/glebarez/sqlite"
@@ -42,10 +43,10 @@ type Link struct {
 	ID       uint   `gorm:"primaryKey" json:"id"`
 	ShareKey string `gorm:"uniqueIndex:idx_share_fid;size:64" json:"share_key"`
 	// FID 双索引:与 ShareKey 组成业务唯一键;复合索引 (fid, created_at) 支撑
-	// FindLinkByFID 的哈希 fid 全局反查——过滤与 created_at 排序全走索引。
+	// ListLinksByFID 的哈希 fid 全局反查——过滤与 created_at 排序全走索引。
 	// 消除临时 B 树的关键是 tiebreaker **方向**:GORM First() 追加的是 id 升序,
 	// 与索引降序扫描相反 → SQLite 仍要 "USE TEMP B-TREE FOR RIGHT PART OF ORDER BY";
-	// 改用 Take + 显式 "created_at DESC, id DESC"(与索引同向)后彻底消除。
+	// 改用显式 "created_at DESC, id DESC"(与索引同向)后彻底消除。
 	// 回归见 repo_fid_index_test.go(EXPLAIN 断言真实 SQL 无 TEMP B-TREE)。
 	FID        string `gorm:"column:fid;uniqueIndex:idx_share_fid;index:idx_fid_created,priority:1;size:128" json:"fid"`
 	FileName   string `gorm:"size:512" json:"file_name"`
@@ -177,12 +178,29 @@ func (s *Store) UpsertLink(l *Link) error {
 		return err
 	}
 	l.ID = exist.ID
-	return s.db.Model(&exist).Updates(map[string]any{
+	updates := map[string]any{
 		"file_name": l.FileName, "size": l.Size, "direct_link": l.DirectLink,
 		"server_link": l.ServerLink,
 		"ua":          l.UA, "referer": l.Referer, "cookie_enc": l.CookieEnc,
-		"bind_ip": l.BindIP, "expires_at": l.ExpiresAt, "ext": l.Ext,
-	}).Error
+		"bind_ip": l.BindIP, "expires_at": l.ExpiresAt,
+	}
+	// ★ ext 的写保护:ext 是 driver 私有上下文,对 mangodrive 而言 Ext["path"]
+	//   是**唯一**能反推真实存储路径的地方(哈希 fid 不可逆,路径恢复只能从
+	//   历史缓存行里捞)。本次解析若没拿到上下文(ext 为空 / 字面量 "null"),
+	//   直接覆盖会把库里已有的 path 永久抹掉 → 该 fid 的裸哈希提链从此必然 404。
+	//   故:ext 无有效内容时**不更新该列**(保留原值),有内容才覆盖。
+	if extHasContent(l.Ext) {
+		updates["ext"] = l.Ext
+	}
+	return s.db.Model(&exist).Updates(updates).Error
+}
+
+// extHasContent 判断 ext 是否携带有效上下文:非空、非 JSON null、非空对象。
+// "null" 是 json.Marshal(nil map) 的产物——它作为「有列」存在,读回来时
+// Unmarshal 得到 nil map,等于没有内容(线上历史数据里确有此形态)。
+func extHasContent(s string) bool {
+	s = strings.TrimSpace(s)
+	return s != "" && s != "null" && s != "{}"
 }
 
 // GetLink 按 (share_key, fid) 读取直链缓存。
@@ -199,28 +217,34 @@ func (s *Store) GetLink(shareKey, fid string) (*Link, error) {
 	return &l, nil
 }
 
-// FindLinkByFID 跨 share_key 按 fid 找最近一条直链缓存。
+// ListLinksByFID 跨 share_key 按 fid 列出直链缓存历史行(最新的在前)。
+//
 // 用途:mangodrive 等驱动对长路径生成哈希 fid("p:<sha1>"),哈希不可逆——
 // 调用方只拿到 fid 时(如客户端由 parentDirOf 推不出父目录、直接以 fid 提链),
-// 从任何一条历史缓存行的 Ext 里都能恢复真实路径。返回 (nil, nil) = 没有历史。
+// 只能从历史缓存行的 Ext["path"] 里恢复真实路径。
+//
+// ★ 为什么返回列表而不是只给一行:同一 fid 会有多行(每行对应一个缓存过它的
+// 分享上下文),其中可能混有「有列无内容」的坏行(线上历史数据里 ext 被写成
+// 字面量 "null" 即属此类)。只取最新一行会在坏行上翻车 —— 明明库里存在带
+// path 的可用历史行,恢复却失败,裸哈希提链必然 404。
+// 故这里只负责「按索引顺序把行摆出来」,挑哪一行由调用方决定。
 //
 // 排序口径:created_at DESC, id DESC(并列时取后写入的那条)。
 // 不用 First():它会强制追加主键 tiebreaker 且方向为 id ASC,与索引
 // (fid, created_at) 的降序扫描不匹配 → EXPLAIN 实测仍出现
-// "USE TEMP B-TREE FOR RIGHT PART OF ORDER BY"。Take + 显式 Order 消除该临时排序。
-func (s *Store) FindLinkByFID(fid string) (*Link, error) {
+// "USE TEMP B-TREE FOR RIGHT PART OF ORDER BY"。显式 Order 消除该临时排序。
+func (s *Store) ListLinksByFID(fid string, limit int) ([]Link, error) {
 	if fid == "" {
 		return nil, nil
 	}
-	var l Link
-	err := s.linkByFIDQuery(s.db, fid).Take(&l).Error
-	if errors.Is(err, gorm.ErrRecordNotFound) {
-		return nil, nil
+	if limit <= 0 {
+		limit = 1
 	}
-	if err != nil {
+	var out []Link
+	if err := s.linkByFIDQuery(s.db, fid).Limit(limit).Find(&out).Error; err != nil {
 		return nil, err
 	}
-	return &l, nil
+	return out, nil
 }
 
 // linkByFIDQuery 构造 FindLinkByFID 的查询。单独抽出是为了让回归测试能用
@@ -228,8 +252,7 @@ func (s *Store) FindLinkByFID(fid string) (*Link, error) {
 // 手抄版无法约束 GORM 是否偷偷追加主键 tiebreaker,正是 P1 的漏网之处)。
 func (s *Store) linkByFIDQuery(db *gorm.DB, fid string) *gorm.DB {
 	return db.Where("fid = ?", fid).
-		Order("created_at DESC, id DESC").
-		Limit(1)
+		Order("created_at DESC, id DESC")
 }
 
 // GetShare 按 share_key 读取分享快照。

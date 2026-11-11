@@ -453,11 +453,22 @@ func (r *Resolver) ResolveFile(ctx context.Context, rawURL, pwd, fid string, own
 	if err != nil {
 		return nil, fmt.Errorf("encrypt cookie: %w", err)
 	}
-	extJSON, _ := json.Marshal(ext)
+	// ★ ext 落库必须是「有效 JSON 对象」,不能是 json.Marshal(nil map) 的
+	// 字面量 "null"。原因:mangodrive 的 Ext["path"] 是哈希 fid 反推真实
+	// 存储路径的**唯一**来源;一旦某次解析没拿到上下文却把 "null" 写进
+	// links.ext,该行就成了「有列无内容」的坏行 —— 反查若取到它就等于
+	// 没恢复,裸哈希提链必然 404。空上下文一律落空串(不写列),
+	// repo.UpsertLink 侧另有写保护兜底(空值不覆盖原值)。
+	extJSON := ""
+	if len(ext) > 0 {
+		if b, err := json.Marshal(ext); err == nil {
+			extJSON = string(b)
+		}
+	}
 	l := &repo.Link{
 		ShareKey: key, FID: fid, FileName: name, Size: size,
 		DirectLink: dl.URL, ServerLink: dl.ServerURL, UA: dl.UA, Referer: dl.Referer, CookieEnc: cookieEnc,
-		BindIP: dl.BindIP, ExpiresAt: dl.ExpiresAt, Ext: string(extJSON),
+		BindIP: dl.BindIP, ExpiresAt: dl.ExpiresAt, Ext: extJSON,
 	}
 	// 落库失败必须报错:直链未持久化时不得返回看似成功的下载入口(P2-6)。
 	if err := r.store.UpsertLink(l); err != nil {
@@ -507,18 +518,59 @@ func (r *Resolver) buildRef(key, fid string, own bool) (*driver.FileRef, error) 
 		// 哈希 fid 无法从上下文推导路径时,任何一条同 fid 历史缓存都是恢复源。
 		// 仅哈希形态启用:path 形态未命中由 driverStat 兜底,不必扫历史表;
 		// 也杜绝其它驱动形态 fid 撞名时把无关 Ext 注入 FileRef。
-		hist, herr := r.store.FindLinkByFID(fid)
+		ext, herr := r.recoverExtFromHistory(fid)
 		if herr != nil {
 			return nil, fmt.Errorf("query link history: %w", herr)
 		}
-		if hist != nil && hist.Ext != "" {
-			var ext map[string]string
-			if json.Unmarshal([]byte(hist.Ext), &ext) == nil && ext["path"] != "" {
-				ref.Ext = ext
-			}
+		if len(ext) > 0 {
+			ref.Ext = ext
 		}
 	}
 	return ref, nil
+}
+
+// recoverExtFromHistory 从同 fid 的历史缓存行里恢复 driver 上下文(含真实 path)。
+//
+// ★ 必须「挑一条**有 path** 的行」,而不是简单取最新一行:同一 fid 的多行里
+// 可能混有「有列无内容」的坏行 —— 线上历史数据中确有 ext 被写成字面量 "null"
+// 的形态(json.Marshal(nil map) 的产物)。这类行 Unmarshal 后是 nil map,
+// 取到它就等于没恢复 → 裸哈希提链必然 404,而库里明明存在带 path 的可用历史行。
+// 故按新→旧遍历,取第一条能解出非空 path 的行;全都没有才算没历史。
+func (r *Resolver) recoverExtFromHistory(fid string) (map[string]string, error) {
+	ext, _, err := r.recoverHistory(fid)
+	return ext, err
+}
+
+// recoverHistory 一次扫描同时取回「可用历史行」与「它的 ext」。
+// 只扫一遍历史表:两个调用方(buildRef 要 ext、fileMeta 要 ext+名字/大小)
+// 关心的始终是同一行。
+//
+// 候选口径:优先取「带非空 path」的最新行(那是路径恢复源);
+// 若所有行都无 path,退而取最新的**有文件名**的行 —— 仅补展示元数据,
+// 不给 driver 供路径(没有 path 的行对恢复毫无价值)。
+func (r *Resolver) recoverHistory(fid string) (map[string]string, *repo.Link, error) {
+	hist, err := r.store.ListLinksByFID(fid, historyScanLimit)
+	if err != nil {
+		return nil, nil, err
+	}
+	var named *repo.Link
+	for i := range hist {
+		if hist[i].Ext == "" {
+			continue
+		}
+		var ext map[string]string
+		if json.Unmarshal([]byte(hist[i].Ext), &ext) != nil {
+			continue
+		}
+		if ext["path"] == "" {
+			if named == nil && hist[i].FileName != "" {
+				named = &hist[i]
+			}
+			continue
+		}
+		return ext, &hist[i], nil
+	}
+	return nil, named, nil
 }
 
 // fileMeta 取文件展示元数据:先查直链缓存行,再查分享快照;都没有返回空 name 交由调用方兜底。
@@ -549,18 +601,24 @@ func (r *Resolver) fileMeta(key, fid string, ref *driver.FileRef) (string, int64
 	// 哈希 fid 在本分享查不到名字时,同 fid 的历史缓存行有完整元数据。
 	// 残缺行(FileName 空)不算命中,落到调用方的 driverStat 兜底。
 	if isHashFid(fid) {
-		hist, herr := r.store.FindLinkByFID(fid)
+		ext, hist, herr := r.recoverHistory(fid)
 		if herr != nil {
 			return "", 0, nil, fmt.Errorf("query link history: %w", herr)
 		}
+		// 名字/大小同样取「内容完整」的那条历史行:坏行(ext=null)的 FileName
+		// 常常也是兜底出来的「文件」+0,拿它当展示元数据不如不拿。
 		if hist != nil && hist.FileName != "" {
-			var ext map[string]string
-			_ = json.Unmarshal([]byte(hist.Ext), &ext)
 			return hist.FileName, hist.Size, ext, nil
 		}
 	}
 	return "", 0, ref.Ext, nil
 }
+
+// historyScanLimit 历史反查时扫描同 fid 历史行的上限。
+// 行数 = 曾缓存过该 fid 的分享上下文数(share_key 各不相同),量级很小;
+// 上限要盖得住「前面若干行都是坏行(无有效 path)、可用行在更早」的情形,
+// 故取宽松值。扫描按 idx_fid_created 索引序进行,本身廉价。
+const historyScanLimit = 64
 
 // isHashFid 哈希形态 fid 判定(mangodrive 对超长路径生成 "p:<sha1>",不可逆)。
 // 仅哈希形态启用历史反查:path 形态 fid 未命中由 driverStat 兜底,省一次全局扫;

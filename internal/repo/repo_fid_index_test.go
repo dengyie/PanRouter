@@ -57,7 +57,7 @@ func TestFindLinkByFIDUsesIndexWithoutTempBTree(t *testing.T) {
 	//    EXPLAIN 的是**GORM 真实发出的 SQL**(DryRun 会话捕获),不是手抄近似——
 	//    手抄版约束不到 GORM 是否偷偷追加主键 tiebreaker,正是 P1 的漏网之处。
 	dry := s.db.Session(&gorm.Session{DryRun: true})
-	stmt := s.linkByFIDQuery(dry, fid).Take(&Link{}).Statement
+	stmt := s.linkByFIDQuery(dry, fid).Limit(1).Find(&Link{}).Statement
 	realSQL := stmt.SQL.String()
 	if realSQL == "" {
 		t.Fatal("未能捕获 GORM 实际 SQL")
@@ -118,15 +118,15 @@ func TestFindLinkByFIDUsesIndexWithoutTempBTree(t *testing.T) {
 	}
 
 	// ② 返回行为:created_at 最大者;并列时 id 最大者。
-	got, err := s.FindLinkByFID(fid)
+	got, err := s.ListLinksByFID(fid, 1)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got == nil {
-		t.Fatal("应命中历史行")
+	if len(got) != 1 {
+		t.Fatalf("应命中一条历史行,got %d", len(got))
 	}
-	if got.FileName != "f4.bin" {
-		t.Fatalf("应取 created_at 最大者 f4.bin,got %s", got.FileName)
+	if got[0].FileName != "f4.bin" {
+		t.Fatalf("应取 created_at 最大者 f4.bin,got %s", got[0].FileName)
 	}
 
 	// created_at 并列 → 取 id 最大者(后写入的那条)。
@@ -144,19 +144,31 @@ func TestFindLinkByFIDUsesIndexWithoutTempBTree(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	got, err = s.FindLinkByFID(fid)
+	got, err = s.ListLinksByFID(fid, 1)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got == nil || got.FileName != "tie2.bin" {
+	if len(got) != 1 || got[0].FileName != "tie2.bin" {
 		t.Fatalf("created_at 并列应取 id 最大者 tie2.bin,got %+v", got)
 	}
 
-	// 边界:空 fid 与不存在的 fid 都返回 (nil, nil),不报错。
-	if l, err := s.FindLinkByFID(""); err != nil || l != nil {
-		t.Fatalf("空 fid 应返回 (nil,nil),got %v %v", l, err)
+	// 边界:空 fid 与不存在的 fid 都返回空集,不报错。
+	if l, err := s.ListLinksByFID("", 5); err != nil || len(l) != 0 {
+		t.Fatalf("空 fid 应返回空集,got %v %v", l, err)
 	}
-	if l, err := s.FindLinkByFID("p:doesnotexist"); err != nil || l != nil {
-		t.Fatalf("不存在的 fid 应返回 (nil,nil),got %v %v", l, err)
+	if l, err := s.ListLinksByFID("p:doesnotexist", 5); err != nil || len(l) != 0 {
+		t.Fatalf("不存在的 fid 应返回空集,got %v %v", l, err)
+	}
+
+	// ③ 多行返回:按新→旧倒序,limit 生效(供调用方挑「有 path 的那一条」)。
+	all, err := s.ListLinksByFID(fid, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(all) != 2 {
+		t.Fatalf("limit=2 应返回 2 行,got %d", len(all))
+	}
+	if all[0].FileName != "tie2.bin" {
+		t.Fatalf("第 1 行应为最新(tie2.bin),got %s", all[0].FileName)
 	}
 }
