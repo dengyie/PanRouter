@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/url"
 	"strings"
 	"sync"
 	"time"
@@ -574,9 +575,24 @@ func (r *Resolver) buildRef(key, fid string, own bool) (*driver.FileRef, error) 
 //   - 节点按 fid 精确匹配,且该节点的 Ext 必须携带内容(非空 map);
 //   - 命中即返回,不做「合并多个来源」——不同来源的 stoken 可能互相矛盾,
 //     混用比不混用更危险(夸克 stoken 与 pwd_id 必须同源)。
+//
+// ★ 必须校验「同一份分享」:fid 不是全局唯一的 ——
+//   - 蓝奏云的 fid 恒为 "file"(每个分享的单文件节点都叫 "file");
+//   - 不同分享/不同目录的节点 fid 也可能撞名。
+//     若不校验分享身份,自愈会把**别的分享**的上下文(蓝奏云的 share_url/pwd)
+//     注入本次请求 → 提链指向另一个分享的文件,且用户毫不知情 ——
+//     静默给错文件比提链失败危险得多。
+//     判定口径见 sameShareIdentity。
 func (r *Resolver) healShareNode(key, fid string) (*driver.FileNode, error) {
 	pan := r.panOfShareKey(key)
 	if pan == "" {
+		return nil, nil
+	}
+	self, err := r.store.GetShare(key)
+	if err != nil {
+		return nil, err
+	}
+	if self == nil {
 		return nil, nil
 	}
 	shares, err := r.store.ListSharesByPan(pan)
@@ -598,11 +614,206 @@ func (r *Resolver) healShareNode(key, fid string) (*driver.FileNode, error) {
 			if nodes[j].FID != fid || len(nodes[j].Ext) == 0 {
 				continue
 			}
+			if !sameShareIdentity(self, &shares[i], &nodes[j]) {
+				continue // 不是同一份分享的节点:不得拿它的上下文
+			}
 			n := nodes[j]
 			return &n, nil
 		}
 	}
 	return nil, nil
+}
+
+// sameShareIdentity 判断候选快照里的节点是否属于**同一份分享**。
+//
+// ★ 自愈的安全闸:fid 不是全局唯一标识 ——
+//   - 蓝奏云每个分享的单文件节点 fid 恒为 "file";
+//   - 不同分享的节点 fid 也可能撞名。
+//     拿错上下文的后果是「提链指向另一个分享的文件」,且用户完全无感。
+//
+// 硬门槛:host 必须相同。不同 host = 不同的分享站点(夸克 / 蓝奏云 /
+// Google Drive 聚合站),绝不可能是同一份分享;而「同一份分享的不同 URL 形态」
+// (根链 vs 深链)host 必然相同。
+//
+// 硬门槛之后,按「由强到弱」逐条比对,任一条命中即视为同一份分享:
+//
+//  1. 分享 id:quark 的 /s/<id> 与节点 Ext["pwd_id"] 是同一个值,
+//     蓝奏云的 /iXXXX 也在路径里。id 相同即同一份分享(与 URL 形态无关)。
+//  2. pwd_id 相同(两侧快照都带时)。
+//  3. host+path 相同:同一份分享的两种 URL 形态
+//     (根链 "/s/xxx" 与深链 "/s/xxx#/list/share/yyy")path 相同。
+//  4. 路径前缀(mangodrive):节点的 Ext["path"] 以本分享 URL 的 path 为前缀
+//     → 同一棵目录树下的文件。
+//
+// 四条都判不出来 → 视为**不是**同一份分享(宁可不自愈,也不给错文件)。
+func sameShareIdentity(self *repo.Share, cand *repo.Share, node *driver.FileNode) bool {
+	if self == nil || cand == nil {
+		return false
+	}
+	selfHost := hostOf(self.ShareURL)
+	candHost := hostOf(cand.ShareURL)
+	// 节点自带的 share_url(蓝奏云)也参与 host 判定:它才是真正被解析的地址。
+	nodeURLs := []string{node.Ext["share_url"]}
+	if selfHost == "" {
+		return false
+	}
+	if candHost != "" && candHost != selfHost {
+		return false
+	}
+	for _, u := range nodeURLs {
+		if h := hostOf(u); h != "" && h != selfHost {
+			return false
+		}
+	}
+	selfID := shareIDOf(self.ShareURL)
+	selfPwd := shareIdentityOf(self, "pwd_id")
+	selfPath := hostPathOf(self.ShareURL)
+	candURLs := append([]string{cand.ShareURL}, nodeURLs...)
+
+	// ① 分享 id:候选节点的 pwd_id 或候选 URL 里的 id 与本分享 id 相同。
+	if selfID != "" {
+		if node.Ext["pwd_id"] != "" && node.Ext["pwd_id"] == selfID {
+			return true
+		}
+		for _, u := range candURLs {
+			if shareIDOf(u) == selfID {
+				return true
+			}
+		}
+	}
+	// ② pwd_id 相同(两侧快照都带时)。
+	if selfPwd != "" && node.Ext["pwd_id"] != "" && selfPwd == node.Ext["pwd_id"] {
+		return true
+	}
+	// ③ host+path 相同。
+	if selfPath != "" {
+		for _, u := range candURLs {
+			if hostPathOf(u) == selfPath {
+				return true
+			}
+		}
+	}
+	// ④ 路径前缀(mangodrive 的 fid 就是存储路径,目录树关系最可靠)。
+	if p := node.Ext["path"]; p != "" && sharePathOf(self.ShareURL) != "" {
+		if pathHasPrefix(p, sharePathOf(self.ShareURL)) {
+			return true
+		}
+	}
+	return false
+}
+
+// hostOf 取 URL 的 host(小写);解析失败或为空返回空串。
+func hostOf(raw string) string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return ""
+	}
+	u, err := url.Parse(raw)
+	if err != nil {
+		return ""
+	}
+	return strings.ToLower(u.Host)
+}
+
+// pathHasPrefix 判定 b 是否为 a 的**目录段**前缀("/a/b" 以 "/a" 为前缀,
+// 但 "/ab" 不是 "/a" 的前缀 —— 段边界必须对齐)。
+func pathHasPrefix(p, prefix string) bool {
+	p = strings.TrimSuffix(strings.TrimSpace(p), "/")
+	prefix = strings.TrimSuffix(strings.TrimSpace(prefix), "/")
+	if prefix == "" {
+		return false
+	}
+	return p == prefix || strings.HasPrefix(p, prefix+"/")
+}
+
+// shareIdentityOf 从快照自身推导某个身份字段:取其第一个节点的 Ext 值。
+// 快照是空壳(坏行)时返回空串 —— 此时只能靠分享 URL 侧的判据。
+func shareIdentityOf(sh *repo.Share, field string) string {
+	if sh == nil || !repo.RawTreeHasContent(sh.RawTree) {
+		return ""
+	}
+	var nodes []driver.FileNode
+	if json.Unmarshal([]byte(sh.RawTree), &nodes) != nil {
+		return ""
+	}
+	for i := range nodes {
+		if v := nodes[i].Ext[field]; v != "" {
+			return v
+		}
+	}
+	return ""
+}
+
+// hostPathOf 取分享 URL 的 host+path(去掉 query、fragment 与尾部斜杠)。
+// quark 的 "/s/xxx" 与 "/s/xxx#/list/share/yyy" 的 path 都是 "/s/xxx",
+// 故 host+path 相同即可判定为同一份分享的不同 URL 形态。
+func hostPathOf(raw string) string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return ""
+	}
+	u, err := url.Parse(raw)
+	if err != nil {
+		return ""
+	}
+	p := strings.TrimSuffix(u.Path, "/")
+	if p == "" {
+		return ""
+	}
+	return strings.ToLower(u.Host) + p
+}
+
+// shareIDOf 从分享 URL 的路径里取网盘自己的分享 id
+// (quark 的 "/s/AbCdEf123456" → "AbCdEf123456",蓝奏云的 "/iNrjO4afcy0b" → "iNrjO4afcy0b"),
+// 取不到返回空串。
+//
+// ★ 这是最可靠的「同一份分享」判据:分享 id 直接嵌在路径里,
+//
+//	与 URL 形态(根链/深链)无关 —— 同一份分享的两种形态拿到同一个 id。
+func shareIDOf(raw string) string {
+	p := sharePathOf(raw)
+	if p == "" {
+		return ""
+	}
+	seg := strings.Split(strings.Trim(p, "/"), "/")
+	last := seg[len(seg)-1]
+	if last == "" {
+		return ""
+	}
+	// id 形态:字母数字组合且至少含一个数字,长度 >= 6 —— 排除 "share"/"list"/
+	// "out" 这类纯路径词,避免把目录名误当分享 id。
+	if len(last) >= 6 && isShareIDLike(last) {
+		return last
+	}
+	return ""
+}
+
+// sharePathOf 取分享 URL 的路径部分(去掉 host、query、fragment 与尾部斜杠)。
+func sharePathOf(raw string) string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return ""
+	}
+	u, err := url.Parse(raw)
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSuffix(u.Path, "/")
+}
+
+// isShareIDLike 判定末段是否像网盘分享 id(纯字母数字,且至少含一个数字)。
+func isShareIDLike(s string) bool {
+	hasDigit := false
+	for _, c := range s {
+		switch {
+		case c >= '0' && c <= '9':
+			hasDigit = true
+		case c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z':
+		default:
+			return false
+		}
+	}
+	return hasDigit
 }
 
 // healShareContext 是 healShareNode 的上下文-only 包装。

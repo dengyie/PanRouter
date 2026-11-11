@@ -26,7 +26,9 @@ func (d *ctxDriver) ResolveShare(context.Context, driver.ShareLink, *driver.Cred
 }
 
 func (d *ctxDriver) GetDirectLink(_ context.Context, _ *driver.Credential, ref driver.FileRef) (driver.DirectLink, error) {
-	if ref.Ext == nil || ref.Ext["pwd_id"] == "" {
+	// 上下文齐备的判据:夸克形态带 pwd_id,蓝奏云形态带 share_url —— 任一存在即可。
+	// 刻意不校验分享身份:身份校验是 resolver 的职责,由独立用例覆盖。
+	if ref.Ext == nil || (ref.Ext["pwd_id"] == "" && ref.Ext["share_url"] == "") {
 		return driver.DirectLink{}, driver.NewErr(driver.KindNotFound, "缺少夸克分享上下文,请重新解析", nil)
 	}
 	return driver.DirectLink{URL: "https://up.invalid/" + ref.FID, ExpiresAt: time.Now().Add(time.Hour)}, nil
