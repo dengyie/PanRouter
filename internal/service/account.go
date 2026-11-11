@@ -88,6 +88,12 @@ func (s *AccountService) checkAcc(ctx context.Context, acc *repo.Account, drv dr
 		status := "expired"
 		if st.Valid {
 			status = "ok"
+			// ★ 健康检查成功**不得**解除风控冷却:cooling 的复位路径只有一条
+			//   (PickAccount 里 cooldown_until 到期自动复位),否则一次「碰巧
+			//   有效」的探测就把被风控的账号写回 ok,冷却形同虚设。
+			if acc.Status == "cooling" {
+				status = "cooling"
+			}
 		}
 		if err := s.store.UpdateAccountCheck(acc.ID, status, now, acc.Status); err != nil {
 			return st, err
@@ -107,22 +113,17 @@ func (s *AccountService) checkAcc(ctx context.Context, acc *repo.Account, drv dr
 }
 
 // MarkStatus 供 resolver 在 AuthExpired 时标记账号失效。
+// ★ 只写 status 列,不做「读整行 → 改内存 → 写回整行」:整行回写会拿一次
+//   可能已过期的快照把 cooldown_until / cred_version 等并发改动一起冲掉
+//   (如 MarkStatus 与 MarkCooldown 并发时,后写者用旧值复活冷却/凭据代际)。
 func (s *AccountService) MarkStatus(accID uint, status string) {
-	if acc, err := s.store.GetAccount(accID); err == nil && acc != nil {
-		acc.Status = status
-		_ = s.store.UpdateAccount(acc)
-	}
+	_ = s.store.MarkAccountStatus(accID, status)
 	s.RefreshStatusMetrics()
 }
 
-// MarkCooldown 风控时给账号降温。
+// MarkCooldown 风控时给账号降温。同样只写涉及的列(见 MarkStatus)。
 func (s *AccountService) MarkCooldown(accID uint, d time.Duration) {
-	if acc, err := s.store.GetAccount(accID); err == nil && acc != nil {
-		until := time.Now().Add(d)
-		acc.CooldownUntil = &until
-		acc.Status = "cooling"
-		_ = s.store.UpdateAccount(acc)
-	}
+	_ = s.store.MarkAccountCooldown(accID, time.Now().Add(d))
 	s.RefreshStatusMetrics()
 }
 

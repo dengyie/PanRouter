@@ -41,6 +41,8 @@ func (d *e2eDriver) ResolveShare(context.Context, driver.ShareLink, *driver.Cred
 		{FID: "f1", Name: "plain.bin", Size: 12, Ext: map[string]string{}},
 		{FID: "fcookie", Name: "withcookie.bin", Size: 11, Ext: map[string]string{}},
 		{FID: "fbind", Name: "bound.bin", Size: 11, Ext: map[string]string{}},
+		// path 形态 fid(含 "/",mangodrive 的真实形态):回归下载入口 URL 编码
+		{FID: "/deep/dir/f.bin", Name: "deep.bin", Size: 5, Ext: map[string]string{"path": "/deep/dir/f.bin"}},
 	}, nil
 }
 
@@ -54,6 +56,8 @@ func (d *e2eDriver) GetDirectLink(_ context.Context, _ *driver.Credential, ref d
 		}, nil
 	case "fbind": // 绑定解析 IP → cloud 画像或 aria2 异机时走中转
 		return driver.DirectLink{URL: d.upstream + "/file/b", BindIP: true, ExpiresAt: time.Now().Add(time.Hour)}, nil
+	case "/deep/dir/f.bin": // 路径形态 fid:裸链 → 浏览器 302
+		return driver.DirectLink{URL: d.upstream + "/file/deep", ExpiresAt: time.Now().Add(time.Hour)}, nil
 	default: // f1:裸链 → 浏览器 302
 		return driver.DirectLink{URL: d.upstream + "/file/f1", ExpiresAt: time.Now().Add(time.Hour)}, nil
 	}
@@ -78,6 +82,8 @@ func e2eUpstream() *httptest.Server {
 			_, _ = w.Write([]byte("UPSTREAM-c"))
 		case "/file/b":
 			_, _ = w.Write([]byte("UPSTREAM-b"))
+		case "/file/deep":
+			_, _ = w.Write([]byte("UPSTREAM-deep"))
 		default:
 			w.WriteHeader(http.StatusNotFound)
 		}
@@ -310,7 +316,7 @@ func TestE2EResolveAndRoute302(t *testing.T) {
 
 	// 分享列表:一次解析即自动提链,文件行应带 download_url
 	st, body := e.do(t, "POST", "/api/v1/resolve", e.token, `{"url":"`+e2eShareURL+`"}`)
-	if st != http.StatusOK || len(body["files"].([]any)) != 3 {
+	if st != http.StatusOK || len(body["files"].([]any)) != 4 {
 		t.Fatalf("share: %d %v", st, body)
 	}
 	first := body["files"].([]any)[0].(map[string]any)

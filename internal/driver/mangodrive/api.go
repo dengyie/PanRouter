@@ -223,10 +223,15 @@ func (a *API) Put(ctx context.Context, p string, size int64, r io.Reader) error 
 		return driver.NewErr(driver.KindUpstream, "Mango Drive 上传失败", err)
 	}
 	var resp apiResp
-	if len(res.Body) > 0 {
-		if err := json.Unmarshal(res.Body, &resp); err != nil {
-			return driver.NewErr(driver.KindInterfaceChanged, "Mango Drive 上传响应结构变化", err)
-		}
+	// ★ 200 + 空 body 不是成功:OpenList 的 fs/put 正常必回 {"code":200,...}。
+	//   空 body 意味着代理截断/协议异常,此时 resp.Code 恒为 0,若按「code==0
+	//   即成功」处理,转存会报 done 而远端**没有文件**(静默丢文件)。
+	if len(res.Body) == 0 {
+		return driver.NewErr(driver.KindUpstream,
+			fmt.Sprintf("Mango Drive 上传响应为空(HTTP %d),无法确认结果", res.StatusCode), nil)
+	}
+	if err := json.Unmarshal(res.Body, &resp); err != nil {
+		return driver.NewErr(driver.KindInterfaceChanged, "Mango Drive 上传响应结构变化", err)
 	}
 	if res.StatusCode >= 400 || (resp.Code != 0 && resp.Code != http.StatusOK) {
 		msg := resp.Message

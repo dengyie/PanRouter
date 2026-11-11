@@ -95,6 +95,12 @@ type DirectLink struct {
 	Cookie    string // 直链需携带的 Cookie;非空则浏览器 302 不可用
 	BindIP    bool   // 直链绑定解析出口 IP(cloud 画像下浏览器 302 不可用)
 	ExpiresAt time.Time
+	// Name/Size 是 driver 提链途中**顺带**拿到的文件元数据(如 mangodrive 的
+	// fs/get 响应本就含 name/size);空/零 = driver 不知道,调用方按原兜底走。
+	// 背景:缓存/快照/历史都查不到元数据时(如 mangodrive 根 URL + 深路径 fid),
+	// 此前只能落兜底名「文件」+0 —— 而信息其实就在提链响应里。
+	Name string
+	Size int64
 }
 
 // ---- 接口 ----

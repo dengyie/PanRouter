@@ -241,7 +241,12 @@ func (d *Deps) handleQRPoll(w http.ResponseWriter, r *http.Request) {
 }
 
 func (d *Deps) handleDeleteAccount(w http.ResponseWriter, r *http.Request) {
-	id, _ := strconv.ParseUint(chi.URLParam(r, "id"), 10, 64)
+	id, err := strconv.ParseUint(chi.URLParam(r, "id"), 10, 64)
+	if err != nil {
+		// 解析失败不得吞掉:id=0 会命中「不存在」以外的分支并写入误导性审计
+		writeErr(w, driver.NewErr(driver.KindUnsupported, "账号 id 无效", err))
+		return
+	}
 	if err := d.Accounts.Delete(uint(id)); err != nil {
 		writeErr(w, err)
 		return
@@ -250,7 +255,11 @@ func (d *Deps) handleDeleteAccount(w http.ResponseWriter, r *http.Request) {
 }
 
 func (d *Deps) handleRefreshAccount(w http.ResponseWriter, r *http.Request) {
-	id, _ := strconv.ParseUint(chi.URLParam(r, "id"), 10, 64)
+	id, err := strconv.ParseUint(chi.URLParam(r, "id"), 10, 64)
+	if err != nil {
+		writeErr(w, driver.NewErr(driver.KindUnsupported, "账号 id 无效", err))
+		return
+	}
 	st, err := d.Accounts.Refresh(r.Context(), uint(id), func(pan string) (driver.Driver, bool) {
 		return d.Resolver.Registry().Get(pan)
 	})

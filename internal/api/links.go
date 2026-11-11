@@ -1,7 +1,6 @@
 package api
 
 import (
-	"fmt"
 	"net/http"
 
 	"github.com/go-chi/chi/v5"
@@ -11,10 +10,17 @@ import (
 )
 
 // verifySig 校验 /d、/stream 的 HMAC 签名(签名 payload 与签发端一致)。
+//
+// ★ fid 是经过 FIDPathSeg 编码后放入路径段的(可能含 "%2F"),这里必须先解回
+//   原始 fid 再验签 —— 签名 payload 是编码前的规范形(见 service/dlurl.go)。
 func (d *Deps) verifySig(w http.ResponseWriter, r *http.Request) (pan, key, fid string, ok bool) {
 	pan = chi.URLParam(r, "pan")
 	key = chi.URLParam(r, "key")
-	fid = chi.URLParam(r, "fid")
+	fid, err := service.FIDFromPathSeg(chi.URLParam(r, "fid"))
+	if err != nil {
+		writeErr(w, driver.NewErr(driver.KindNotFound, "fid 编码无效,请重新解析", err))
+		return "", "", "", false
+	}
 	if err := d.Signer.Verify(pan+"|"+key+"|"+fid, r.URL.Query().Get("sig")); err != nil {
 		writeErr(w, driver.NewErr(driver.KindNotFound, "签名无效或已过期,请重新解析", err))
 		return "", "", "", false
@@ -42,7 +48,7 @@ func (d *Deps) handleDownload302(w http.ResponseWriter, r *http.Request) {
 		// 浏览器无法满足直链约束 → 降级中转,用户无感
 		sig := d.Signer.Sign(pan+"|"+key+"|"+fid, cfg.Server.EffectiveSignTTL())
 		d.Met.Inc("panrouter_download_route_total", map[string]string{"pan": pan, "route": "stream"})
-		http.Redirect(w, r, fmt.Sprintf("/stream/%s/%s/%s?sig=%s", pan, key, fid, sig), http.StatusFound)
+		http.Redirect(w, r, service.EntryURL("", "stream", pan, key, fid, sig), http.StatusFound)
 		return
 	}
 	d.Met.Inc("panrouter_download_route_total", map[string]string{"pan": pan, "route": "302"})
@@ -89,8 +95,8 @@ func (d *Deps) handleDirectJSON(w http.ResponseWriter, r *http.Request) {
 		"size":         link.Size,
 		"route":        service.Route(meta, env),
 		"direct_link":  link.DirectLink,
-		"download_url": fmt.Sprintf("%s/d/%s/%s/%s?sig=%s", base, pan, key, fid, sig),
-		"stream_url":   fmt.Sprintf("%s/stream/%s/%s/%s?sig=%s", base, pan, key, fid, sig),
+		"download_url": service.EntryURL(base, "d", pan, key, fid, sig),
+		"stream_url":   service.EntryURL(base, "stream", pan, key, fid, sig),
 		"ua":           link.UA,
 		"referer":      link.Referer,
 		"need_headers": service.NeedHeaders(link.UA, link.Referer, string(cookie), ua),

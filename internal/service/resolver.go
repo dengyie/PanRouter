@@ -424,7 +424,16 @@ func (r *Resolver) ResolveFile(ctx context.Context, rawURL, pwd, fid string, own
 		}
 		if cached.ExpiresAt.After(time.Now()) {
 			r.met.Inc("panrouter_link_cache_hit_total", map[string]string{"pan": pan})
-			return r.buildResult(pan, key, cached, clientUA, true), nil
+			res := r.buildResult(pan, key, cached, clientUA, true)
+			if linkMetaIsPlaceholder(res.FileName, res.Size) {
+				// 直链仍新鲜但元数据是历史占位值:直链复用缓存,展示名/大小
+				// 再找一遍(快照/自愈/历史),不让「文件」+0 顶着真文件出场。
+				if name, size, _, merr := r.fileMeta(key, fid, &driver.FileRef{FID: fid}); merr == nil &&
+					!linkMetaIsPlaceholder(name, size) {
+					res.FileName, res.Size = name, size
+				}
+			}
+			return res, nil
 		}
 	}
 
@@ -453,15 +462,23 @@ func (r *Resolver) ResolveFile(ctx context.Context, rawURL, pwd, fid string, own
 	if merr != nil {
 		return nil, merr
 	}
-	if name == "" {
+	if linkMetaIsPlaceholder(name, size) {
+		// driver 提链途中带回的元数据(mangodrive 的 fs/get 响应)优先于回问
+		// driver 列目录:信息就在手上,不必再打一次上游。
+		if dl.Name != "" {
+			name, size = dl.Name, dl.Size
+		}
+	}
+	if linkMetaIsPlaceholder(name, size) {
 		// 调用方直接给了 fid(如 mangodrive 的 FID 就是存储路径)却没先列过分享:
 		// 缓存与分享快照里都没有名字/大小,回问 driver 一次,别把「文件」+0 发出去。
 		if n, s := r.driverStat(ctx, drv, rawURL, fid, cred); n != "" {
 			name, size = n, s
 		}
 	}
-	if name == "" {
-		name = "文件"
+	if linkMetaIsPlaceholder(name, size) {
+		name = placeholderFileName
+		size = 0
 	}
 	cookieEnc, err := r.aes.EncryptBytes([]byte(dl.Cookie))
 	if err != nil {
@@ -511,7 +528,11 @@ func (r *Resolver) buildRef(key, fid string, own bool) (*driver.FileRef, error) 
 	if l != nil && l.Ext != "" {
 		_ = json.Unmarshal([]byte(l.Ext), &ref.Ext)
 	}
-	if len(ref.Ext) == 0 {
+	// ★ 上下文有效性按「语义有效」判定(extHasValue),不能只看 len(map)>0:
+	//   历史坏行 {"api":""}(mangodrive 的恒空 api 键)是「有键无值」,拿它当
+	//   有效上下文会把后面的快照/自愈/历史恢复链全部短路 → 哈希 fid 提链必然
+	//   404,而库里明明有可用行(v2.9 之前写入的形态)。
+	if !extHasValue(ref.Ext) {
 		sh, err := r.store.GetShare(key)
 		if err != nil {
 			return nil, fmt.Errorf("query share snapshot: %w", err)
@@ -520,7 +541,7 @@ func (r *Resolver) buildRef(key, fid string, own bool) (*driver.FileRef, error) 
 			var nodes []driver.FileNode
 			if json.Unmarshal([]byte(sh.RawTree), &nodes) == nil {
 				for _, n := range nodes {
-					if n.FID == fid {
+					if n.FID == fid && extHasValue(n.Ext) {
 						ref.Ext = n.Ext
 						break
 					}
@@ -537,16 +558,16 @@ func (r *Resolver) buildRef(key, fid string, own bool) (*driver.FileRef, error) 
 	//   sha1(pan|url|pwd),同一份分享的「/s/xxx」与「/s/xxx#/list/share/yyy」
 	//   是两个 key、两条快照 —— 另一条里往往还留着完整的 pwd_id/stoken。
 	//   只在同一 pan_type 内扫:不同网盘的 fid 空间互不相通,跨网盘取上下文必然串味。
-	if len(ref.Ext) == 0 && !own {
+	if !extHasValue(ref.Ext) && !own {
 		healed, herr := r.healShareContext(key, fid)
 		if herr != nil {
 			return nil, fmt.Errorf("heal share context: %w", herr)
 		}
-		if len(healed) > 0 {
+		if extHasValue(healed) {
 			ref.Ext = healed
 		}
 	}
-	if len(ref.Ext) == 0 && isHashFid(fid) {
+	if !extHasValue(ref.Ext) && isHashFid(fid) {
 		// 哈希 fid 无法从上下文推导路径时,任何一条同 fid 历史缓存都是恢复源。
 		// 仅哈希形态启用:path 形态未命中由 driverStat 兜底,不必扫历史表;
 		// 也杜绝其它驱动形态 fid 撞名时把无关 Ext 注入 FileRef。
@@ -554,11 +575,25 @@ func (r *Resolver) buildRef(key, fid string, own bool) (*driver.FileRef, error) 
 		if herr != nil {
 			return nil, fmt.Errorf("query link history: %w", herr)
 		}
-		if len(ext) > 0 {
+		if extHasValue(ext) {
 			ref.Ext = ext
 		}
 	}
 	return ref, nil
+}
+
+// extHasValue 判断解码后的 driver 上下文是否**语义有效**:至少携带一个非空值。
+// len(map)>0 只说明有键 —— 历史坏行 {"api":""} 形态(mangodrive 的恒空 api 键,
+// mangodrive.nodeOf 现行写法)会以「有键无值」冒充有效上下文。与 repo 层的
+// extHasContent(针对**原始字符串**列的写保护口径)是两回事:一个判列内容,
+// 一个判解码后的语义。
+func extHasValue(m map[string]string) bool {
+	for _, v := range m {
+		if v != "" {
+			return true
+		}
+	}
+	return false
 }
 
 // healShareNode 在本分享快照是空壳时,从同一网盘**别的** share_key 快照里
@@ -597,7 +632,10 @@ func (r *Resolver) healShareNode(key, fid string) (*driver.FileNode, error) {
 	if err != nil {
 		return nil, err
 	}
-	for i := range shares {
+	// 逆序消费(id 降序 = 最新快照优先):同一份分享的多条快照里,最新的那条
+	// 上下文最新(quark 的 stoken 有时效)。取最旧的命中会拿过期上下文 ——
+	// 夸克还有 stoken 过期重试兜底,mangodrive 的 path 缺失就直接 404。
+	for i := len(shares) - 1; i >= 0; i-- {
 		if shares[i].ShareKey == key {
 			continue // 本分享自己的快照已查过
 		}
@@ -609,7 +647,7 @@ func (r *Resolver) healShareNode(key, fid string) (*driver.FileNode, error) {
 			continue
 		}
 		for j := range nodes {
-			if nodes[j].FID != fid || len(nodes[j].Ext) == 0 {
+			if nodes[j].FID != fid || !extHasValue(nodes[j].Ext) {
 				continue
 			}
 			if !sameShareIdentity(self, &shares[i], &nodes[j]) {
@@ -857,7 +895,7 @@ func (r *Resolver) recoverHistory(fid string) (map[string]string, *repo.Link, er
 			continue
 		}
 		if ext["path"] == "" {
-			if named == nil && hist[i].FileName != "" {
+			if named == nil && !linkMetaIsPlaceholder(hist[i].FileName, hist[i].Size) {
 				named = &hist[i]
 			}
 			continue
@@ -868,12 +906,17 @@ func (r *Resolver) recoverHistory(fid string) (map[string]string, *repo.Link, er
 }
 
 // fileMeta 取文件展示元数据:先查直链缓存行,再查分享快照;都没有返回空 name 交由调用方兜底。
+//
+// ★ 直链缓存行可能是「占位元数据」(兜底名「文件」+0)—— 某次解析在缓存/快照/
+//   历史都查不到时落的兜底值。读侧必须跳过它继续找,否则快照/历史里的真实
+//   名字/大小会被占位行**永久遮蔽**(与 v2.9 ext、v2.10 raw_tree 同型的
+//   「有列无内容」问题,只是载体换成 file_name/size)。
 func (r *Resolver) fileMeta(key, fid string, ref *driver.FileRef) (string, int64, map[string]string, error) {
 	l, err := r.store.GetLink(key, fid)
 	if err != nil {
 		return "", 0, nil, fmt.Errorf("query link cache: %w", err)
 	}
-	if l != nil && l.FileName != "" {
+	if l != nil && !linkMetaIsPlaceholder(l.FileName, l.Size) {
 		var ext map[string]string
 		_ = json.Unmarshal([]byte(l.Ext), &ext)
 		return l.FileName, l.Size, ext, nil
@@ -908,11 +951,20 @@ func (r *Resolver) fileMeta(key, fid string, ref *driver.FileRef) (string, int64
 		}
 		// 名字/大小同样取「内容完整」的那条历史行:坏行(ext=null)的 FileName
 		// 常常也是兜底出来的「文件」+0,拿它当展示元数据不如不拿。
-		if hist != nil && hist.FileName != "" {
+		if hist != nil && !linkMetaIsPlaceholder(hist.FileName, hist.Size) {
 			return hist.FileName, hist.Size, ext, nil
 		}
 	}
 	return "", 0, ref.Ext, nil
+}
+
+// placeholderFileName / linkMetaIsPlaceholder:占位元数据的判定口径单一来源在
+// repo.LinkMetaIsPlaceholder(写侧覆盖保护与读侧遮蔽跳过必须同口径),这里只
+// 做包内转发,防止两处口径漂移。
+const placeholderFileName = repo.PlaceholderFileName
+
+func linkMetaIsPlaceholder(name string, size int64) bool {
+	return repo.LinkMetaIsPlaceholder(name, size)
 }
 
 // historyScanLimit 历史反查时扫描同 fid 历史行的上限。
@@ -964,8 +1016,8 @@ func (r *Resolver) buildResult(pan, key string, l *repo.Link, clientUA string, c
 	res := &ResolveFileResult{
 		Pan: pan, ShareKey: key, FID: l.FID, FileName: l.FileName, Size: l.Size,
 		Route:       route,
-		DownloadURL: fmt.Sprintf("%s/d/%s/%s/%s?sig=%s", base, pan, key, l.FID, sig),
-		StreamURL:   fmt.Sprintf("%s/stream/%s/%s/%s?sig=%s", base, pan, key, l.FID, sig),
+		DownloadURL: EntryURL(base, "d", pan, key, l.FID, sig),
+		StreamURL:   EntryURL(base, "stream", pan, key, l.FID, sig),
 		DirectURL:   l.DirectLink,
 		UA:          l.UA,
 		Referer:     l.Referer,

@@ -89,7 +89,7 @@ func (a *Aria2) Push(ctx context.Context, req PushRequest) (*PushResult, error) 
 	} else {
 		// 绑 IP 且 aria2 不同机:走中转 URL(aria2 下载 PanRouter 的 /stream)
 		sig := a.signer.Sign(req.Pan+"|"+req.ShareKey+"|"+req.FID, c.Server.EffectiveSignTTL())
-		target = fmt.Sprintf("%s/stream/%s/%s/%s?sig=%s", c.Server.BaseURL, req.Pan, req.ShareKey, req.FID, sig)
+		target = EntryURL(c.Server.BaseURL, "stream", req.Pan, req.ShareKey, req.FID, sig)
 		route = "stream"
 	}
 
@@ -117,6 +117,10 @@ func (a *Aria2) Push(ctx context.Context, req PushRequest) (*PushResult, error) 
 	}
 	if out.Err != nil {
 		return nil, fmt.Errorf("aria2: %s", out.Err.Message)
+	}
+	// 空 gid 不得落库:会产生查询不到也推不动的僵尸下载记录。
+	if out.Result == "" {
+		return nil, fmt.Errorf("aria2: 响应缺少 result(gid)")
 	}
 	rec := &repo.Download{GID: out.Result, FID: req.FID, Dest: req.Dest, Route: route, Status: "active"}
 	if err := a.store.CreateDownload(rec); err != nil {
@@ -163,6 +167,11 @@ func (a *Aria2) Status(ctx context.Context, gid string) (*TaskStatus, error) {
 	if out.Err != nil {
 		return nil, fmt.Errorf("aria2: %s", out.Err.Message)
 	}
+	// ★ 空响应(网关截断/aria2 重启)时 result 为 nil:直接解引用会 panic
+	//   (被 recoverer 兜成 500 且丢失真实原因),必须显式报上游错误。
+	if out.Result == nil {
+		return nil, fmt.Errorf("aria2: 响应缺少 result 字段")
+	}
 	r := out.Result
 	task := &TaskStatus{
 		GID:       gid,
@@ -173,8 +182,14 @@ func (a *Aria2) Status(ctx context.Context, gid string) (*TaskStatus, error) {
 		Error:     r.ErrorMsg,
 	}
 	if rec, _ := a.store.GetDownload(gid); rec != nil {
-		rec.Status = r.Status
-		rec.ErrMsg = r.ErrorMsg
+		// 上游缺字段(空串)不得覆盖本地已有状态/原因:空 status 会让下游把
+		// 终态任务当非终态永久等待;空 error 把已有失败原因抹掉。
+		if r.Status != "" {
+			rec.Status = r.Status
+		}
+		if r.ErrorMsg != "" {
+			rec.ErrMsg = r.ErrorMsg
+		}
 		_ = a.store.UpdateDownload(rec)
 	}
 	return task, nil

@@ -595,19 +595,24 @@ func (s *Transfer) watchOfflineArtifact(task *TransferTask, destPath string, exp
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), after)
 	defer cancel()
-	// landed 观测产物:必须是非目录且非空;源大小已知时还要不小于它。
+	// landed 观测产物:必须是非目录;源大小已知且 >0 时还要不小于它。
 	// expect<=0(大小未知)时「非空」不足以证明是本次产物:同路径的历史残留
 	// (上一次重传/失败任务的半截文件)同样非空,要求 mtime 不早于任务开始时间。
+	// expect==0 是合法形态(源文件本身 0 字节):此时以 mtime 新鲜度判定,
+	// 否则合法产物永远确认不了 → 确认窗口超时被误报 failed。
 	landed := func(p string) (int64, bool) {
 		obj, err := s.driveAPI().Get(ctx, p)
-		if err != nil || obj == nil || obj.IsDir || obj.Size <= 0 {
+		if err != nil || obj == nil || obj.IsDir {
 			return 0, false
 		}
 		if expect > 0 {
 			if obj.Size < expect {
 				return 0, false
 			}
-		} else if !freshEnough(obj, task.StartedAt) {
+			return obj.Size, true
+		}
+		// expect<=0:大小不再是判据(含合法的 0 字节产物),只认新鲜度。
+		if !freshEnough(obj, task.StartedAt) {
 			return 0, false
 		}
 		return obj.Size, true
@@ -749,10 +754,16 @@ func (s *Transfer) reconcileOfflineArtifact(task *TransferTask, destPath string,
 	}
 	for i := range objs {
 		o := &objs[i]
-		if o.IsDir || o.Size <= 0 || !freshEnough(o, task.StartedAt) {
-			continue
-		}
-		if expect > 0 && o.Size < expect {
+		// expect==0(源文件 0 字节)是合法形态:非空判据会让合法产物永远对不上,
+		// 此时只认新鲜度;expect>0 才要求非空且不小于期望。
+		if expect > 0 {
+			if o.IsDir || o.Size <= 0 || !freshEnough(o, task.StartedAt) {
+				continue
+			}
+			if o.Size < expect {
+				continue
+			}
+		} else if o.IsDir || !freshEnough(o, task.StartedAt) {
 			continue
 		}
 		// 认领守卫:同目录并发转存(claimDest 只互斥同路径)下,目录里可能有
@@ -888,10 +899,22 @@ func (s *Transfer) resolveSource(ctx context.Context, req TransferRequest) (*tra
 			return nil, err
 		}
 		pan = sh.Pan
+		// 只挑自动提链成功的文件:LinkError 非空说明该文件的直链已试过且失败,
+		// 拿它当转存源只会原样复现失败 → 整次转存退出,后面的可用文件永无机会。
+		// 全部都失败时退回第一个候选:让 ResolveFile 给出**真实**上游错误,
+		// 比误报「分享中没有可转存的文件」更有诊断价值。
 		for _, f := range sh.Files {
-			if f.FID != "" && !f.IsDir {
+			if f.FID != "" && !f.IsDir && f.LinkError == "" {
 				fid = f.FID
 				break
+			}
+		}
+		if fid == "" {
+			for _, f := range sh.Files {
+				if f.FID != "" && !f.IsDir {
+					fid = f.FID
+					break
+				}
 			}
 		}
 		if fid == "" {
@@ -1126,6 +1149,14 @@ func (s *Transfer) transferStream(ctx context.Context, task *TransferTask, src *
 	if size > 0 && done != size {
 		return driver.NewErr(driver.KindUpstream,
 			"上传字节数不一致:期望 "+strconv.FormatInt(size, 10)+" 实收 "+strconv.FormatInt(done, 10), nil)
+	}
+	// ★ 上游 200 但**零字节**不是成功:直链失效/风控常以空 body 200 出现。
+	//   size==0 有两种来源——chunked(未知长度,合法)与真的空响应,单看响应头
+	//   不可区分;但源文件的元数据大小(src.size)是独立证据:登记了非零大小却
+	//   一个字节都没收到,必然是异常,不得落一个 0 字节产物还标 done。
+	if size == 0 && done == 0 && src.size > 0 {
+		return driver.NewErr(driver.KindUpstream,
+			"上游返回空内容:解析时登记 "+strconv.FormatInt(src.size, 10)+" 字节,实收 0", nil)
 	}
 	return nil
 }

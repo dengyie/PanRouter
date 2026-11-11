@@ -55,7 +55,9 @@ func (d *Driver) tmpDir(ctx context.Context, cred *driver.Credential) (string, e
 		dbg("tmpDir mkdir notOK code=%d msg=%s → findTmpDir", resp.Code, resp.Message)
 		fid, ferr := d.findTmpDir(ctx, cred)
 		if ferr != nil {
-			return "", err
+			// 必须返回 ferr:err 是 mkdir 的「目录已存在」类业务错,拿它冒充
+			// 查找失败会让上游把可重试的冲突误分类成别的错误类别。
+			return "", ferr
 		}
 		dbg("tmpDir findTmpDir key=%s fid=%s", key, fid)
 		d.storeTmpDir(key, fid)

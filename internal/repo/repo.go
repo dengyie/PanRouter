@@ -220,7 +220,27 @@ func (s *Store) UpsertLink(l *Link) error {
 	if extHasContent(l.Ext) {
 		updates["ext"] = l.Ext
 	}
+	// ★ file_name/size 的写保护(与 ext 同型):「兜底名『文件』+0」是查不到
+	//   元数据时的占位值,若本次解析元数据缺失而历史行里有真实名字/大小,
+	//   无条件覆盖会把真实值永久抹成占位 —— 读侧还得靠它展示。
+	//   故:占位元数据不覆盖已有真实值;真实值照常覆盖(含真实值互相覆盖)。
+	if LinkMetaIsPlaceholder(l.FileName, l.Size) && !LinkMetaIsPlaceholder(exist.FileName, exist.Size) {
+		updates["file_name"] = exist.FileName
+		updates["size"] = exist.Size
+	}
 	return s.db.Model(&exist).Updates(updates).Error
+}
+
+// PlaceholderFileName 是「查不到元数据」时的兜底展示名。单独出现不一定是占位
+// (真实文件可能恰好叫「文件」),与 size<=0 组合才是占位判据 —— 见
+// LinkMetaIsPlaceholder。
+const PlaceholderFileName = "文件"
+
+// LinkMetaIsPlaceholder 判断一组文件名/大小是否为「查不到元数据」的占位值。
+// 写侧(UpsertLink 的覆盖保护)与读侧(service 的 fileMeta/历史回退/缓存命中)
+// 共用同一口径,防止占位值把真实元数据永久遮蔽或覆盖(防两处口径漂移)。
+func LinkMetaIsPlaceholder(name string, size int64) bool {
+	return name == "" || (name == PlaceholderFileName && size <= 0)
 }
 
 // extHasContent 判断 ext 是否携带有效上下文:非空、非 JSON null、非空对象。
@@ -306,6 +326,7 @@ func (s *Store) GetShare(shareKey string) (*Share, error) {
 //
 // 只在同一 pan_type 内扫:不同网盘的 fid 空间互不相通,跨网盘取上下文必然串味。
 // 快照行数量级很小(每个分享上下文一行),按 pan_type 取回即可。
+// 固定按 id 升序返回;自愈侧逆序消费(最新快照的上下文最新,见 healShareNode)。
 func (s *Store) ListSharesByPan(panType string) ([]Share, error) {
 	if panType == "" {
 		return nil, nil
@@ -380,6 +401,19 @@ func (s *Store) UpdateAccountCheck(id uint, status string, checkedAt time.Time, 
 
 func (s *Store) DeleteAccount(id uint) error { return s.db.Delete(&Account{}, id).Error }
 
+// MarkAccountStatus 只更新 status 列:调用方(resolver 标记 AuthExpired 等)
+// 不应经手整行,避免用过期快照把并发改动的 cooldown_until/cred_version 一起冲掉。
+func (s *Store) MarkAccountStatus(id uint, status string) error {
+	return s.db.Model(&Account{}).Where("id = ?", id).Update("status", status).Error
+}
+
+// MarkAccountCooldown 只更新冷却涉及的列(状态 + 到期时间)。
+func (s *Store) MarkAccountCooldown(id uint, until time.Time) error {
+	return s.db.Model(&Account{}).Where("id = ?", id).Updates(map[string]any{
+		"status": "cooling", "cooldown_until": until,
+	}).Error
+}
+
 // PickAccount 选出一个可用账号:状态 ok,或 cooling 且冷却已过(选中时自动复位)。
 // 状态机:ok →(风控)cooling →(冷却到期)ok;不存在其他恢复路径。
 func (s *Store) PickAccount(panType string) (*Account, error) {
@@ -450,7 +484,14 @@ func (s *Store) ListDownloads() ([]Download, error) {
 	return out, err
 }
 
-func (s *Store) UpdateDownload(d *Download) error { return s.db.Save(d).Error }
+// UpdateDownload 只更新状态轮询涉及的列。
+// 原 s.db.Save(d) 整行回写:轮询协程拿到的行快照与推送协程的写入并发时,
+// 后写者会把前者的 dest_path 等列用**过期值**冲掉(丢更新)。
+func (s *Store) UpdateDownload(d *Download) error {
+	return s.db.Model(&Download{}).Where("gid = ?", d.GID).Updates(map[string]any{
+		"status": d.Status, "err_msg": d.ErrMsg,
+	}).Error
+}
 
 // ---- SyncItem ----
 

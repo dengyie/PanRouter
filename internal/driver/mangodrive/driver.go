@@ -147,7 +147,13 @@ func (d *Driver) GetDirectLink(ctx context.Context, cred *driver.Credential, ref
 	if p == "" {
 		return driver.DirectLink{}, driver.NewErr(driver.KindNotFound, "Mango Drive 缺少文件路径", nil)
 	}
-	api := NewAPI(d.client, d.pickBase(d.PublicBase), cred.Cookie)
+	base := d.pickBase(d.PublicBase)
+	if base == "" {
+		// 未配内网基址且提链时拿不到链接 host(公开分享 URL 才有 host):
+		// 与其发出无 scheme 的请求得到费解的连接错误,不如显式报配置缺失。
+		return driver.DirectLink{}, driver.NewErr(driver.KindUnsupported, "Mango Drive 未配置 API 基址(public_base/internal_base)", nil)
+	}
+	api := NewAPI(d.client, base, cred.Cookie)
 	obj, err := api.Get(ctx, p)
 	if err != nil {
 		return driver.DirectLink{}, err
@@ -172,11 +178,15 @@ func (d *Driver) GetDirectLink(ctx context.Context, cred *driver.Credential, ref
 		// 只配内网基址:raw_url 可能是相对路径,补成内网绝对地址。
 		internal = absolute(link, d.InternalBase)
 	}
+	// fs/get 响应本就带着 name/size:提链路径(根 URL + 深路径 fid)下缓存与
+	// 快照都查不到元数据,这里不带走的话 service 层只能落「文件」+0。
 	return driver.DirectLink{
 		URL:       link,
 		ServerURL: internal,
 		UA:        BrowserUA,
 		ExpiresAt: time.Now().Add(rawLinkTTL),
+		Name:      obj.Name,
+		Size:      obj.Size,
 	}, nil
 }
 
@@ -185,7 +195,11 @@ func (d *Driver) CheckCredential(ctx context.Context, cred driver.Credential) (d
 	if cred.Cookie == "" {
 		return driver.CredStatus{}, driver.NewErr(driver.KindAuthInvalid, "Mango Drive token 为空", nil)
 	}
-	name, err := NewAPI(d.client, d.pickBase(d.PublicBase), cred.Cookie).Me(ctx)
+	base := d.pickBase(d.PublicBase)
+	if base == "" {
+		return driver.CredStatus{}, driver.NewErr(driver.KindUnsupported, "Mango Drive 未配置 API 基址(public_base/internal_base)", nil)
+	}
+	name, err := NewAPI(d.client, base, cred.Cookie).Me(ctx)
 	if err != nil {
 		return driver.CredStatus{}, err
 	}
