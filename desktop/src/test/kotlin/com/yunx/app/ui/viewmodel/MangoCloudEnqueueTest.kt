@@ -5,6 +5,9 @@ import com.yunx.app.data.mangodrive.MangoDriveClient
 import com.yunx.app.data.mangodrive.MangoDriveSettings
 import com.yunx.app.util.WindowsToastNotifier
 import com.yunx.app.data.panrouter.PanRouterClient
+import com.yunx.app.data.panrouter.RemoteLinkResult
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.runBlocking
 import okhttp3.OkHttpClient
 import okhttp3.mockwebserver.Dispatcher
@@ -33,19 +36,30 @@ class MangoCloudEnqueueTest {
     /** 失败的文件序号（0..11 中的 4 个）；dispatcher 按请求里的 fid 判定 */
     private val failingIdx = setOf(8, 9, 10, 11)
 
+    /**
+     * 服务端下发的 limit_qps；null = 响应里**不下发该字段**（旧版本服务端形态）。
+     * 用于真正跑到 resolveConcurrency 的「未下发 → 回退默认」分支，
+     * 而不是拿 limit_qps=10 的结果冒充回退分支断言（那样断言恒真、无鉴别力）。
+     */
+    private var limitQps: Int? = 10
+
     @Before
     fun setUp() {
         WindowsToastNotifier.enabled = false
+        limitQps = 10
         server = MockWebServer()
         server.dispatcher = object : Dispatcher() {
             override fun dispatch(request: RecordedRequest): MockResponse {
                 val path = request.path.orEmpty()
                 return when {
-                    path.startsWith("/api/v1/storage") -> json(
-                        """{"code":200,"driver":"mangodrive","enabled":true,
-                           "public_base":"${server.url("/drive")}",
-                           "dest_dir":"/Pool","max_bytes":0,"limit_qps":10}"""
-                    )
+                    path.startsWith("/api/v1/storage") -> {
+                        val qpsField = limitQps?.let { "\"limit_qps\":$it," } ?: ""
+                        json(
+                            """{"code":200,"driver":"mangodrive","enabled":true,
+                               "public_base":"${server.url("/drive")}",
+                               "dest_dir":"/Pool","max_bytes":0,$qpsField"reserved":0}"""
+                        )
+                    }
                     path.startsWith("/api/v1/resolve") -> {
                         val body = request.body.readUtf8()
                         val idx = Regex("\"fid\":\"[^\"]*quota(\\d+)\\.bin\"").find(body)
@@ -92,6 +106,13 @@ class MangoCloudEnqueueTest {
     @After
     fun tearDown() {
         WindowsToastNotifier.enabled = true
+        // ★ 必须先停掉后台下载再关 MockWebServer：enqueue 会立即启动真实下载，
+        //   若在请求仍在飞时 shutdown，MockWebServer 抛 "Gave up waiting for queue
+        //   to shut down"（IOException），把用例失败原因从「被测逻辑」带偏到「测试环境」。
+        runBlocking {
+            dao.listAll().forEach { manager.remove(it.id, deleteLocal = true) }
+            delay(300)
+        }
         server.shutdown()
     }
 
@@ -140,7 +161,7 @@ class MangoCloudEnqueueTest {
 
     @Test
     fun `resolveConcurrency clamps server limit_qps`() {
-        // 直接对解析函数断言:10 QPS → 1/3 = 3(与历史默认一致);0 → 默认 3
+        // limit_qps=10 → 1/3 = 3（与历史默认一致）
         val client = MangoDriveClient(
             settings = MangoDriveSettings(),
             routerClient = PanRouterClient(
@@ -151,7 +172,104 @@ class MangoCloudEnqueueTest {
         )
         val conc = runBlocking { client.resolveConcurrency() }
         assertEquals("limit_qps=10 → 并发 3", 3, conc)
-        assertEquals("未下发时回退默认", MangoDriveClient.DEFAULT_RESOLVE_CONCURRENCY, conc)
+    }
+
+    @Test
+    fun `resolveConcurrency falls back to default when limit_qps absent`() {
+        // 服务端**不下发** limit_qps（旧版本形态）→ 必须回退到默认并发，
+        // 且此时默认（3）≠ limit_qps=10 时的计算值才有鉴别力——否则断言恒真。
+        limitQps = null
+        val client = MangoDriveClient(
+            settings = MangoDriveSettings(),
+            routerClient = PanRouterClient(
+                http = OkHttpClient(),
+                baseUrlProvider = { server.url("/").toString().trimEnd('/') },
+                tokenProvider = { "test-token" }
+            )
+        )
+        val conc = runBlocking { client.resolveConcurrency() }
+        assertEquals("未下发 limit_qps → 回退默认", MangoDriveClient.DEFAULT_RESOLVE_CONCURRENCY, conc)
+    }
+
+    @Test
+    fun `resolveConcurrency clamps low and high limit_qps`() {
+        // limit_qps=1 → 1/3 = 0 → 钳到下限 1
+        limitQps = 1
+        val client = MangoDriveClient(
+            settings = MangoDriveSettings(),
+            routerClient = PanRouterClient(
+                http = OkHttpClient(),
+                baseUrlProvider = { server.url("/").toString().trimEnd('/') },
+                tokenProvider = { "test-token" }
+            )
+        )
+        assertEquals("limit_qps=1 → 并发钳到 1", 1, runBlocking { client.resolveConcurrency() })
+
+        // limit_qps=100 → 1/3 = 33 → 钳到上限 6
+        limitQps = 100
+        assertEquals("limit_qps=100 → 并发钳到 6", 6, runBlocking { client.resolveConcurrency() })
+    }
+
+    @Test
+    fun `enqueueEach does not report cancellation as failure`() {
+        // 取消不是「失败」：CancellationException 被 runCatching 吞掉后，
+        // onFailure 会把文件塞进 failed 名单 → 用户看到「失败 N 个」，
+        // 而实际语义是「已中断下载」。
+        //
+        // 鉴别力（修复前 vs 修复后）：
+        //   修复前：runCatching 吞掉 CancellationException → onFailure 记入 failed
+        //           → failed = 3 条 → 本用例断言失败；
+        //   修复后：CancellationException 原样重抛 → 该子协程以「取消」结束，
+        //           failed 为空、ok 为 0，用户看到的是「已中断」而非「失败 3 个」。
+        //
+        // 注：协程语义上，子协程抛 CancellationException 不会让父作用域失败
+        //     （父只等它结束），所以断言点是**失败名单**而非异常外抛。
+        val vm = vm()
+        val (ok, failed) = runBlocking {
+            vm.enqueueEach(
+                tasks(3),
+                saveDir.absolutePath,
+                concurrency = 3,
+                linkProvider = { _, _ -> throw CancellationException("cancelled") }
+            )
+        }
+        assertEquals("取消不应计入成功", 0, ok)
+        assertTrue("取消不得被记成失败（会被误报为「失败 3 个」）", failed.isEmpty())
+        assertEquals("取消后不应入队任何任务", 0, runBlocking { dao.listAll().size })
+    }
+
+    @Test
+    fun `enqueueEach counts only real failures and never counts cancellation`() {
+        // 普通异常（404 等）仍必须计入 failed —— 取消修复不能把「失败」也一起吞掉。
+        val vm = vm()
+        val (ok, failed) = runBlocking {
+            vm.enqueueEach(
+                tasks(3),
+                saveDir.absolutePath,
+                concurrency = 3,
+                linkProvider = { _, fid ->
+                    if (fid.endsWith("quota0.bin")) throw IllegalStateException("boom")
+                    RemoteLinkResult(
+                        pan = "mangodrive",
+                        shareKey = "k",
+                        fid = fid,
+                        fileName = fid.substringAfterLast('/'),
+                        size = 4,
+                        route = "aria2",
+                        downloadUrl = server.url("/file").toString(),
+                        streamUrl = server.url("/stream").toString(),
+                        directUrl = null,
+                        ua = "UA/1",
+                        referer = "",
+                        needHeaders = true,
+                        expiresAtMs = 0,
+                        cacheHit = false
+                    )
+                }
+            )
+        }
+        assertEquals("成功数 = 3 - 1 个真失败", 2, ok)
+        assertEquals("失败名单只含真失败项", listOf("folder/quota0.bin"), failed)
+        assertEquals("成功项才落库", 2, runBlocking { dao.listAll().size })
     }
 }
-

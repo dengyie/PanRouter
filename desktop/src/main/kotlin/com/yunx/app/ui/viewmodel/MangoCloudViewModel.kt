@@ -339,11 +339,17 @@ class MangoCloudViewModel(
      * 提链是服务端 QPS 限速下的逐文件 HTTP 解析（限速 10，3 并发安全）——串行时
      * 大文件夹要等 N×单次延迟才入完队；并发后总耗时 ≈ N/3。任务落库顺序允许交错
      * （下载列表按文件夹分组展示，组内顺序无业务语义）。
+     *
+     * @param linkProvider 提链动作（默认走 [client]）。抽出成参数是为了可测：
+     *   取消传播必须在「提链抛 CancellationException」这一刻被确定性验证。
      */
     internal suspend fun enqueueEach(
         tasks: List<MangoCollectItem>,
         saveDir: String,
-        concurrency: Int = MangoDriveClient.DEFAULT_RESOLVE_CONCURRENCY
+        concurrency: Int = MangoDriveClient.DEFAULT_RESOLVE_CONCURRENCY,
+        linkProvider: suspend (dir: String, fid: String) -> RemoteLinkResult = { dir, fid ->
+            client.link(dir, fid).getOrThrow()
+        }
     ): Pair<Int, List<String>> {
         val ok = AtomicInteger(0)
         val processed = AtomicInteger(0)
@@ -361,7 +367,7 @@ class MangoCloudViewModel(
                             // 哈希 fid 也直接命中（不依赖 auto-link 配额——每目录只有
                             // 前 8 个文件会产生 links 历史行，第 9+ 个走历史反查必 404，
                             // 生产实测复现）。历史反查仅作服务端兜底。
-                            val link = client.link(task.dir, task.fid).getOrThrow()
+                            val link = linkProvider(task.dir, task.fid)
                             downloadManager.enqueue(
                                 url = downloadUrlOf(link),
                                 fileName = task.rel,
@@ -371,7 +377,13 @@ class MangoCloudViewModel(
                                 saveDir = saveDir
                             )
                             ok.incrementAndGet()
-                        }.onFailure { if (!downloadCancelRequested) failed.add(task.rel) }
+                        }.onFailure { err ->
+                            // 取消不是「失败」：协程被取消时抛 CancellationException，
+                            // runCatching 会把它当普通异常吞掉，导致取消后协程继续跑、
+                            // 结构化并发被破坏（父作用域取消无法传播）。必须原样重抛。
+                            if (err is CancellationException) throw err
+                            if (!downloadCancelRequested) failed.add(task.rel)
+                        }
                     }
                 }
             }

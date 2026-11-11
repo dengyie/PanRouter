@@ -9,9 +9,14 @@ import com.yunx.app.data.panrouter.PanRouterClient
 import com.yunx.app.data.security.DbKeyStore
 import com.yunx.app.ui.viewmodel.MangoCloudViewModel
 import com.yunx.app.util.WindowsToastNotifier
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeout
 import okhttp3.OkHttpClient
@@ -203,18 +208,61 @@ class MangoDriveEndToEndTest {
 }
 
 /** 仅测试用的内存 DAO（不碰真实数据库；独立实现，避免与 DownloadManagerDirectIntegrationTest 的私有 DAO 重名） */
+/**
+ * 测试用 DAO 的并发语义护栏。
+ *
+ * 背景：[MangoE2eTaskDao] 用 `MutableStateFlow` 模拟 DB。最初写成
+ * `state.value = state.value + task`（读 → 改 → 写三步非原子），
+ * 并发入队时互相覆盖 → 丢任务。该丢任务在聚合用例里表现为
+ * 「成功数 8，落库只有 7 条」这类与被测逻辑无关的偶发失败，
+ * 排查成本极高。
+ *
+ * 本用例用**同一协程**内的并发屏障复现：无原子性时必丢，有原子性时必不丢。
+ */
+class MangoE2eTaskDaoConcurrencyTest {
+
+    @Test
+    fun `concurrent inserts must not lose tasks`() = runBlocking {
+        val dao = MangoE2eTaskDao()
+        val n = 200
+        // 所有 insert 先在屏障前就位，随后同时放行 → 制造真实并发窗口
+        val gate = CompletableDeferred<Unit>()
+        val jobs = (0 until n).map { i ->
+            async(Dispatchers.Default) {
+                gate.await()
+                dao.insert(
+                    DownloadTaskEntity(
+                        url = "http://127.0.0.1/$i",
+                        fileName = "f$i.bin",
+                        totalSize = 1L
+                    )
+                )
+            }
+        }
+        gate.complete(Unit)
+        jobs.awaitAll()
+        val all = dao.listAll()
+        assertEquals("并发插入不得丢任务（应恰好 $n 条）", n, all.size)
+        assertEquals("任务 id 不得重复", n, all.map { it.id }.toSet().size)
+    }
+}
+
 internal class MangoE2eTaskDao : DownloadTaskDao {
     private val state = MutableStateFlow<List<DownloadTaskEntity>>(emptyList())
     private val nextId = AtomicLong(1L)
 
+    // ★ 必须用 state.update{}（CAS 循环）而不是 `state.value = state.value +/- x`：
+    //   后者是「读 → 改 → 写」三步非原子操作，并发入队（enqueueEach 默认 3 并发）
+    //   会互相覆盖 → 丢任务。实测：12 任务并发入队，DB 只剩 7 条（丢 5 条）。
+    //   MutableStateFlow.update 是原子的 compare-and-set 循环，不会丢更新。
     private fun mutate(id: Long, block: (DownloadTaskEntity) -> DownloadTaskEntity) {
-        state.value = state.value.map { if (it.id == id) block(it) else it }
+        state.update { list -> list.map { if (it.id == id) block(it) else it } }
     }
 
     override fun observeAll(): Flow<List<DownloadTaskEntity>> = state
     override suspend fun insert(task: DownloadTaskEntity): Long {
         val id = nextId.getAndIncrement()
-        state.value = state.value + task.copy(id = id)
+        state.update { list -> list + task.copy(id = id) }
         return id
     }
     override suspend fun get(id: Long): DownloadTaskEntity? = state.value.firstOrNull { it.id == id }
