@@ -584,18 +584,16 @@ func (r *Resolver) buildRef(key, fid string, own bool) (*driver.FileRef, error) 
 //     静默给错文件比提链失败危险得多。
 //     判定口径见 sameShareIdentity。
 func (r *Resolver) healShareNode(key, fid string) (*driver.FileNode, error) {
-	pan := r.panOfShareKey(key)
-	if pan == "" {
-		return nil, nil
-	}
+	// 本分享的快照行(含 share_url 与网盘类型):既是「是否同一份分享」的判据源,
+	// 也避免为拿 pan_type 再查一次库。
 	self, err := r.store.GetShare(key)
 	if err != nil {
 		return nil, err
 	}
-	if self == nil {
+	if self == nil || self.PanType == "" {
 		return nil, nil
 	}
-	shares, err := r.store.ListSharesByPan(pan)
+	shares, err := r.store.ListSharesByPan(self.PanType)
 	if err != nil {
 		return nil, err
 	}
@@ -823,19 +821,6 @@ func (r *Resolver) healShareContext(key, fid string) (map[string]string, error) 
 		return nil, err
 	}
 	return n.Ext, nil
-}
-
-// panOfShareKey 从 share_key 反查网盘类型:share_key 是 sha1(pan|url|pwd),
-// 不可逆推,故只能在库内的快照行里比对(按 share_key 命中即得 pan_type)。
-func (r *Resolver) panOfShareKey(key string) string {
-	if key == "" {
-		return ""
-	}
-	sh, err := r.store.GetShare(key)
-	if err != nil || sh == nil {
-		return ""
-	}
-	return sh.PanType
 }
 
 // recoverExtFromHistory 从同 fid 的历史缓存行里恢复 driver 上下文(含真实 path)。
