@@ -30,9 +30,11 @@ $notes = "PanRouter 桌面端 $Tag 便携版（免安装，解压即用）。`n`
 # 幂等发版:tag 被重指向后重推(历史重写/发版重跑)时 Release 已存在,
 # gh release create 会撞名失败——生产实证 v0.1.12 重发即此形态。
 # 已存在 → 覆盖资产(--clobber)并刷新标题与说明;不存在 → 正常创建。
-$releaseExists = $false
-gh release view $Tag *> $null
-if ($LASTEXITCODE -eq 0) { $releaseExists = $true }
+# 探测必须走 cmd 接管输出:PS 5.1 会把原生命令的 stderr 当 ErrorRecord,
+# EAP=Stop 下 `gh release view` 的 "release not found" 会直接终止脚本
+# (生产实证 v0.1.13 首次发版即此形态,新建路径从未跑到)。
+cmd /c "gh release view `"$Tag`" --json tagName >nul 2>nul"
+$releaseExists = ($LASTEXITCODE -eq 0)
 
 if ($releaseExists) {
     gh release upload $Tag "$name.zip" --clobber
