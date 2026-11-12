@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"net/url"
+	"strconv"
 	"strings"
 
 	"github.com/dengyie/panrouter/internal/driver"
@@ -118,7 +119,25 @@ type shareItem struct {
 	IsDir          json.RawMessage `json:"isdir"`
 	Path           string          `json:"path"`
 	ServerFilename string          `json:"server_filename"`
-	Size           int64           `json:"size"`
+	Size           flexInt64       `json:"size"`
+}
+
+// flexInt64 容忍百度把数字字段同时给成 number 或 string(xpan/share 的 size
+// 实测是字符串;用 int64 直接解码会让整次解析变成 interface_changed)。
+type flexInt64 int64
+
+func (f *flexInt64) UnmarshalJSON(b []byte) error {
+	s := strings.Trim(strings.TrimSpace(string(b)), `"`)
+	if s == "" || s == "null" {
+		*f = 0
+		return nil
+	}
+	n, err := strconv.ParseInt(s, 10, 64)
+	if err != nil {
+		return err
+	}
+	*f = flexInt64(n)
+	return nil
 }
 
 func rawString(r json.RawMessage) string {
@@ -247,7 +266,7 @@ func (d *Driver) walkShare(ctx context.Context, cookie, dir, prefix string, dept
 		nodes = append(nodes, driver.FileNode{
 			FID:  f.fsid(),
 			Name: joinSharePath(prefix, f.name()),
-			Size: f.Size,
+			Size: int64(f.Size),
 			Ext: map[string]string{
 				"share_id": ext["share_id"],
 				"uk":       ext["uk"],

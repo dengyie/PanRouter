@@ -154,6 +154,35 @@ func TestResolveShareWalksAndCarriesContext(t *testing.T) {
 	}
 }
 
+// 生产实证(2026-11-13):xpan/share 的 size 有时是字符串("123"),直接解成
+// int64 会让整次解析误报 interface_changed。number 与 string 都必须能读。
+func TestResolveShareToleratesStringSize(t *testing.T) {
+	d := newTestDriver(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"errno": 0,
+			"list": []map[string]any{
+				{"fs_id": 111, "isdir": "0", "path": "/a.bin", "server_filename": "a.bin", "size": "12345"},
+				{"fs_id": "222", "isdir": 0, "path": "/b.bin", "server_filename": "b.bin", "size": 678},
+			},
+		})
+	}))
+	nodes, err := d.ResolveShare(context.Background(), driver.ShareLink{
+		URL: "https://pan.baidu.com/s/1AbCdEfGhIjKlMnOpQrStUv",
+	}, nil)
+	if err != nil {
+		t.Fatalf("ResolveShare: %v", err)
+	}
+	if len(nodes) != 2 {
+		t.Fatalf("want 2 files, got %d: %+v", len(nodes), nodes)
+	}
+	if nodes[0].Size != 12345 || nodes[1].Size != 678 {
+		t.Fatalf("sizes: %d %d", nodes[0].Size, nodes[1].Size)
+	}
+	if nodes[0].FID != "111" || nodes[1].FID != "222" {
+		t.Fatalf("fids: %q %q", nodes[0].FID, nodes[1].FID)
+	}
+}
+
 // 加密分享未给提取码:应提示需要提取码,而不是笼统的上游错误。
 func TestResolveShareNeedsPwd(t *testing.T) {
 	d := newTestDriver(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

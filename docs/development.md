@@ -333,6 +333,8 @@ iframe / modern / 密码分享三条流;最终 CDN 对非浏览器客户端先 a
 `share/verify(有提取码时)→ xpan/share 列目录(根 root=1,子目录 root=0 + BDCLND)→ share/transfer(ondup=newcopy 进 panrouter_tmp)→ locatedownload → 清理副本`
 
 - **分享解析**匿名可用(未加密分享不需要登录);新 surl 是 base64url(含 `_`/`-`),旧 base62 正则会把新链接误判成「STOKEN 缺失」
+- `xpan/share` 的 `size` 实测可能是 JSON **字符串**(生产实证 2026-11-13),按柔性整数解码;`fs_id`/`isdir` 同理按「number 或 string」读 —— 否则整次解析被误报成 `interface_changed`
+- 不存在的 `/s/` 短链 errno=140(无 errmsg)→ `share_gone`,不落进含糊的 `upstream_error`
 - 列目录根目录必须 `root=1`;子目录 `root=0` 且 Cookie 必须带 `BDCLND=<randsk>`(verify 返回的 sekey)
 - **提链必须登录态**:转存 + locatedownload 全部依赖 bdstoken;`bdstoken` 随会话漂移,进程内按登录态指纹缓存,errno 105 时刷新重试一次
 - 取链优先 `d.pcs.baidu.com` 客户端协议 locatedownload(硬编码 psign/rand/devuid 属上游公开常量,**会腐坏**),失败自动退回 `/api/filemetas?dlink=1`;两条路都拿不到才报 upstream_error
@@ -502,6 +504,8 @@ iframe / modern / 密码分享三条流;最终 CDN 对非浏览器客户端先 a
 ---
 
 ## 变更记录
+
+- **v2.12.1(2026-11-13)**:百度 driver 生产实跑两处口径修正(均在 v2.12 部署后的线上回归中发现,契约零变化)。① **`xpan/share` 的 `size` 可能是 JSON 字符串**:线上用真实加密分享(匿名 + 提取码)列目录时整次解析被报成 `interface_changed`,底层错误是 `json: cannot unmarshal string into Go struct field shareListResp.list.0.size of type int64`。`size` 改为柔性整数 `flexInt64`(number 与 string 都接受,`""`/`null` 归 0);`fs_id`/`isdir` 本就是 `json.RawMessage`,number 与 string 均可读。回归 `TestResolveShareToleratesStringSize`(字符串 size + 数字 fs_id/isdir 必须解析出正确大小与 fid)。② **errno 140 → `share_gone`**:线上喂不存在的 `/s/` 短链,xpan/share 直接回 `errno=140`、`errmsg` 为空,原走文案兜底报 502 `upstream_error`;显式归类后返回 404「百度分享链接无效或不存在」。判别力:修复后匿名 + `pwd=petr` 的加密分享解析出 9 个文件,不存在的短链 404 share_gone。测试:`go vet ./...` 干净,全量 17 包绿。
 
 - **v2.12(2026-11-13)**:新增**百度网盘 driver**(`internal/driver/baidu`,契约零变化,纯增量)。① **链路**:`share/verify → xpan/share 列目录 → share/transfer(ondup=newcopy) → locatedownload → 清理副本`;与夸克同型但百度**必须转存**才能取直链。实现口径逐条来自本仓姊妹项目 YunX-Desktop 生产在用的 `BaiduApi` + 上游公开实现交叉验证,不是推测。② **已知坑显式处理**:新 surl 是 base64url(`_`/`-`),旧 base62 正则会把新链接误判成「STOKEN 缺失」,解析器按 `[0-9A-Za-z_-]` 取;列目录根目录必须 `root=1`、子目录 `root=0` 且 Cookie 带 `BDCLND=<randsk>`;`bdstoken` 随会话漂移 → 按登录态指纹缓存 + errno 105 刷新重试一次;locatedownload 的 psign/rand/devuid 是上游公开硬编码常量(会腐坏)→ 失败自动退回 `filemetas?dlink=1`,两路都失败才报 upstream_error。③ **安全/pilot 闸**:日转存 50 次/账号硬闸(按登录态指纹 + 本地日,超限诚实返回 risk_control,不硬闯风控);默认 `limit_qps: 1`、`download_concurrency: 2`;`redirect_allow` 仅 `.baidu.com/.baidupcs.com/.baidupcs.cn/.bdstatic.com`;清理只删 `panrouter_tmp` 内本次转存路径,独立有界 ctx,失败只记日志。④ **多账号池真正生效**(此前后端 `store.PickAccount` 恒取「最近检查优先」→ 同网盘多账号永远只有第一个在干活,池子退化成单账号,风控命中即全链路停摆):`AccountService.Pick` 改为按网盘轮转(候选集合语义不变:ok 或冷却到期,expired/banned 永不可选),新增 `TestPickRotatesAccounts`。⑤ 注册与配置:`app.go` factory + `config.Default()`/`config.example.yaml` 的 `domain_routes.baidu` 与 `drivers.baidu`。测试:新增 `internal/driver/baidu` 8 个用例(链接形态/errno 分类/根与子目录遍历 + BDCLND 透传/转存链选 encrypt=0/fallback/配额闸/凭据校验),`go vet ./...` 干净,全量 17 包绿。
 
