@@ -175,7 +175,7 @@ func SuffixMatch(host string, allow []string) bool {
 
 // Do 执行请求并读完全部响应体(API 调用用)。
 func (c *Client) Do(req *http.Request) (*Result, error) {
-	resp, err := c.doWithACW(req)
+	resp, err := c.doWithACW(req, c.hc)
 	if err != nil {
 		return nil, err
 	}
@@ -188,9 +188,24 @@ func (c *Client) Do(req *http.Request) (*Result, error) {
 }
 
 // DoStream 执行请求并保留响应体(中转流用)。遇 acw_sc__v2 挑战页自动解题重放。
-func (c *Client) DoStream(req *http.Request) (*http.Response, error) { return c.doWithACW(req) }
+func (c *Client) DoStream(req *http.Request) (*http.Response, error) { return c.doWithACW(req, c.hc) }
 
-func (c *Client) doWithACW(req *http.Request) (*http.Response, error) {
+// DoStreamFresh 与 DoStream 相同,但强制用一条全新的 TCP 连接:
+//   - 请求带 Connection: close,这条连接用完即关,不会回到连接池;
+//   - 发起前关闭池中空闲连接(在途连接不受影响),保证不去复用别人。
+//
+// 大文件中转需要它:部分网盘(quark)对**同一条上游长连接**按累计流量降速,
+// 复用一条"已经跑热"的空闲连接会从 ~100 KB/s 起步;而复用后自己再放回池里,
+// 还会把这条受降速的连接传染给下一个请求。
+func (c *Client) DoStreamFresh(req *http.Request) (*http.Response, error) {
+	req.Close = true
+	if tr, ok := c.hc.Transport.(*http.Transport); ok {
+		tr.CloseIdleConnections()
+	}
+	return c.doWithACW(req, c.hc)
+}
+
+func (c *Client) doWithACW(req *http.Request, hc *http.Client) (*http.Response, error) {
 	cur := req
 	origCtx := req.Context()
 	for attempt := 0; attempt <= maxACWReplay; attempt++ {

@@ -1,10 +1,16 @@
 package service
 
 import (
+	"bytes"
 	"context"
+	"fmt"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -72,7 +78,7 @@ func newRelayFixture(t *testing.T, upstreamURL string) (*Relay, string) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	relay := NewRelay(resolver, map[string]*httpx.Client{"fake": streamCl}, store, aes, log)
+	relay := NewRelay(resolver, map[string]*httpx.Client{"fake": streamCl}, store, aes, met, log)
 	return relay, resolver.shareKey("fake", shareURL, "")
 }
 
@@ -198,5 +204,166 @@ func TestRelaySolvesLanzouACWChallenge(t *testing.T) {
 	}
 	if rec.Body.String() != payload {
 		t.Fatalf("body=%q want %q", rec.Body.String(), payload)
+	}
+}
+
+// fakeUpstream 模拟 quark 直链:按 Range 返回片段,并记录每个请求的 Range 头与
+// 新建 TCP 连接数。acceptRanges=false 时不下发 Accept-Ranges
+// (用于验证「上游不支持 Range 就不轮换」)。
+type fakeUpstream struct {
+	srv    *httptest.Server
+	mu     sync.Mutex
+	ranges []string
+	conns  int64
+}
+
+func newFakeUpstream(t *testing.T, payload []byte, acceptRanges bool) *fakeUpstream {
+	t.Helper()
+	u := &fakeUpstream{}
+	u.srv = httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		rh := r.Header.Get("Range")
+		u.mu.Lock()
+		u.ranges = append(u.ranges, rh)
+		u.mu.Unlock()
+
+		start, end := 0, len(payload)-1
+		partial := false
+		if rh != "" {
+			if s, e, ok := parseTestRange(rh, len(payload)); ok {
+				start, end, partial = s, e, true
+			}
+		}
+		if acceptRanges {
+			w.Header().Set("Accept-Ranges", "bytes")
+		}
+		w.Header().Set("Content-Length", strconv.Itoa(end-start+1))
+		if partial {
+			w.Header().Set("Content-Range", "bytes "+strconv.Itoa(start)+"-"+strconv.Itoa(end)+"/"+strconv.Itoa(len(payload)))
+			w.WriteHeader(http.StatusPartialContent)
+		}
+		_, _ = w.Write(payload[start : end+1])
+	}))
+	u.srv.Config.ConnState = func(_ net.Conn, st http.ConnState) {
+		if st == http.StateNew {
+			atomic.AddInt64(&u.conns, 1)
+		}
+	}
+	u.srv.Start()
+	t.Cleanup(u.srv.Close)
+	return u
+}
+
+func (u *fakeUpstream) URL() string { return u.srv.URL }
+
+func (u *fakeUpstream) reqRanges() []string {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	return append([]string(nil), u.ranges...)
+}
+
+func (u *fakeUpstream) connections() int64 { return atomic.LoadInt64(&u.conns) }
+
+func parseTestRange(h string, total int) (int, int, bool) {
+	h = strings.TrimPrefix(h, "bytes=")
+	sp, ep, ok := strings.Cut(h, "-")
+	if !ok {
+		return 0, 0, false
+	}
+	s, err := strconv.Atoi(sp)
+	if err != nil || s >= total {
+		return 0, 0, false
+	}
+	e := total - 1
+	if ep != "" {
+		if v, err := strconv.Atoi(ep); err == nil {
+			e = v
+		}
+	}
+	if e >= total {
+		e = total - 1
+	}
+	if e < s {
+		return 0, 0, false
+	}
+	return s, e, true
+}
+
+// withRotateBytes 临时把轮换阈值调小,让单测用 KB 级数据就能触发多条上游连接。
+func withRotateBytes(t *testing.T, v int64) {
+	t.Helper()
+	old := relayRotateBytes
+	relayRotateBytes = v
+	t.Cleanup(func() { relayRotateBytes = old })
+}
+
+// P0 回归:单条上游连接搬够 relayRotateBytes 后必须重开连接续传,
+// 而客户端收到的字节流仍完整且顺序正确(quark 长连接降速的根治手段)。
+func TestRelayRotatesUpstreamConnection(t *testing.T) {
+	payload := bytes.Repeat([]byte("abcdefgh"), 40<<10) // 320 KB
+	up := newFakeUpstream(t, payload, true)
+	// 阈值取 32 KB:即便每次 Read 都取满 128 KB,一条连接最多也只能搬
+	// 32K+128K=160K,320 KB 必然需要至少 2 次轮换(Read 返回得更碎只会更多)。
+	withRotateBytes(t, 32<<10)
+
+	relay, key := newRelayFixture(t, up.URL())
+	rec := httptest.NewRecorder()
+	if err := relay.Serve(context.Background(), rec, StreamInput{Pan: "fake", ShareKey: key, FID: "f1"}, ""); err != nil {
+		t.Fatalf("relay: %v", err)
+	}
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status=%d", rec.Code)
+	}
+	if !bytes.Equal(rec.Body.Bytes(), payload) {
+		t.Fatalf("body corrupted after rotation: got %d bytes, want %d", rec.Body.Len(), len(payload))
+	}
+
+	got := up.reqRanges()
+	if len(got) < 3 {
+		t.Fatalf("want >=3 upstream requests (rotation), got %d: %v", len(got), got)
+	}
+	if got[0] != "" {
+		t.Fatalf("first upstream request must be unconditional, got Range=%q", got[0])
+	}
+	prev := 0
+	for i, rh := range got[1:] {
+		s, _, ok := parseTestRange(rh, len(payload))
+		if !ok || s <= prev {
+			t.Fatalf("rotation #%d Range=%q must continue forward from %d (all=%v)", i+1, rh, prev, got)
+		}
+		prev = s
+	}
+	// 轮换必须真的换 TCP 连接:否则复用一条已被限速的旧连接等于没轮换
+	if n := up.connections(); n < int64(len(got)) {
+		t.Fatalf("want a fresh TCP connection per upstream request, got %d conns for %d requests", n, len(got))
+	}
+
+	// 指标必须真的记上:没有指标就等于线上无法判断轮换是否生效
+	rr := httptest.NewRecorder()
+	relay.met.Handler().ServeHTTP(rr, httptest.NewRequest("GET", "/metrics", nil))
+	if body := rr.Body.String(); !strings.Contains(body, `panrouter_relay_bytes_total{pan="fake"} 327680`) {
+		t.Fatalf("relay bytes metric missing/wrong:\n%s", body)
+	}
+	if body := rr.Body.String(); !strings.Contains(body, fmt.Sprintf(`panrouter_relay_rotate_total{pan="fake"} %d`, len(got)-1)) {
+		t.Fatalf("relay rotate metric missing/wrong (want %d rotations):\n%s", len(got)-1, body)
+	}
+}
+
+// 上游不声明 Accept-Ranges 时不得轮换:否则会对着同一个「忽略 Range 的 200」
+// 反复请求全量数据,把带宽放大成 N 倍。
+func TestRelayNoRotateWhenUpstreamLacksRange(t *testing.T) {
+	payload := bytes.Repeat([]byte("z"), 320<<10)
+	up := newFakeUpstream(t, payload, false)
+	withRotateBytes(t, 100<<10)
+
+	relay, key := newRelayFixture(t, up.URL())
+	rec := httptest.NewRecorder()
+	if err := relay.Serve(context.Background(), rec, StreamInput{Pan: "fake", ShareKey: key, FID: "f1"}, ""); err != nil {
+		t.Fatalf("relay: %v", err)
+	}
+	if !bytes.Equal(rec.Body.Bytes(), payload) {
+		t.Fatalf("body mismatch: got %d bytes, want %d", rec.Body.Len(), len(payload))
+	}
+	if got := up.reqRanges(); len(got) != 1 {
+		t.Fatalf("upstream without range support must not rotate, got %d requests: %v", len(got), got)
 	}
 }

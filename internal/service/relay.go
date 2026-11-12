@@ -6,9 +6,12 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strconv"
+	"strings"
 
 	"github.com/dengyie/panrouter/internal/driver"
 	"github.com/dengyie/panrouter/internal/pkg/httpx"
+	"github.com/dengyie/panrouter/internal/pkg/metrics"
 	"github.com/dengyie/panrouter/internal/repo"
 )
 
@@ -18,16 +21,51 @@ type aesCipher interface {
 	DecryptBytes(data []byte) ([]byte, error)
 }
 
+const (
+	relayBufSize = 128 << 10
+	// relayFlushBytes:攒够这么多字节再 Flush 一次。原实现每 32 KB Write+Flush,
+	// 13 GB 就是约 40 万次系统调用;下载场景对首字节延迟不敏感,攒到 256 KB
+	// (满速下 ~70 ms)可以省下大半开销,同时对边下边播仍然够快。
+	relayFlushBytes = 256 << 10
+)
+
+// relayRotateBytes:单条上游连接最多搬运这么多字节就重开一条。
+//
+// 2026-11-13 实测(51 文件 / 13.16 GB 真实下载):quark 对**同一条上游长连接**
+// 在累计约 1 GB 后把速度压到 ~100 KB/s,而新建连接立刻回到 3.5 MB/s——三条老
+// 连接合计 0.32 MB/s、两条新连接合计 7.2 MB/s,同期账号状态始终 ok(既不是
+// 我方限频,也不是账号被风控)。旧实现一条连接跑到底,417 MB 文件要 185~220 s;
+// 按块换连接后 143~167 s,两个 576 MB 文件从「重试耗尽失败」变成正常跑完。
+//
+// 所以这里按固定字节数主动轮换上游连接:响应头早已发出,客户端侧字节流连续。
+var relayRotateBytes int64 = 256 << 20
+
 type Relay struct {
 	resolver *Resolver
 	clients  map[string]*httpx.Client // pan → client(带 per-driver 重定向白名单)
 	store    *repo.Store
 	aes      aesCipher
+	met      *metrics.Registry
 	log      *loggerType
 }
 
-func NewRelay(resolver *Resolver, clients map[string]*httpx.Client, store *repo.Store, aes aesCipher, log *loggerType) *Relay {
-	return &Relay{resolver: resolver, clients: clients, store: store, aes: aes, log: log}
+func NewRelay(resolver *Resolver, clients map[string]*httpx.Client, store *repo.Store,
+	aes aesCipher, met *metrics.Registry, log *loggerType) *Relay {
+	s := &Relay{resolver: resolver, clients: clients, store: store, aes: aes, met: met, log: log}
+	if met != nil {
+		met.Help("panrouter_relay_bytes_total", "Relay 转发给客户端的字节数(按网盘)")
+		met.Help("panrouter_relay_rotate_total", "Relay 主动轮换上游连接的次数")
+		met.Help("panrouter_relay_abort_total", "Relay 未正常读完就结束的次数(按原因)")
+		// 先把各网盘的 0 值序列建出来:没有序列和「全 0」在监控上不可区分。
+		for pan := range clients {
+			met.Add("panrouter_relay_bytes_total", map[string]string{"pan": pan}, 0)
+			met.Add("panrouter_relay_rotate_total", map[string]string{"pan": pan}, 0)
+			for _, reason := range []string{"client_gone", "upstream_interrupt", "rotate_failed"} {
+				met.Add("panrouter_relay_abort_total", map[string]string{"pan": pan, "reason": reason}, 0)
+			}
+		}
+	}
+	return s
 }
 
 // StreamInput 是一次中转请求的已验证参数(签名校验在 api 层完成)。
@@ -38,60 +76,54 @@ type StreamInput struct {
 	ClientUA string
 }
 
+// streamLink 是发起一次上游请求所需的全部约束(来自缓存直链)。
+type streamLink struct {
+	URL     string
+	UA      string
+	Referer string
+	Cookie  []byte
+}
+
 // Serve 执行中转:取新鲜直链 → 携带约束头请求上游 → 透传响应(含 Range/续传)。
-// 签名只在建立连接时校验,Range 续传复用同一 URL,不会中途 401。
+// 签名只在建立连接时校验;轮换复用同一 URL,不会中途 401。
 func (s *Relay) Serve(ctx context.Context, w http.ResponseWriter, in StreamInput, rangeHeader string) error {
-	link, err := s.resolver.GetFreshLink(ctx, in.ShareKey, in.FID, in.ClientUA)
+	link, err := s.freshLink(ctx, in)
 	if err != nil {
 		return err
 	}
-	cookie, err := s.aes.DecryptBytes(link.CookieEnc)
-	if err != nil {
-		return fmt.Errorf("decrypt link cookie: %w", err)
-	}
-	client := s.clients[in.Pan]
-	if client == nil {
-		return fmt.Errorf("no http client for pan %q", in.Pan)
-	}
 
-	upReq, err := http.NewRequestWithContext(ctx, http.MethodGet, link.DirectLink, nil)
+	resp, err := s.openUpstream(ctx, in, link, rangeHeader)
 	if err != nil {
-		return driver.NewErr(driver.KindUpstream, "构造上游请求失败", err)
+		return err
 	}
-	if link.UA != "" {
-		upReq.Header.Set("User-Agent", link.UA)
-	}
-	if link.Referer != "" {
-		upReq.Header.Set("Referer", link.Referer)
-	}
-	if len(cookie) > 0 && string(cookie) != "" {
-		upReq.Header.Set("Cookie", string(cookie))
-	}
-	if rangeHeader != "" {
-		upReq.Header.Set("Range", rangeHeader)
-	}
-
-	resp, err := client.DoStream(upReq)
-	if err != nil {
-		return driver.NewErr(driver.KindUpstream, "中转上游请求失败", err)
-	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode >= 400 {
 		// 直链可能提前失效(风控/过期):尚未写响应头,可安全报错让上层提示重试
-		io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
+		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
 		// 上游明确否决时立即失效本地缓存,否则重新解析仍命中同一死链(缓存优先),
 		// 用户会在 TTL 内 (最长 2h) 反复失败。失效后下次 GetFreshLink 触发真实重解析。
-		if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden ||
-			resp.StatusCode == http.StatusNotFound || resp.StatusCode == http.StatusGone ||
-			resp.StatusCode == http.StatusPreconditionFailed {
-			if err := s.store.ExpireLink(in.ShareKey, in.FID); err != nil {
-				s.log.Warnf("expire stale link: share=%s fid=%s err=%v", in.ShareKey, in.FID, err)
-			}
+		if isStaleStatus(resp.StatusCode) {
+			s.expireLink(in)
 		}
 		return driver.NewErr(driver.KindUpstream,
 			fmt.Sprintf("上游返回 %d,直链可能已失效,请重新解析", resp.StatusCode), nil)
 	}
+
+	start, total, hasCR := parseContentRange(resp.Header.Get("Content-Range"))
+	// Content-Length 只在非 206 时代表整文件长度;206 时它是本段长度,不能当总量。
+	if !hasCR {
+		if cl := resp.Header.Get("Content-Length"); cl != "" {
+			if v, perr := strconv.ParseInt(cl, 10, 64); perr == nil && v > 0 {
+				total = v
+			}
+		}
+	}
+	// 只有「知道总长度 + 上游支持 Range」时才轮换;否则保持旧行为(单连接跑到底),
+	// 避免为了一次性小响应(如 lanzou 的 HTML 挑战页)白折腾。
+	// relayRotateBytes<=0 视为关闭轮换(单测/排障用)。
+	canRotate := relayRotateBytes > 0 && total > 0 &&
+		(hasCR || strings.EqualFold(resp.Header.Get("Accept-Ranges"), "bytes"))
 
 	h := w.Header()
 	for _, k := range []string{"Content-Type", "Content-Length", "Content-Range", "Accept-Ranges", "ETag", "Last-Modified"} {
@@ -102,24 +134,189 @@ func (s *Relay) Serve(ctx context.Context, w http.ResponseWriter, in StreamInput
 	w.WriteHeader(resp.StatusCode)
 
 	flusher, _ := w.(http.Flusher)
-	buf := make([]byte, 32<<10)
+	buf := make([]byte, relayBufSize)
+	pos := start          // 下一条上游请求应从哪个绝对偏移续
+	connBytes := int64(0) // 当前这条上游连接已搬运的字节
+	pending := int64(0)   // 尚未 Flush 的字节
+	refreshed := false
+
 	for {
 		n, rerr := resp.Body.Read(buf)
 		if n > 0 {
 			if _, werr := w.Write(buf[:n]); werr != nil {
+				s.countAbort(in, "client_gone")
 				return nil // 客户端断开,属正常取消
 			}
-			if flusher != nil {
+			if s.met != nil {
+				s.met.Add("panrouter_relay_bytes_total", map[string]string{"pan": in.Pan}, float64(n))
+			}
+			pos += int64(n)
+			connBytes += int64(n)
+			pending += int64(n)
+			if flusher != nil && pending >= relayFlushBytes {
 				flusher.Flush()
+				pending = 0
 			}
 		}
 		if rerr != nil {
 			if rerr == io.EOF {
+				if flusher != nil && pending > 0 {
+					flusher.Flush()
+				}
 				return nil
 			}
 			// 上游中断:响应头已发出,无法改写状态码;记录日志供排查
-			s.log.Warnf("relay upstream interrupted: share=%s fid=%s err=%v", in.ShareKey, in.FID, rerr)
+			s.countAbort(in, "upstream_interrupt")
+			s.log.Warnf("relay upstream interrupted: share=%s fid=%s pos=%d err=%v",
+				in.ShareKey, in.FID, pos, rerr)
 			return nil
 		}
+
+		// 主动轮换:这条连接搬够量且文件还有剩余。客户端侧字节流连续,不可感知。
+		if canRotate && connBytes >= relayRotateBytes && pos < total {
+			next, rerr2 := s.rotate(ctx, in, &link, pos, &refreshed)
+			if rerr2 != nil {
+				s.countAbort(in, "rotate_failed")
+				s.log.Warnf("relay rotate failed: share=%s fid=%s pos=%d err=%v",
+					in.ShareKey, in.FID, pos, rerr2)
+				return nil
+			}
+			_ = resp.Body.Close()
+			resp = next
+			connBytes = 0
+			if s.met != nil {
+				s.met.Inc("panrouter_relay_rotate_total", map[string]string{"pan": in.Pan})
+			}
+		}
 	}
+}
+
+// rotate 从 pos 处重开一条上游连接。上游忽略 Range(回 200)时丢掉已有的 pos 字节
+// 继续用这条连接(用带宽换正确性);直链失效则刷新一次凭据再试。
+func (s *Relay) rotate(ctx context.Context, in StreamInput, link *streamLink, pos int64, refreshed *bool) (*http.Response, error) {
+	resp, err := s.openUpstream(ctx, in, *link, fmt.Sprintf("bytes=%d-", pos))
+	if err != nil {
+		return nil, err
+	}
+	switch {
+	case resp.StatusCode == http.StatusPartialContent:
+		if st, _, ok := parseContentRange(resp.Header.Get("Content-Range")); ok && st == pos {
+			return resp, nil
+		}
+		_ = resp.Body.Close()
+		return nil, fmt.Errorf("content-range start mismatch, want %d", pos)
+	case resp.StatusCode == http.StatusOK:
+		if _, err := io.CopyN(io.Discard, resp.Body, pos); err != nil {
+			_ = resp.Body.Close()
+			return nil, fmt.Errorf("discard %d bytes: %w", pos, err)
+		}
+		s.log.Warnf("relay upstream ignored range on rotate: share=%s fid=%s pos=%d", in.ShareKey, in.FID, pos)
+		return resp, nil
+	}
+
+	code := resp.StatusCode
+	_ = resp.Body.Close()
+	if isStaleStatus(code) && !*refreshed {
+		*refreshed = true
+		s.expireLink(in)
+		nl, ferr := s.freshLink(ctx, in)
+		if ferr != nil {
+			return nil, ferr
+		}
+		*link = nl
+		return s.rotate(ctx, in, link, pos, refreshed)
+	}
+	return nil, fmt.Errorf("upstream %d on rotate", code)
+}
+
+func (s *Relay) freshLink(ctx context.Context, in StreamInput) (streamLink, error) {
+	link, err := s.resolver.GetFreshLink(ctx, in.ShareKey, in.FID, in.ClientUA)
+	if err != nil {
+		return streamLink{}, err
+	}
+	cookie, err := s.aes.DecryptBytes(link.CookieEnc)
+	if err != nil {
+		return streamLink{}, fmt.Errorf("decrypt link cookie: %w", err)
+	}
+	return streamLink{URL: link.DirectLink, UA: link.UA, Referer: link.Referer, Cookie: cookie}, nil
+}
+
+func (s *Relay) openUpstream(ctx context.Context, in StreamInput, link streamLink, rangeHeader string) (*http.Response, error) {
+	client := s.clients[in.Pan]
+	if client == nil {
+		return nil, fmt.Errorf("no http client for pan %q", in.Pan)
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, link.URL, nil)
+	if err != nil {
+		return nil, driver.NewErr(driver.KindUpstream, "构造上游请求失败", err)
+	}
+	if link.UA != "" {
+		req.Header.Set("User-Agent", link.UA)
+	}
+	if link.Referer != "" {
+		req.Header.Set("Referer", link.Referer)
+	}
+	if len(link.Cookie) > 0 && string(link.Cookie) != "" {
+		req.Header.Set("Cookie", string(link.Cookie))
+	}
+	if rangeHeader != "" {
+		req.Header.Set("Range", rangeHeader)
+	}
+	// 上游一律走新连接(DoStreamFresh):一是避免复用一条已被网盘降速的旧连接,
+	// 二是中转流量本身不回到池里,不把受降速的连接传染给下一个请求。
+	resp, err := client.DoStreamFresh(req)
+	if err != nil {
+		return nil, driver.NewErr(driver.KindUpstream, "中转上游请求失败", err)
+	}
+	return resp, nil
+}
+
+func (s *Relay) expireLink(in StreamInput) {
+	if err := s.store.ExpireLink(in.ShareKey, in.FID); err != nil {
+		s.log.Warnf("expire stale link: share=%s fid=%s err=%v", in.ShareKey, in.FID, err)
+	}
+}
+
+func (s *Relay) countAbort(in StreamInput, reason string) {
+	if s.met != nil {
+		s.met.Inc("panrouter_relay_abort_total", map[string]string{"pan": in.Pan, "reason": reason})
+	}
+}
+
+// isStaleStatus:上游明确否决(直链已不可用)的状态码。
+func isStaleStatus(code int) bool {
+	switch code {
+	case http.StatusUnauthorized, http.StatusForbidden, http.StatusNotFound,
+		http.StatusGone, http.StatusPreconditionFailed:
+		return true
+	}
+	return false
+}
+
+// parseContentRange 解析 "bytes <start>-<end>/<total>"(total 可为 *)。
+func parseContentRange(v string) (start, total int64, ok bool) {
+	const prefix = "bytes "
+	if !strings.HasPrefix(v, prefix) {
+		return 0, 0, false
+	}
+	rest := strings.TrimPrefix(v, prefix)
+	slash := strings.LastIndex(rest, "/")
+	if slash < 0 {
+		return 0, 0, false
+	}
+	span, totalPart := rest[:slash], rest[slash+1:]
+	dash := strings.Index(span, "-")
+	if dash <= 0 {
+		return 0, 0, false
+	}
+	st, err := strconv.ParseInt(span[:dash], 10, 64)
+	if err != nil {
+		return 0, 0, false
+	}
+	if totalPart != "*" {
+		if t, terr := strconv.ParseInt(totalPart, 10, 64); terr == nil {
+			total = t
+		}
+	}
+	return st, total, true
 }
