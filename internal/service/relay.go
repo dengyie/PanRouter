@@ -47,27 +47,30 @@ var (
 	// 所以这里按固定字节数主动轮换上游连接:响应头早已发出,客户端侧字节流连续。
 	relayRotateBytes int64 = 256 << 20
 
-	// relayStallTimeout:上游连续这么久一个字节都没吐,就判它挂死(黑洞/半开连接),
-	// 取消这条连接并尝试续传。
+	// relayStallTimeout 的默认值,以及为什么需要它:stream client 是 NoBodyTimeout=true
+	// (慢流不能被整体超时掐断),代价是上游真挂死时 Read 会一直阻塞,客户端连接就这么吊着——
+	// 用户看到的是「0 B/s 卡死」而不是一个明确结局。有了看门狗,挂死会退化成一次有界续传/报错。
 	//
-	// 为什么必须有它:stream client 是 NoBodyTimeout=true(慢流不能被整体超时掐断),
-	// 代价是上游真挂死时 Read 会一直阻塞,客户端连接就这么吊着——用户看到的是
-	// 「0 B/s 卡死」而不是一个明确结局。有了看门狗,挂死会退化成一次有界续传/报错。
-	relayStallTimeout = 60 * time.Second
+	// 放在 Relay 上而不是包级变量:看门狗在独立 goroutine 里读它,包级可变变量会被
+	// 单测的「改了再改回去」撞出 data race(`-race` 实测)。字段在建连那一刻取值,
+	// 之后只读,天然无竞争。
+	defaultRelayStallTimeout = 60 * time.Second
 )
 
 type Relay struct {
-	resolver *Resolver
-	clients  map[string]*httpx.Client // pan → client(带 per-driver 重定向白名单)
-	store    *repo.Store
-	aes      aesCipher
-	met      *metrics.Registry
-	log      *loggerType
+	resolver     *Resolver
+	clients      map[string]*httpx.Client // pan → client(带 per-driver 重定向白名单)
+	store        *repo.Store
+	aes          aesCipher
+	met          *metrics.Registry
+	log          *loggerType
+	stallTimeout time.Duration
 }
 
 func NewRelay(resolver *Resolver, clients map[string]*httpx.Client, store *repo.Store,
 	aes aesCipher, met *metrics.Registry, log *loggerType) *Relay {
-	s := &Relay{resolver: resolver, clients: clients, store: store, aes: aes, met: met, log: log}
+	s := &Relay{resolver: resolver, clients: clients, store: store, aes: aes, met: met, log: log,
+		stallTimeout: defaultRelayStallTimeout}
 	if met != nil {
 		met.Help("panrouter_relay_bytes_total", "Relay 转发给客户端的字节数(按网盘)")
 		met.Help("panrouter_relay_rotate_total", "Relay 主动轮换上游连接的次数")
@@ -124,8 +127,8 @@ func (c *upstreamConn) close() {
 	})
 }
 
-func (c *upstreamConn) watchStall() {
-	tick := relayStallTimeout / 4
+func (c *upstreamConn) watchStall(timeout time.Duration) {
+	tick := timeout / 4
 	if tick <= 0 {
 		tick = time.Millisecond
 	}
@@ -136,7 +139,7 @@ func (c *upstreamConn) watchStall() {
 		case <-c.stop:
 			return
 		case <-t.C:
-			if time.Since(time.Unix(0, c.last.Load())) >= relayStallTimeout {
+			if time.Since(time.Unix(0, c.last.Load())) >= timeout {
 				c.cancel() // 打断 Read,交给 Serve 的续传逻辑
 				return
 			}
@@ -339,8 +342,8 @@ func (s *Relay) openConn(ctx context.Context, in StreamInput, link streamLink, r
 	}
 	c := &upstreamConn{resp: resp, cancel: cancel, stop: make(chan struct{})}
 	c.touch()
-	if relayStallTimeout > 0 {
-		go c.watchStall()
+	if stall := s.stallTimeout; stall > 0 {
+		go c.watchStall(stall)
 	}
 	return c, nil
 }

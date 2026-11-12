@@ -413,14 +413,6 @@ func TestRelayClientCancelCountedAsClientGone(t *testing.T) {
 	}
 }
 
-// withStallTimeout 临时把停流看门狗阈值调小,让单测几百毫秒就能触发挂死判定。
-func withStallTimeout(t *testing.T, d time.Duration) {
-	t.Helper()
-	old := relayStallTimeout
-	relayStallTimeout = d
-	t.Cleanup(func() { relayStallTimeout = old })
-}
-
 // rangeHandler 造一个「先快后断」的上游:首次请求(无 Range)吐 chunk 字节后掐断连接,
 // 之后按 Range 返回剩余部分。返回已服务的请求数(供断言续传次数)。
 func abortingUpstream(t *testing.T, payload []byte, chunk int) *fakeUpstream {
@@ -501,7 +493,6 @@ func TestRelayResumesAfterUpstreamAbort(t *testing.T) {
 func TestRelayResumesAfterStall(t *testing.T) {
 	payload := bytes.Repeat([]byte("s"), 200<<10)
 	const cut = 64 << 10
-	withStallTimeout(t, 200*time.Millisecond)
 
 	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Accept-Ranges", "bytes")
@@ -530,6 +521,7 @@ func TestRelayResumesAfterStall(t *testing.T) {
 	defer up.Close()
 
 	relay, key := newRelayFixture(t, up.URL)
+	relay.stallTimeout = 200 * time.Millisecond // 挂死判定缩到 200ms,单测不必等 60s
 	rec := httptest.NewRecorder()
 	if err := relay.Serve(context.Background(), rec, StreamInput{Pan: "fake", ShareKey: key, FID: "f1"}, ""); err != nil {
 		t.Fatalf("relay: %v", err)
