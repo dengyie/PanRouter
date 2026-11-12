@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"golang.org/x/sync/singleflight"
@@ -23,6 +24,12 @@ type AccountService struct {
 	log   *loggerType
 
 	sf singleflight.Group // 内部并发安全,无需外层互斥
+
+	// rr 是每个网盘的账号轮转游标:多账号池必须轮转,否则
+	// store.PickAccount 的「最近检查优先」会让同一个账号吃掉全部请求,
+	// 池子退化成单账号(风控命中时整条链路一起停摆)。
+	rrMu sync.Mutex
+	rr   map[string]int
 }
 
 // credCheckBudget 是共享凭据检查任务的独立期限:不跟随任何一个 HTTP 请求的
@@ -45,11 +52,44 @@ func (s *AccountService) DecryptCred(acc *repo.Account) (*driver.Credential, err
 	return &driver.Credential{Cookie: string(plain)}, nil
 }
 
-// Pick 选出一个可用账号(无账号返回 nil,nil —— 免登录盘允许匿名)。
+// Pick 轮转选出一个可用账号(无可用账号返回 nil,nil —— 免登录盘允许匿名)。
+//
+// 可选集合与 store.PickAccount 一致:status=ok,或 cooling 且冷却已到期
+// (选中即复位 ok);expired/banned 永远不可选。差异只在选择策略:
+// 这里按「网盘维度轮转」而不是「最近检查优先」,保证多账号池真正分散负载。
 func (s *AccountService) Pick(pan string) (*repo.Account, *driver.Credential, error) {
-	acc, err := s.store.PickAccount(pan)
-	if err != nil || acc == nil {
+	list, err := s.store.ListAccounts(pan)
+	if err != nil {
 		return nil, nil, err
+	}
+	now := time.Now()
+	eligible := make([]repo.Account, 0, len(list))
+	for i := range list {
+		switch list[i].Status {
+		case "ok":
+			eligible = append(eligible, list[i])
+		case "cooling":
+			if list[i].CooldownUntil != nil && list[i].CooldownUntil.Before(now) {
+				eligible = append(eligible, list[i])
+			}
+		}
+	}
+	if len(eligible) == 0 {
+		return nil, nil, nil
+	}
+	s.rrMu.Lock()
+	if s.rr == nil {
+		s.rr = map[string]int{}
+	}
+	idx := s.rr[pan] % len(eligible)
+	s.rr[pan]++
+	s.rrMu.Unlock()
+
+	acc := &eligible[idx]
+	if acc.Status == "cooling" {
+		// 冷却到期的账号被选中即恢复可用;落库失败不影响本次使用。
+		acc.Status = "ok"
+		_ = s.store.UpdateAccount(acc)
 	}
 	cred, err := s.DecryptCred(acc)
 	if err != nil {

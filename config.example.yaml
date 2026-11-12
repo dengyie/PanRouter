@@ -25,6 +25,8 @@ domain_routes:
     - pan.quark.cn
   mangodrive:
     - drive.example.com
+  baidu:
+    - pan.baidu.com
   lanzou:
     - lanzou.com
     - lanzouw.com
@@ -54,6 +56,15 @@ drivers:
     limit_qps: 5
     download_concurrency: 3
     redirect_allow: [".lanzouw.com", ".lanzou.com", ".lanzouu.com", ".xlig.cn", ".lanrar.com", ".dmpdmp.com", ".bakstotre.com"]
+
+  # 百度网盘:凭据为浏览器 BDUSS/STOKEN Cookie,多账号池 + 转存硬闸(50 次/天/账号)。
+  # 风控最严,pilot 期限频 1 QPS;直链必须带 netdisk UA(由 driver 下发)。
+  baidu:
+    enabled: true
+    limit_qps: 1
+    download_concurrency: 2
+    # 百度 CDN 会 302 到 .baidupcs.com 等域名,中转/直链按此白名单放行。
+    redirect_allow: [".baidu.com", ".baidupcs.com", ".baidupcs.cn", ".bdstatic.com"]
 
   # 私有云盘(Mango Drive / OpenList 后端):凭据是 OpenList API Token,
   # 在「账号管理」以 pan=mangodrive 添加后即可解析 drive.* 下的目录链接。

@@ -3,9 +3,11 @@ package service
 import (
 	"context"
 	"errors"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/dengyie/panrouter/internal/driver"
 	"github.com/dengyie/panrouter/internal/pkg/crypto"
@@ -186,5 +188,49 @@ func TestRefreshFirstCallerCancelDoesNotKillSharedCheck(t *testing.T) {
 	}
 	if got, _ := store.GetAccount(acc.ID); got == nil || got.Status != "ok" {
 		t.Fatalf("共享任务应已完成落库: %+v", got)
+	}
+}
+
+// 多账号池:Pick 必须在可用账号间轮转,不能反复命中同一个(store 层单一
+// 「最近检查优先」策略会让池子退化成单账号、风控连带全停)。
+func TestPickRotatesAccounts(t *testing.T) {
+	svc, _, _ := newTestAccService(t)
+	var ids []uint
+	for i := 0; i < 3; i++ {
+		acc, err := svc.Create("baidu", "n"+strconv.Itoa(i), "BDUSS="+strconv.Itoa(i), panKnown)
+		if err != nil {
+			t.Fatal(err)
+		}
+		ids = append(ids, acc.ID)
+	}
+	seen := map[uint]int{}
+	for i := 0; i < 6; i++ {
+		acc, _, err := svc.Pick("baidu")
+		if err != nil || acc == nil {
+			t.Fatalf("pick %d: acc=%v err=%v", i, acc, err)
+		}
+		seen[acc.ID]++
+	}
+	for _, id := range ids {
+		if seen[id] != 2 {
+			t.Fatalf("rotation uneven: %v", seen)
+		}
+	}
+
+	// 冷却中/已失效账号必须被跳过;冷却到期后重新进入轮转并复位 ok。
+	for _, id := range ids[1:] {
+		svc.MarkCooldown(id, time.Hour)
+	}
+	svc.MarkStatus(ids[2], "expired")
+	picks := map[uint]bool{}
+	for i := 0; i < 5; i++ {
+		acc, _, err := svc.Pick("baidu")
+		if err != nil || acc == nil {
+			t.Fatalf("pick with cooling: %v", err)
+		}
+		picks[acc.ID] = true
+	}
+	if len(picks) != 1 || !picks[ids[0]] {
+		t.Fatalf("only the healthy account may be picked, got %v", picks)
 	}
 }

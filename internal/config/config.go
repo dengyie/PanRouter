@@ -137,6 +137,7 @@ func Default() *Config {
 	c.DomainRoutes = map[string][]string{
 		"quark":      {"pan.quark.cn"},
 		"mangodrive": {"drive.example.com"},
+		"baidu":      {"pan.baidu.com"},
 		"lanzou":     {"lanzou.com", "lanzouw.com", "lanzoui.com", "lanzoue.com", "lanzouf.com", "lanzoa.com", "lanzoub.com", "lanzouc.com", "lanzoud.com", "lanzouv.com", "lanzoux.com", "lansov.com", "lanzn.com", "lanzouq.com", "lanzouy.com", "lanzouu.com"},
 	}
 	c.Drivers = map[string]DriverCommon{
@@ -151,6 +152,11 @@ func Default() *Config {
 		"lanzou": {
 			Enabled: true, LimitQPS: 5, DownloadConc: 3,
 			RedirectAllow: []string{"lanzou.com", "lanzouw.com", "lanzoui.com", "lanzoue.com", "lanzouf.com", "lanzoa.com", "lanzoub.com", "lanzouc.com", "lanzoud.com", "lanzouv.com", "lanzoux.com", "lansov.com", "lanzn.com", "lanzouq.com", "lanzouy.com", "lanzouu.com", ".xlig.cn", ".lanrar.com", ".dmpdmp.com", ".bakstotre.com"},
+		},
+		// 百度风控最严:pilot 期限频 1 QPS,转存另有 50 次/天/账号硬闸(见 driver)。
+		"baidu": {
+			Enabled: true, LimitQPS: 1, DownloadConc: 2,
+			RedirectAllow: []string{".baidu.com", ".baidupcs.com", ".baidupcs.cn", ".bdstatic.com"},
 		},
 	}
 	c.Aria2.Endpoint = "http://127.0.0.1:6800/jsonrpc"

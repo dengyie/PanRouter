@@ -326,7 +326,22 @@ type DirectLink struct {
 
 iframe / modern / 密码分享三条流;最终 CDN 对非浏览器客户端先 acw_sc__v2 挑战(httpx 自动解题,§11),再可能落「验证并下载」页(`down_r` + POST `ajax.php`)换真实文件 URL。
 
-### 10.4 限频 / 熔断 / 并发闸
+### 10.4 baidu(转存链 + 多账号池, v2.12)
+
+与夸克同型(Cookie 登录态 + 分享链接 + 风控),差异是**必须转存到账号自己的网盘**才能取直链:
+
+`share/verify(有提取码时)→ xpan/share 列目录(根 root=1,子目录 root=0 + BDCLND)→ share/transfer(ondup=newcopy 进 panrouter_tmp)→ locatedownload → 清理副本`
+
+- **分享解析**匿名可用(未加密分享不需要登录);新 surl 是 base64url(含 `_`/`-`),旧 base62 正则会把新链接误判成「STOKEN 缺失」
+- 列目录根目录必须 `root=1`;子目录 `root=0` 且 Cookie 必须带 `BDCLND=<randsk>`(verify 返回的 sekey)
+- **提链必须登录态**:转存 + locatedownload 全部依赖 bdstoken;`bdstoken` 随会话漂移,进程内按登录态指纹缓存,errno 105 时刷新重试一次
+- 取链优先 `d.pcs.baidu.com` 客户端协议 locatedownload(硬编码 psign/rand/devuid 属上游公开常量,**会腐坏**),失败自动退回 `/api/filemetas?dlink=1`;两条路都拿不到才报 upstream_error
+- 直链下发 `netdisk;…` UA + 完整 Cookie;`BindIP=false`,但链接 45 分钟后由 Resolver 续签
+- 清理只删 `panrouter_tmp` 内本次转存路径(`defer cleanupSaved(WithoutCancel)`,独立有界 ctx),失败只记日志——宁可留副本,不误删用户文件
+- **日转存硬闸 50 次/账号**(按登录态指纹 + 本地日计数,进程内):pilot 期防风控,超限诚实返回 `risk_control`;多账号池下配额按账号独立
+- 默认 `limit_qps: 1`、`download_concurrency: 2`(百度风控最严);错误分类见 §8,`9019` 安全验证 → risk_control,账号侧 5min 冷却
+
+### 10.5 限频 / 熔断 / 并发闸
 
 - 限频:每网盘 token bucket,键 = `pan`(登录)/ `pan:guest`(游客),速率 = `drivers.*.limit_qps`(float64,支持小数;容量 ≥ 1、首扣令牌,P2-7 已修)
 - 熔断:per-key breaker,连续 5 次 RiskControl/Upstream → 冷却 10min;无 half-open
@@ -487,6 +502,8 @@ iframe / modern / 密码分享三条流;最终 CDN 对非浏览器客户端先 a
 ---
 
 ## 变更记录
+
+- **v2.12(2026-11-13)**:新增**百度网盘 driver**(`internal/driver/baidu`,契约零变化,纯增量)。① **链路**:`share/verify → xpan/share 列目录 → share/transfer(ondup=newcopy) → locatedownload → 清理副本`;与夸克同型但百度**必须转存**才能取直链。实现口径逐条来自本仓姊妹项目 YunX-Desktop 生产在用的 `BaiduApi` + 上游公开实现交叉验证,不是推测。② **已知坑显式处理**:新 surl 是 base64url(`_`/`-`),旧 base62 正则会把新链接误判成「STOKEN 缺失」,解析器按 `[0-9A-Za-z_-]` 取;列目录根目录必须 `root=1`、子目录 `root=0` 且 Cookie 带 `BDCLND=<randsk>`;`bdstoken` 随会话漂移 → 按登录态指纹缓存 + errno 105 刷新重试一次;locatedownload 的 psign/rand/devuid 是上游公开硬编码常量(会腐坏)→ 失败自动退回 `filemetas?dlink=1`,两路都失败才报 upstream_error。③ **安全/pilot 闸**:日转存 50 次/账号硬闸(按登录态指纹 + 本地日,超限诚实返回 risk_control,不硬闯风控);默认 `limit_qps: 1`、`download_concurrency: 2`;`redirect_allow` 仅 `.baidu.com/.baidupcs.com/.baidupcs.cn/.bdstatic.com`;清理只删 `panrouter_tmp` 内本次转存路径,独立有界 ctx,失败只记日志。④ **多账号池真正生效**(此前后端 `store.PickAccount` 恒取「最近检查优先」→ 同网盘多账号永远只有第一个在干活,池子退化成单账号,风控命中即全链路停摆):`AccountService.Pick` 改为按网盘轮转(候选集合语义不变:ok 或冷却到期,expired/banned 永不可选),新增 `TestPickRotatesAccounts`。⑤ 注册与配置:`app.go` factory + `config.Default()`/`config.example.yaml` 的 `domain_routes.baidu` 与 `drivers.baidu`。测试:新增 `internal/driver/baidu` 8 个用例(链接形态/errno 分类/根与子目录遍历 + BDCLND 透传/转存链选 encrypt=0/fallback/配额闸/凭据校验),`go vet ./...` 干净,全量 17 包绿。
 
 - **v2.11.1(2026-11-12)**:深度 review 收口轮(phase-gate review 两项 backlog 落地)。① **banned 终态不被探测复活**:checkAcc 对凭据有效的状态保持逻辑原只保护 cooling —— banned(人工/风控终态,当前无自动写入方,保留语义供运维手改与仪表盘展示)的账号若凭据「碰巧有效」,一次健康检查就被写回 ok,终态被旁路打穿;改为 `switch acc.Status { case "cooling", "banned": status = acc.Status }`,终态的唯一解除路径是人工操作(与状态机单向逃逸只有冷却到期的口径一致);失效→expired 迁移仍放行。② **快照自愈扫描上限 `healScanLimit = 64`**:healShareNode 原对同 pan_type **全部** shares 逆序全扫 + 逐条 JSON 解析,而自愈找的是「同一份分享的另一条快照」(同一 URL 的另一种形态),命中几乎必然落在最近几条;封顶后空壳 miss 的最坏成本是常数次 JSON 解析,不随 shares 总量线性增长(当前生产 9 行,上限是数百倍冗余)。**判别力已验证**(行为级回退,只回退逻辑分支保留常量定义):回退 banned 保护 → `TestCheckKeepsBannedOnValidCredential` 失败;回退扫描上限 → `TestHealScanLimitBoundsSiblingSearch` 失败(窗口外老快照被自愈消费)。测试:`go vet ./...` 干净,全量 13 包绿。
 - **v2.11(2026-11-12)**:深度审计修复轮(两轮独立审计交叉 + 生产实证,共 12 项根因修复)。**P0 ① 下载入口 fid 路径段编码**:mangodrive 的 path 形态 fid 就是存储路径(含 `/`),而 chi 的 `{fid}` 参数不跨段 → 签发端把 fid 原样拼进路径,这类文件的 `/d`、`/stream`、`/api/v1/json`、aria2 中转 URL **必然 404**(生产实证:mangodrive welcome.txt 提链 200、其 download_url 请求 404,同一响应里 quark fid 正常)。修复:新增 `service/dlurl.go`(`FIDPathSeg`/`FIDFromPathSeg`/`EntryURL`),四个签发点统一编码;签名 payload 恒为**原始 fid**,验签端先解回原始形再验签;fid 无保留字符时编码恒等(夸克/蓝奏云零影响)。**P1 ② 占位元数据遮蔽真实元数据**(与 v2.9/v2.10 同型第三例):「兜底名『文件』+0」落库后,`fileMeta` 只判 `FileName != ""` 即命中 → 快照/自愈/历史里的真实名字/大小被**永久遮蔽**(生产实证:池文件 resolve 返回 `file_name=文件, size=0`)。修复三层:`repo.UpsertLink` 占位元数据不覆盖已有真实值(`LinkMetaIsPlaceholder` 单一口径);`fileMeta`/缓存命中/历史回退全部跳过占位行;driver 提链途中带回的元数据(`DirectLink.Name/Size`,mangodrive fs/get 本就返回)优先采用 —— 根 URL + 深路径 fid 场景下这是唯一来源。**P1 ③ 账号健康检查解除风控冷却**:`checkAcc` 凭据有效即写回 ok,一次探测就复活被风控的账号;修复:cooling 账号校验成功保持 cooling(复位只经冷却到期),失效→expired 仍放行。**P1 ④ MarkStatus/MarkCooldown 整行回写**:并发下用过期快照冲掉 cooldown_until/cred_version;改 `MarkAccountStatus`/`MarkAccountCooldown` 定向列更新。**P1 ⑤ aria2 空响应 nil 解引用**:网关截断/aria2 重启时 `result` 缺失 → panic(500 丢真实原因);显式报「响应缺少 result 字段」,空 gid 拒绝落库,状态回写只更新非空字段且 `UpdateDownload` 改定向列(原 `Save` 整行覆盖,空串会抹掉已有失败原因)。**P1 ⑥ mangodrive 上传 200+空 body 判成功**:OpenList fs/put 正常必回 JSON,空 body(代理截断)时 `resp.Code==0` 被当成功 → 转存报 done 而远端无文件(静默丢文件);显式报「响应为空」。**P1 ⑦ 转存源选择不跳过提链失败文件**:目录转存取第一个非目录文件,若它 LinkError 非空则整次转存原样复现失败;改为跳过 LinkError 项,全失败时回退首个候选给出**真实**上游错误。**P1 ⑧ 账号 id 解析错误被吞**:`ParseUint` 错误丢弃 → id=0 继续执行并写误导性审计;改报 400(KindUnsupported)。**P1 ⑨ mangodrive 无基址发无 scheme 请求**:public_base/internal_base 均未配置时显式报「未配置 API 基址」(提链与 CheckCredential 两处)。**P2 ⑩ buildRef 的 ext 有效性只看 `len(map)>0`**:历史坏行 `{"api":""}`(mangodrive 恒空 api 键)以「有键无值」冒充有效上下文,把快照/自愈/历史恢复链全部短路 → 哈希 fid 提链 404;改按「至少一个非空值」判定(`extHasValue`),快照候选节点与自愈来源同口径。**P2 ⑪ 快照自愈取最旧命中**:按 id 升序扫,最新快照的 stoken/path 反而拿不到;改逆序消费(id 降序 = 最新优先)。**P2 ⑫ 转存空响应/0 字节三连**:stream 通道 `size==0` 跳过字节数校验 → 200 空 body 落 0 字节产物标 done(现以源登记大小为独立证据,登记非零却实收 0 必报错);offline 产物确认要求非空 → 源本身 0 字节的合法产物永远确认不了、超窗误报 failed(expect==0 改以 mtime 新鲜度判定,expect>0 仍严格);quark `findTmpDir` 失败冒充 mkdir 错误(`return "", ferr`)。**判别力已验证**:整体回退(仅保留测试)→ `TestE2EDownloadSlashFidFullPathEscaped`、`TestE2EAccountInvalidIDRejected`、`TestTmpDirFindFailureReturnsFindError` 失败;`TestHealPrefersNewestSiblingSnapshot` 在实现前实跑失败(取到 OLD-STOKEN)。新增回归:`internal/api/download_fidpath_test.go`(斜杠 fid 全链路 302/stream/400 对照)、`internal/repo/repo_meta_guard_test.go`、`internal/service/resolver_meta_guard_test.go`、`internal/service/account_cooling_test.go`、`internal/service/transfer_guard_test.go`、`internal/driver/mangodrive/upload_guard_test.go`、`internal/driver/quark/p212_tmpdir_err_test.go`。审计同时确认一批「看似可疑、实际安全」的位点不改(`UpsertSyncItem` DELETE+INSERT 的 AUTOINCREMENT 单调性、`ListLinksByFID` 排序、`RawTreeHasContent`/`extHasContent` 口径、`nil→"[]"` 规范化、身份闸、`PickAccount` 单选、`relay` 死链失效等)。测试:`go vet ./...` 干净,全量 13 包绿(CI 另跑 `-race -shuffle=on`)。
