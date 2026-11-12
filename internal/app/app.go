@@ -171,6 +171,13 @@ func Build(o Options) (*App, error) {
 	cfgp.Set(cfg)
 
 	accSvc := service.NewAccountService(store, aes, met, o.Logger)
+	// 启动自检:主密钥变更(或回落来源变化)会让历史凭据全部解不开。
+	// 提前显式告警,不要等到第一个请求 502「读取账号凭据失败」才发现。
+	if total, unreadable := accSvc.AuditUnreadable(); unreadable > 0 {
+		o.Logger.Warnf("credential self-check: %d/%d accounts cannot be decrypted with the current master key "+
+			"(PANROUTER_MASTER_KEY unset → jwt_secret fallback, or it changed); "+
+			"unreadable accounts will be skipped and marked expired on use", unreadable, total)
+	}
 	resolver := service.NewResolver(cfgp, reg, store, aes, accSvc, lim, brs, signer, met, o.Logger)
 	relay := service.NewRelay(resolver, streamClients, store, aes, o.Logger)
 	aria2, err := service.NewAria2(cfgp, signer, resolver, store, aes, met, o.Logger)

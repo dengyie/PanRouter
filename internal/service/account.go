@@ -81,21 +81,58 @@ func (s *AccountService) Pick(pan string) (*repo.Account, *driver.Credential, er
 	if s.rr == nil {
 		s.rr = map[string]int{}
 	}
-	idx := s.rr[pan] % len(eligible)
+	start := s.rr[pan] % len(eligible)
 	s.rr[pan]++
 	s.rrMu.Unlock()
 
-	acc := &eligible[idx]
-	if acc.Status == "cooling" {
-		// 冷却到期的账号被选中即恢复可用;落库失败不影响本次使用。
-		acc.Status = "ok"
-		_ = s.store.UpdateAccount(acc)
+	// ★ 坏凭据不得毒化整个账号池:解密失败是确定性故障(主密钥变更/数据损坏),
+	//   轮转撞上坏号时必须跳过并落库 expired,继续尝试下一个候选。旧实现直接
+	//   返回错误,结果是一个解不开的账号就让该 pan 的**全部**登录态请求 502
+	//   「读取账号凭据失败」,而且状态仍是 ok,下一轮继续撞同一堵墙。
+	for i := 0; i < len(eligible); i++ {
+		acc := eligible[(start+i)%len(eligible)]
+		if acc.Status == "cooling" {
+			// 冷却到期的账号被选中即恢复可用;落库失败不影响本次使用。
+			acc.Status = "ok"
+			_ = s.store.MarkAccountStatus(acc.ID, "ok")
+		}
+		cred, derr := s.DecryptCred(&acc)
+		if derr == nil {
+			return &acc, cred, nil
+		}
+		s.log.Warnf("account %d pan=%s credential unreadable, mark expired: %v", acc.ID, acc.PanType, derr)
+		if merr := s.store.MarkAccountStatus(acc.ID, "expired"); merr != nil {
+			s.log.Warnf("mark account %d expired: %v", acc.ID, merr)
+		}
+		s.store.AddAudit("cred_unreadable",
+			fmt.Sprintf("account=%d pan=%s: %v", acc.ID, acc.PanType, derr))
+		s.RefreshStatusMetrics()
 	}
-	cred, err := s.DecryptCred(acc)
+	// 全部候选都解不开:按「无可用账号」处理(免登录盘可继续匿名解析),
+	// 上面已逐个标记 expired 并留审计,不再用 502 掩盖真实原因。
+	return nil, nil, nil
+}
+
+// AuditUnreadable 启动自检:统计无法用当前主密钥解密的凭据数。
+//
+// 主密钥来源是 PANROUTER_MASTER_KEY,未设置时回落 jwt_secret;两者任一变化,
+// 历史账号就会全部解不开。若不在启动时暴露,这种故障只会在请求期表现为
+// 「读取账号凭据失败」,根因不可见。只读,不改库——落库 expired 由实际使用
+// (Pick / checkAcc)完成。
+func (s *AccountService) AuditUnreadable() (total, unreadable int) {
+	list, err := s.store.ListAccounts("")
 	if err != nil {
-		return nil, nil, err
+		s.log.Warnf("credential self-check: %v", err)
+		return 0, 0
 	}
-	return acc, cred, nil
+	for i := range list {
+		if _, derr := s.DecryptCred(&list[i]); derr != nil {
+			unreadable++
+			s.log.Warnf("credential self-check: account=%d pan=%s unreadable: %v",
+				list[i].ID, list[i].PanType, derr)
+		}
+	}
+	return len(list), unreadable
 }
 
 // Check 凭据校验:看门狗与请求失败触发的刷新合并为一次执行(singleflight),
@@ -118,6 +155,22 @@ func (s *AccountService) checkAcc(ctx context.Context, acc *repo.Account, drv dr
 		defer cancel()
 		cred, err := s.DecryptCred(acc)
 		if err != nil {
+			// ★ 凭据不可解密是确定性故障(主密钥变更/数据损坏),必须落库:
+			//   旧实现只把 Valid=false 写进返回值,status 仍是 ok —— 管理页手动
+			//   刷新与 watchdog 每轮都"检查成功",坏号永远留在可用池里,还会被
+			//   请求链路反复选中。banned 是人工终态,校验不得越权解除。
+			now := time.Now()
+			status := "expired"
+			if acc.Status == "banned" {
+				status = "banned"
+			}
+			if uerr := s.store.UpdateAccountCheck(acc.ID, status, now, acc.Status); uerr != nil {
+				s.log.Warnf("persist unreadable credential status account=%d: %v", acc.ID, uerr)
+			}
+			s.store.AddAudit("cred_check",
+				fmt.Sprintf("account=%d pan=%s valid=false reason=unreadable", acc.ID, acc.PanType))
+			s.RefreshStatusMetrics()
+			s.log.Warnf("credential unreadable: account=%d pan=%s: %v", acc.ID, acc.PanType, err)
 			return driver.CredStatus{Valid: false, Message: err.Error()}, nil
 		}
 		st, err := drv.CheckCredential(tctx, *cred)
