@@ -66,6 +66,7 @@ func TestClassifyErrno(t *testing.T) {
 		{2, "提取码错误", driver.KindNotFound},
 		{105, "", driver.KindUpstream},
 		{110, "", driver.KindShareGone},
+		{140, "", driver.KindShareGone},
 		{113, "", driver.KindShareGone},
 		{9019, "", driver.KindRiskControl},
 		{31066, "", driver.KindRiskControl},

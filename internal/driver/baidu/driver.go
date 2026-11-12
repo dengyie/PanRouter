@@ -141,6 +141,10 @@ func classifyErrno(errno int, msg string) *driver.Error {
 	case 105:
 		// bdstoken 失效:调用方刷新后重试。
 		return driver.NewErr(driver.KindUpstream, "百度 bdstoken 已失效,请重试", errBdstoken)
+	case 140:
+		// 生产实证(2026-11-13):不存在的 /s/ 短链在 xpan/share 直接回 errno=140,
+		// errmsg 为空。归为分享失效,而不是含糊的 upstream_error(用户看得懂)。
+		return driver.NewErr(driver.KindShareGone, "百度分享链接无效或不存在", nil)
 	case 110, 9019:
 		// 110: 分享不存在/已删除; 9019: 需要安全验证
 		if errno == 9019 {
