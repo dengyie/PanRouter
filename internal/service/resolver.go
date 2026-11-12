@@ -77,7 +77,9 @@ func (r *Resolver) acquire(ctx context.Context, pan string) (release func(), err
 	case <-ctx.Done():
 		return nil, driver.NewErr(driver.KindUpstream, "等待并发额度时请求已取消", ctx.Err())
 	case <-time.After(15 * time.Second):
-		return nil, driver.NewErr(driver.KindRiskControl, "等待并发额度超时,请稍后重试", nil)
+		// 在途并发闸也是本地准入:标记 errLocalThrottle,不让它被当成上游风控。
+		r.met.Inc("panrouter_local_throttle_total", map[string]string{"pan": pan, "reason": "concurrency"})
+		return nil, &errLocalThrottle{driver.NewErr(driver.KindRiskControl, "等待并发额度超时,请稍后重试", nil)}
 	}
 }
 
@@ -209,12 +211,16 @@ func (r *Resolver) guard(ctx context.Context, pan string, fn func() error) error
 	}
 	b := r.breakers.Get(key)
 	r.met.Set("panrouter_breaker_open", map[string]string{"pan": pan, "scope": scope}, boolGauge(b.Opened()))
+	// 本地准入拒绝用 errLocalThrottle 包一层:对外仍是 risk_control/429,
+	// 但 mapErr 不会据此冷却账号(见 errLocalThrottle 注释)。
 	if !b.Allow() {
 		r.met.Inc("panrouter_driver_error_total", map[string]string{"pan": pan, "kind": "breaker_open"})
-		return driver.NewErr(driver.KindRiskControl, "该网盘熔断中(近期风控/异常过多),请稍后再试", nil)
+		r.met.Inc("panrouter_local_throttle_total", map[string]string{"pan": pan, "reason": "breaker"})
+		return &errLocalThrottle{driver.NewErr(driver.KindRiskControl, "该网盘熔断中(近期风控/异常过多),请稍后再试", nil)}
 	}
 	if !r.limiter.Allow(key, r.driverCfg(pan).LimitQPS) {
-		return driver.NewErr(driver.KindRiskControl, "本地限频:请求过于频繁,请稍后", nil)
+		r.met.Inc("panrouter_local_throttle_total", map[string]string{"pan": pan, "reason": "rate_limit"})
+		return &errLocalThrottle{driver.NewErr(driver.KindRiskControl, "本地限频:请求过于频繁,请稍后", nil)}
 	}
 	err := fn()
 	fail := false
@@ -239,6 +245,20 @@ func boolGauge(b bool) float64 {
 	return 0
 }
 
+// errLocalThrottle 标记「我方」准入拒绝(熔断打开 / 本地令牌桶空),而非上游风控。
+//
+// 对外契约不变:Unwrap 透出内层 driver.Error,api 层仍映射为 risk_control → 429,
+// 客户端按退避重试即可。唯一的区别在副作用——mapErr 不得据此冷却账号。
+//
+// ★ 旧实现把本地限频/熔断直接当 KindRiskControl 处理:一次客户端并发打满令牌桶,
+//   就会把**完全正常**的账号 MarkCooldown 5 分钟,让它在冷却期退出轮转。我们自己的
+//   准入闸反过来惩罚了健康账号,还会把「本地限频」误记成「上游风控」(现场:6 个并发
+//   解析 → 3 个 429 → quark 账号 id=1 变成 cooling)。
+type errLocalThrottle struct{ err error }
+
+func (e *errLocalThrottle) Error() string { return e.err.Error() }
+func (e *errLocalThrottle) Unwrap() error { return e.err }
+
 // mapErr 处理 driver 错误的副作用(账号标记等),原样返回给上层映射 HTTP 状态。
 func (r *Resolver) mapErr(ctx context.Context, pan string, acc *repo.Account, err error) error {
 	if err == nil {
@@ -246,6 +266,11 @@ func (r *Resolver) mapErr(ctx context.Context, pan string, acc *repo.Account, er
 	}
 	var de *driver.Error
 	if !errors.As(err, &de) {
+		return err
+	}
+	var lt *errLocalThrottle
+	if errors.As(err, &lt) {
+		// 本地限频/熔断是准入决策,不是上游对账号的惩罚:不改账号状态。
 		return err
 	}
 	switch de.Kind {

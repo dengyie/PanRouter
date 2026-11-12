@@ -131,6 +131,9 @@ func (r *Registry) snapshot() []byte {
 	writeFamily("counter", "panrouter_download_route_total", r.counters["panrouter_download_route_total"])
 	writeFamily("counter", "panrouter_link_cache_hit_total", r.counters["panrouter_link_cache_hit_total"])
 	writeFamily("counter", "panrouter_driver_error_total", r.counters["panrouter_driver_error_total"])
+	// 本地准入拒绝(令牌桶/熔断):与 driver_error_total 分开,避免把
+	// 「我们自己限的流」统计成「上游出错」,也便于和账号冷却事件区分来源。
+	writeFamily("counter", "panrouter_local_throttle_total", r.counters["panrouter_local_throttle_total"])
 	writeFamily("gauge", "panrouter_breaker_open", r.gauges["panrouter_breaker_open"])
 	writeFamily("gauge", "panrouter_account_status", r.gauges["panrouter_account_status"])
 	return []byte(sb.String())
