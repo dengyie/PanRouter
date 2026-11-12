@@ -127,14 +127,26 @@ func (r *Registry) snapshot() []byte {
 			fmt.Fprintf(&sb, "%s{%s} %v\n", name, s.labels, s.value)
 		}
 	}
-	writeFamily("counter", "panrouter_resolve_total", r.counters["panrouter_resolve_total"])
-	writeFamily("counter", "panrouter_download_route_total", r.counters["panrouter_download_route_total"])
-	writeFamily("counter", "panrouter_link_cache_hit_total", r.counters["panrouter_link_cache_hit_total"])
-	writeFamily("counter", "panrouter_driver_error_total", r.counters["panrouter_driver_error_total"])
-	// 本地准入拒绝(令牌桶/熔断):与 driver_error_total 分开,避免把
-	// 「我们自己限的流」统计成「上游出错」,也便于和账号冷却事件区分来源。
-	writeFamily("counter", "panrouter_local_throttle_total", r.counters["panrouter_local_throttle_total"])
-	writeFamily("gauge", "panrouter_breaker_open", r.gauges["panrouter_breaker_open"])
-	writeFamily("gauge", "panrouter_account_status", r.gauges["panrouter_account_status"])
+	// ★ 不维护指标白名单:Inc/Set 之后忘记在此登记,会让指标**静默消失**
+	//   (v2.12.3 新增 local_throttle 时就踩过:计数在跑、/metrics 里看不到)。
+	//   改为按已注册名字全集输出,顺序排序保证文本稳定;counter 与 gauge
+	//   同名不可能同时存在(同名先判 counter)。
+	names := make([]string, 0, len(r.counters)+len(r.gauges))
+	for name := range r.counters {
+		names = append(names, name)
+	}
+	for name := range r.gauges {
+		if _, dup := r.counters[name]; !dup {
+			names = append(names, name)
+		}
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		if m, ok := r.counters[name]; ok {
+			writeFamily("counter", name, m)
+			continue
+		}
+		writeFamily("gauge", name, r.gauges[name])
+	}
 	return []byte(sb.String())
 }
