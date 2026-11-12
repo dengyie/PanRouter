@@ -2,11 +2,12 @@ package com.yunx.app.data.panrouter
 
 import com.yunx.app.data.db.AppDatabase
 import com.yunx.app.data.download.DownloadPlatform
+import com.yunx.app.data.network.BaiduConstants
 
 /**
  * 本机可贡献给 PanRouter 账号池的网盘账号（规格 §5.3 M2「账号贡献」）。
  *
- * 只枚举**服务端覆盖集内**的平台（夸克 / 蓝奏云，对齐 ResolveRouter）；
+ * 只枚举**服务端覆盖集内**的平台（夸克 / 蓝奏云 / 百度，对齐 ResolveRouter）；
  * 凭据经 SecureAccountDaos 透明解密读出 —— 仅在贡献对话框打开期间驻留内存
  * （**不落日志、不回显、不入持久化**），上传请求发出后随对话框关闭而释放。
  *
@@ -17,7 +18,7 @@ class PanRouterContribution(private val db: AppDatabase) {
     /** 一条可贡献账号（credential 仅在贡献请求时使用，UI 层不得持有） */
     data class Contributable(
         val platform: String,
-        /** 服务端 pan_type（quark / lanzou） */
+        /** 服务端 pan_type（quark / lanzou / baidu） */
         val panType: String,
         /** 展示名：备注优先，回退昵称，再回退账号 id */
         val displayName: String,
@@ -42,6 +43,13 @@ class PanRouterContribution(private val db: AppDatabase) {
         lanzou.forEach { a ->
             if (a.cookie.isBlank()) return@forEach
             out += contributable(DownloadPlatform.LANZOU, "lanzou", a.nickname, a.remark, a.isPrimary, a.cookie, serverNames)
+        }
+        // 百度网盘：服务端 baidu driver 是多账号池,转存有 50 次/天/账号硬闸,
+        // 贡献多个账号能线性分散配额与风控面。Cookie 仅含 BDUSS/STOKEN,无设备指纹。
+        val baidu = runCatching { db.baiduAccountDao().getAccounts() }.getOrDefault(emptyList())
+        baidu.forEach { a ->
+            if (!BaiduConstants.isValidCookie(a.cookie)) return@forEach
+            out += contributable(DownloadPlatform.BAIDU, "baidu", a.nickname, a.remark, a.isPrimary, a.cookie, serverNames)
         }
         return out
     }

@@ -18,13 +18,14 @@ object ResolveRouter {
     enum class Route { REMOTE, LOCAL }
 
     /**
-     * 服务端 driver 覆盖集（M1，对应 panrouter 生产 v1.1.12：quark / lanzou）。
-     * 服务端 M2 扩容（123/UC/139/189）后随版本更新此表；
-     * 运行期「服务端说不支持」的自学习覆盖修正见 [PanRouterResolveGateway] 的 uncovered 集。
+     * 服务端 driver 覆盖集（对应 panrouter 生产：quark / lanzou / mangodrive / baidu）。
+     * 服务端扩容后随版本更新此表；运行期「服务端说不支持」的自学习覆盖修正见
+     * [PanRouterResolveGateway] 的 uncovered 集。
      */
     private val SERVER_COVERAGE: Map<SharePlatform, String> = mapOf(
         SharePlatform.QUARK to "quark",
-        SharePlatform.LANZOU to "lanzou"
+        SharePlatform.LANZOU to "lanzou",
+        SharePlatform.BAIDU to "baidu"
     )
 
     /** 平台 → 服务端 pan 标识；未覆盖返回 null（调用方据此走 LOCAL） */
@@ -38,6 +39,7 @@ object ResolveRouter {
         "quark" -> DownloadPlatform.QUARK
         "lanzou" -> DownloadPlatform.LANZOU
         "mangodrive" -> DownloadPlatform.MANGO
+        "baidu" -> DownloadPlatform.BAIDU
         else -> DownloadPlatform.GENERIC
     }
 

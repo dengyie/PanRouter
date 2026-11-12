@@ -46,15 +46,15 @@ class ResolveRouterTest {
         )
     }
 
-    // ---------- 服务端覆盖集（M1：quark / lanzou） ----------
+    // ---------- 服务端覆盖集（quark / lanzou / baidu） ----------
 
     @Test
-    fun `server coverage is quark and lanzou only`() {
+    fun `server coverage is quark lanzou baidu`() {
         assertEquals("quark", ResolveRouter.serverPanFor(SharePlatform.QUARK))
         assertEquals("lanzou", ResolveRouter.serverPanFor(SharePlatform.LANZOU))
+        assertEquals("baidu", ResolveRouter.serverPanFor(SharePlatform.BAIDU))
         assertNull(ResolveRouter.serverPanFor(SharePlatform.UC))
         assertNull(ResolveRouter.serverPanFor(SharePlatform.XUNLEI))
-        assertNull(ResolveRouter.serverPanFor(SharePlatform.BAIDU))
         assertNull(ResolveRouter.serverPanFor(SharePlatform.C139))
         assertNull(ResolveRouter.serverPanFor(SharePlatform.PAN123))
         assertNull(ResolveRouter.serverPanFor(SharePlatform.PAN115))
@@ -69,6 +69,7 @@ class ResolveRouterTest {
     fun `pan maps to download platform`() {
         assertEquals(DownloadPlatform.QUARK, ResolveRouter.downloadPlatformFor("quark"))
         assertEquals(DownloadPlatform.LANZOU, ResolveRouter.downloadPlatformFor("lanzou"))
+        assertEquals(DownloadPlatform.BAIDU, ResolveRouter.downloadPlatformFor("baidu"))
         assertEquals(DownloadPlatform.GENERIC, ResolveRouter.downloadPlatformFor("unknown_pan"))
     }
 }

@@ -1110,7 +1110,7 @@ class ResolveViewModel(
         if (batchGateway != null && multiLinks.size > 1) {
             if (multiLinks.any { batchGateway.serverPanFor(it.share.platform) == null }) {
                 prefillRequest = lastResolveInput
-                uiState = ResolveUiState.Error("批量解析仅支持夸克 / 蓝奏云分享，其余网盘请分开粘贴解析")
+                uiState = ResolveUiState.Error("批量解析仅支持服务端已覆盖的网盘（夸克 / 蓝奏云 / 百度）分享，其余网盘请分开粘贴解析")
                 return
             }
             when {

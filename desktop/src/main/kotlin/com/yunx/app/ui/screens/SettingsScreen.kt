@@ -501,7 +501,7 @@ fun SettingsScreen(
             SettingsItem(
                 icon = Icons.Outlined.Backup,
                 title = "贡献账号到服务端账号池",
-                description = "把本机已登录的夸克 / 蓝奏云账号上传给 PanRouter（服务端加密存储），云端解析即可用",
+                description = "把本机已登录的夸克 / 蓝奏云 / 百度账号上传给 PanRouter（服务端加密存储），云端解析即可用；同一网盘多账号会轮流使用",
                 onClick = { showPanRouterContributeDialog = true }
             )
         }
@@ -2170,7 +2170,7 @@ private fun PanRouterContributeDialog(
                 when {
                     loading -> Text("正在读取本机账号…", style = MaterialTheme.typography.bodySmall)
                     accounts.isEmpty() -> Text(
-                        "本机没有可贡献的账号（需要先在「网盘」页登录夸克 / 蓝奏云）",
+                        "本机没有可贡献的账号（需要先在「网盘」页登录夸克 / 蓝奏云 / 百度）",
                         style = MaterialTheme.typography.bodySmall
                     )
                     else -> Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
