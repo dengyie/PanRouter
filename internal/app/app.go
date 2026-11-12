@@ -66,6 +66,9 @@ type ExtraDriver struct {
 	Driver       driver.Driver
 	APIClient    *httpx.Client
 	StreamClient *httpx.Client
+	// RelayClient 留空则复用 StreamClient:Relay 轮换连接时会关闭整个 Transport 的
+	// 空闲连接,与 Transfer 共用同一份会互相干扰(见 NewRelay 调用处注释)。
+	RelayClient *httpx.Client
 }
 
 // App 是装配完成的全部运行时依赖。
@@ -118,9 +121,13 @@ func Build(o Options) (*App, error) {
 		})
 	}
 
-	// 每个 driver 两个客户端:API 调用受总超时约束;中转流不限体传输时长
+	// 每个 driver 三个客户端:API 调用受总超时约束;中转流不限体传输时长;
+	// relay 再单独一份——Relay 每次轮换都调 Transport.CloseIdleConnections(),
+	// 该调用是整个 Transport 级别的,与 Transfer 共用会把它的空闲连接一并关掉。
+	// 多一份 Transport 的代价远小于这种跨功能耦合。
 	apiClients := map[string]*httpx.Client{}
 	streamClients := map[string]*httpx.Client{}
+	relayClients := map[string]*httpx.Client{}
 	var driversList []driver.Driver
 	ids := make([]string, 0, len(cfg.Drivers))
 	for id := range cfg.Drivers {
@@ -147,7 +154,12 @@ func Build(o Options) (*App, error) {
 			_ = store.Close()
 			return nil, fmt.Errorf("stream client %s: %w", id, err)
 		}
-		apiClients[id], streamClients[id] = apiCl, streamCl
+		relayCl, err := newClient(dc, true)
+		if err != nil {
+			_ = store.Close()
+			return nil, fmt.Errorf("relay client %s: %w", id, err)
+		}
+		apiClients[id], streamClients[id], relayClients[id] = apiCl, streamCl, relayCl
 		dd, derr := factory(context.Background(), apiCl, dc)
 		if derr != nil {
 			_ = store.Close()
@@ -163,6 +175,11 @@ func Build(o Options) (*App, error) {
 		}
 		if ex.StreamClient != nil {
 			streamClients[id] = ex.StreamClient
+		}
+		if ex.RelayClient != nil {
+			relayClients[id] = ex.RelayClient
+		} else if ex.StreamClient != nil {
+			relayClients[id] = ex.StreamClient
 		}
 	}
 	reg := driver.NewRegistry(driversList, cfg.DomainRoutes)
@@ -182,7 +199,7 @@ func Build(o Options) (*App, error) {
 			"unreadable accounts will be skipped and marked expired on use", unreadable, total)
 	}
 	resolver := service.NewResolver(cfgp, reg, store, aes, accSvc, lim, brs, signer, met, o.Logger)
-	relay := service.NewRelay(resolver, streamClients, store, aes, met, o.Logger)
+	relay := service.NewRelay(resolver, relayClients, store, aes, met, o.Logger)
 	aria2, err := service.NewAria2(cfgp, signer, resolver, store, aes, met, o.Logger)
 	if err != nil {
 		_ = store.Close()

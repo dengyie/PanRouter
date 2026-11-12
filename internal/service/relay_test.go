@@ -289,11 +289,13 @@ func parseTestRange(h string, total int) (int, int, bool) {
 }
 
 // withRotateBytes 临时把轮换阈值调小,让单测用 KB 级数据就能触发多条上游连接。
-func withRotateBytes(t *testing.T, v int64) {
+// 阈值挂在 Relay 实例上而不是包级变量:包级变量被测试改写时,已经在跑的
+// 看门狗/转发 goroutine 会与之形成 data race(v2.12.8 的 CI 就抓到过一次)。
+func withRotateBytes(t *testing.T, relay *Relay, v int64) {
 	t.Helper()
-	old := relayRotateBytes
-	relayRotateBytes = v
-	t.Cleanup(func() { relayRotateBytes = old })
+	old := relay.rotateBytes
+	relay.rotateBytes = v
+	t.Cleanup(func() { relay.rotateBytes = old })
 }
 
 // P0 回归:单条上游连接搬够 relayRotateBytes 后必须重开连接续传,
@@ -301,11 +303,11 @@ func withRotateBytes(t *testing.T, v int64) {
 func TestRelayRotatesUpstreamConnection(t *testing.T) {
 	payload := bytes.Repeat([]byte("abcdefgh"), 40<<10) // 320 KB
 	up := newFakeUpstream(t, payload, true)
-	// 阈值取 32 KB:即便每次 Read 都取满 128 KB,一条连接最多也只能搬
-	// 32K+128K=160K,320 KB 必然需要至少 2 次轮换(Read 返回得更碎只会更多)。
-	withRotateBytes(t, 32<<10)
 
 	relay, key := newRelayFixture(t, up.URL())
+	// 阈值取 32 KB:即便每次 Read 都取满 128 KB,一条连接最多也只能搬
+	// 32K+128K=160K,320 KB 必然需要至少 2 次轮换(Read 返回得更碎只会更多)。
+	withRotateBytes(t, relay, 32<<10)
 	rec := httptest.NewRecorder()
 	if err := relay.Serve(context.Background(), rec, StreamInput{Pan: "fake", ShareKey: key, FID: "f1"}, ""); err != nil {
 		t.Fatalf("relay: %v", err)
@@ -353,9 +355,9 @@ func TestRelayRotatesUpstreamConnection(t *testing.T) {
 func TestRelayNoRotateWhenUpstreamLacksRange(t *testing.T) {
 	payload := bytes.Repeat([]byte("z"), 320<<10)
 	up := newFakeUpstream(t, payload, false)
-	withRotateBytes(t, 100<<10)
 
 	relay, key := newRelayFixture(t, up.URL())
+	withRotateBytes(t, relay, 100<<10)
 	rec := httptest.NewRecorder()
 	if err := relay.Serve(context.Background(), rec, StreamInput{Pan: "fake", ShareKey: key, FID: "f1"}, ""); err != nil {
 		t.Fatalf("relay: %v", err)
@@ -507,8 +509,10 @@ func TestRelayResumesAfterUpstreamAbort(t *testing.T) {
 	if len(got) != 2 {
 		t.Fatalf("want 2 upstream requests (initial+resume), got %d: %v", len(got), got)
 	}
-	if got[1] != fmt.Sprintf("bytes=%d-", 100<<10) {
-		t.Fatalf("resume must continue from pos 102400, got Range=%q", got[1])
+	// 续传 Range 必须收窄到客户端允许的终点(整段请求时就是文件尾),
+	// 否则上游多吐的字节会撞上已发出的 Content-Length。
+	if want := fmt.Sprintf("bytes=%d-%d", 100<<10, len(payload)-1); got[1] != want {
+		t.Fatalf("resume must continue from pos 102400 bounded at %d, got Range=%q want %q", len(payload)-1, got[1], want)
 	}
 
 	rr := httptest.NewRecorder()
@@ -590,5 +594,250 @@ func TestRelayResumeExhaustedCountsUpstreamInterrupt(t *testing.T) {
 	}
 	if !strings.Contains(body, `panrouter_relay_abort_total{pan="fake",reason="upstream_interrupt"} 1`) {
 		t.Fatalf("exhausted resume must count upstream_interrupt:\n%s", body)
+	}
+}
+
+// 客户端要的是有界范围(bytes=A-B)时,轮换/续传只能写到 B:Range 必须收窄成
+// bytes=<pos>-B。旧实现一律发 bytes=<pos>-,上游会继续吐到文件尾,而响应头里的
+// Content-Length 早已按 B 发出,net/http 直接拒收整块("wrote more than the
+// declared Content-Length"),客户端拿到的是意外 EOF。
+func TestRelayBoundedRangeRotationStaysWithinRequest(t *testing.T) {
+	payload := bytes.Repeat([]byte("0123456789abcdef"), 40<<10) // 640 KB
+	const from, to = 1000, 399999                               // 窗口 ~399 KB,32 KB 阈值下必然多次轮换
+	up := newFakeUpstream(t, payload, true)
+
+	relay, key := newRelayFixture(t, up.URL())
+	withRotateBytes(t, relay, 32<<10)
+
+	rec := httptest.NewRecorder()
+	err := relay.Serve(context.Background(), rec,
+		StreamInput{Pan: "fake", ShareKey: key, FID: "f1"}, fmt.Sprintf("bytes=%d-%d", from, to))
+	if err != nil {
+		t.Fatalf("relay: %v", err)
+	}
+	if rec.Code != http.StatusPartialContent {
+		t.Fatalf("status=%d, want 206", rec.Code)
+	}
+	want := payload[from : to+1]
+	if !bytes.Equal(rec.Body.Bytes(), want) {
+		t.Fatalf("bounded range corrupted after rotation: got %d bytes, want %d", rec.Body.Len(), len(want))
+	}
+
+	got := up.reqRanges()
+	if len(got) < 3 {
+		t.Fatalf("want >=3 upstream requests (rotation), got %d: %v", len(got), got)
+	}
+	if got[0] != fmt.Sprintf("bytes=%d-%d", from, to) {
+		t.Fatalf("client range must be passed through unchanged, got %q", got[0])
+	}
+	for i, rh := range got[1:] {
+		s, e, ok := parseTestRange(rh, len(payload))
+		if !ok || s <= from || e != to {
+			t.Fatalf("rotation #%d Range=%q must be bytes=<pos>-%d inside the requested window", i+1, rh, to)
+		}
+	}
+}
+
+// 上游声明 Accept-Ranges: bytes 却对 Range 回 200(整段)时,只能续一次:
+// 之后每条连接都得从头丢弃 pos 字节,再轮换就是纯粹的带宽放大(256 MB 起跳)。
+func TestRelayAdvertisedRangeIgnoredStopsRotating(t *testing.T) {
+	payload := bytes.Repeat([]byte("k"), 320<<10)
+	var mu sync.Mutex
+	var ranges []string
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		ranges = append(ranges, r.Header.Get("Range"))
+		mu.Unlock()
+		// 声明支持 Range,但无论有没有 Range 都回 200 整段
+		w.Header().Set("Accept-Ranges", "bytes")
+		w.Header().Set("Content-Length", strconv.Itoa(len(payload)))
+		_, _ = w.Write(payload)
+	}))
+	defer up.Close()
+
+	relay, key := newRelayFixture(t, up.URL)
+	withRotateBytes(t, relay, 100<<10)
+	rec := httptest.NewRecorder()
+	if err := relay.Serve(context.Background(), rec, StreamInput{Pan: "fake", ShareKey: key, FID: "f1"}, ""); err != nil {
+		t.Fatalf("relay: %v", err)
+	}
+	if !bytes.Equal(rec.Body.Bytes(), payload) {
+		t.Fatalf("body mismatch: got %d bytes, want %d", rec.Body.Len(), len(payload))
+	}
+	mu.Lock()
+	n := len(ranges)
+	mu.Unlock()
+	if n != 2 {
+		t.Fatalf("upstream ignoring range must cost exactly one fallback request, got %d: %v", n, ranges)
+	}
+
+	rr := httptest.NewRecorder()
+	relay.met.Handler().ServeHTTP(rr, httptest.NewRequest("GET", "/metrics", nil))
+	if body := rr.Body.String(); !strings.Contains(body, `panrouter_relay_rotate_total{pan="fake"} 1`) {
+		t.Fatalf("expected exactly 1 rotation before fallback:\n%s", body)
+	}
+}
+
+// blockingWriter 模拟「客户端读得很慢」:Write 阻塞到 release 关闭。
+type blockingWriter struct {
+	rec     *httptest.ResponseRecorder
+	release chan struct{}
+	blocked chan struct{}
+	once    sync.Once
+}
+
+func (b *blockingWriter) Header() http.Header  { return b.rec.Header() }
+func (b *blockingWriter) WriteHeader(code int) { b.rec.WriteHeader(code) }
+func (b *blockingWriter) Write(p []byte) (int, error) {
+	b.once.Do(func() { close(b.blocked) })
+	<-b.release
+	return b.rec.Write(p)
+}
+
+// 客户端自己读不动(w.Write 阻塞)不是上游挂死:看门狗只该在「正阻塞在读上游」
+// 时生效。否则一个慢客户端会被判成停流 → 取消重连 → 续传 3 次 → 记
+// upstream_interrupt 并把一次正常的下载掐掉。
+func TestRelaySlowClientDoesNotTripStallWatchdog(t *testing.T) {
+	payload := bytes.Repeat([]byte("w"), 256<<10)
+	up := newFakeUpstream(t, payload, true)
+
+	relay, key := newRelayFixture(t, up.URL())
+	relay.stallTimeout = 100 * time.Millisecond
+
+	bw := &blockingWriter{
+		rec:     httptest.NewRecorder(),
+		release: make(chan struct{}),
+		blocked: make(chan struct{}),
+	}
+	done := make(chan error, 1)
+	go func() {
+		done <- relay.Serve(context.Background(), bw, StreamInput{Pan: "fake", ShareKey: key, FID: "f1"}, "")
+	}()
+
+	select {
+	case <-bw.blocked:
+	case <-time.After(3 * time.Second):
+		t.Fatal("relay never wrote to the client")
+	}
+	// 阻塞时长是挂死阈值的 6 倍、看门狗 tick 的 24 倍:误判的话必然已经重连过。
+	time.Sleep(600 * time.Millisecond)
+	if n := len(up.reqRanges()); n != 1 {
+		t.Fatalf("slow client must not be treated as stalled upstream, got %d upstream requests", n)
+	}
+
+	close(bw.release)
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("relay: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Serve did not finish after the client resumed reading")
+	}
+	if !bytes.Equal(bw.rec.Body.Bytes(), payload) {
+		t.Fatalf("body corrupted: got %d bytes, want %d", bw.rec.Body.Len(), len(payload))
+	}
+
+	rr := httptest.NewRecorder()
+	relay.met.Handler().ServeHTTP(rr, httptest.NewRequest("GET", "/metrics", nil))
+	body := rr.Body.String()
+	if !strings.Contains(body, `panrouter_relay_resume_total{pan="fake"} 0`) {
+		t.Fatalf("slow client must not trigger resume:\n%s", body)
+	}
+	if !strings.Contains(body, `panrouter_relay_abort_total{pan="fake",reason="upstream_interrupt"} 0`) {
+		t.Fatalf("slow client must not be counted as upstream_interrupt:\n%s", body)
+	}
+}
+
+// 轮换/续传必须校验 ETag/Last-Modified:上游在该位置已经换成另一个对象时,
+// 继续写就是把两个版本的首尾拼成「长度正确、内容错误」的文件——比直接报错更糟。
+func TestRelayAbortsOnValidatorMismatch(t *testing.T) {
+	payload := bytes.Repeat([]byte("v"), 320<<10)
+	var mu sync.Mutex
+	var reqs int
+	var ranges []string
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		reqs++
+		idx := reqs
+		ranges = append(ranges, r.Header.Get("Range"))
+		mu.Unlock()
+
+		w.Header().Set("Accept-Ranges", "bytes")
+		w.Header().Set("ETag", fmt.Sprintf("%q", fmt.Sprintf("ver-%d", idx))) // 每次请求都是新版本
+		start, end := 0, len(payload)-1
+		if rh := r.Header.Get("Range"); rh != "" {
+			s, e, ok := parseTestRange(rh, len(payload))
+			if !ok {
+				w.WriteHeader(http.StatusRequestedRangeNotSatisfiable)
+				return
+			}
+			start, end = s, e
+			w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, len(payload)))
+			w.WriteHeader(http.StatusPartialContent)
+		}
+		w.Header().Set("Content-Length", strconv.Itoa(end-start+1))
+		_, _ = w.Write(payload[start : end+1])
+	}))
+	defer up.Close()
+
+	relay, key := newRelayFixture(t, up.URL)
+	withRotateBytes(t, relay, 32<<10)
+	rec := httptest.NewRecorder()
+	if err := relay.Serve(context.Background(), rec, StreamInput{Pan: "fake", ShareKey: key, FID: "f1"}, ""); err != nil {
+		t.Fatalf("relay: %v", err)
+	}
+	if rec.Body.Len() >= len(payload) {
+		t.Fatalf("body must be cut at the version boundary, got %d bytes", rec.Body.Len())
+	}
+	// 只写进第一块数据,不得把第二个版本的字节续在后面
+	if !bytes.HasPrefix(payload, rec.Body.Bytes()) {
+		t.Fatal("prefix bytes must come from the original object")
+	}
+	mu.Lock()
+	n := len(ranges)
+	mu.Unlock()
+	if n != 2 {
+		t.Fatalf("mismatched validator must stop at once, got %d upstream requests: %v", n, ranges)
+	}
+
+	rr := httptest.NewRecorder()
+	relay.met.Handler().ServeHTTP(rr, httptest.NewRequest("GET", "/metrics", nil))
+	if body := rr.Body.String(); !strings.Contains(body, `panrouter_relay_abort_total{pan="fake",reason="rotate_failed"} 1`) {
+		t.Fatalf("validator mismatch must be counted as rotate_failed:\n%s", body)
+	}
+}
+
+func TestRangeEndLimit(t *testing.T) {
+	const total = 1000
+	cases := []struct {
+		name   string
+		hdr    string
+		status int
+		want   int64
+		ok     bool
+	}{
+		{"整段请求", "", http.StatusOK, total - 1, true},
+		{"206 无 Range 头", "", http.StatusPartialContent, total - 1, true},
+		{"明确终点", "bytes=100-299", http.StatusPartialContent, 299, true},
+		{"终点超出文件尾", "bytes=900-5000", http.StatusPartialContent, total - 1, true},
+		{"开放终点", "bytes=100-", http.StatusPartialContent, total - 1, true},
+		{"后缀 Range", "bytes=-100", http.StatusPartialContent, total - 1, true},
+		{"多段 Range", "bytes=0-1,5-6", http.StatusPartialContent, 0, false},
+		{"非 bytes 单位", "items=0-1", http.StatusPartialContent, 0, false},
+		{"终点不可解析", "bytes=100-abc", http.StatusPartialContent, 0, false},
+		{"起点不可解析", "bytes=abc-200", http.StatusPartialContent, 0, false},
+		{"不是 Range 语法", "100-200", http.StatusPartialContent, 0, false},
+		{"上游回 200 忽略 Range", "bytes=100-299", http.StatusOK, total - 1, true},
+	}
+	for _, c := range cases {
+		got, ok := rangeEndLimit(c.hdr, total, c.status)
+		if ok != c.ok || (ok && got != c.want) {
+			t.Fatalf("%s: rangeEndLimit(%q,%d,%d) = (%d,%v), want (%d,%v)",
+				c.name, c.hdr, total, c.status, got, ok, c.want, c.ok)
+		}
+	}
+	if _, ok := rangeEndLimit("bytes=0-1", 0, http.StatusPartialContent); ok {
+		t.Fatal("unknown total must disable rotation")
 	}
 }

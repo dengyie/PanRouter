@@ -61,6 +61,9 @@ func (d *Deps) handleStream(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	// Serve 的错误契约:只有**尚未写出响应头**时才返回 error(此时 writeErr 写
+	// JSON 才有意义),一旦开始转发就只返回 nil。契约由 Serve 保证,调用方不做
+	// Header 已发判断——所以这条错误分支不是死代码,别顺手删掉。
 	err := d.Relay.Serve(r.Context(), w, service.StreamInput{
 		Pan: pan, ShareKey: key, FID: fid, ClientUA: r.Header.Get("User-Agent"),
 	}, r.Header.Get("Range"))
