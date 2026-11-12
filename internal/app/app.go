@@ -171,6 +171,9 @@ func Build(o Options) (*App, error) {
 	cfgp.Set(cfg)
 
 	accSvc := service.NewAccountService(store, aes, met, o.Logger)
+	// 启动即初始化 panrouter_account_status gauge:否则重启后要等看门狗
+	// (默认 30min)或首个账号事件,面板上才会出现账号状态(序列缺失 ≠ 全 0)。
+	accSvc.RefreshStatusMetrics()
 	// 启动自检:主密钥变更(或回落来源变化)会让历史凭据全部解不开。
 	// 提前显式告警,不要等到第一个请求 502「读取账号凭据失败」才发现。
 	if total, unreadable := accSvc.AuditUnreadable(); unreadable > 0 {
