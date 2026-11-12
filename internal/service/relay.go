@@ -190,7 +190,9 @@ func (s *Relay) Serve(ctx context.Context, w http.ResponseWriter, in StreamInput
 		(hasCR || strings.EqualFold(conn.resp.Header.Get("Accept-Ranges"), "bytes"))
 
 	h := w.Header()
-	for _, k := range []string{"Content-Type", "Content-Length", "Content-Range", "Accept-Ranges", "ETag", "Last-Modified"} {
+	// Content-Encoding 也照实透传:我们转发的是原始字节,若上游仍带编码声明而这里
+	// 丢掉头,客户端会把压缩字节当成明文。
+	for _, k := range []string{"Content-Type", "Content-Length", "Content-Range", "Content-Encoding", "Accept-Ranges", "ETag", "Last-Modified"} {
 		if v := conn.resp.Header.Get(k); v != "" {
 			h.Set(k, v)
 		}
@@ -369,6 +371,10 @@ func (s *Relay) openUpstream(ctx context.Context, in StreamInput, link streamLin
 	if rangeHeader != "" {
 		req.Header.Set("Range", rangeHeader)
 	}
+	// 显式声明 identity:一是文件字节必须原样透传(Go 只在「自己加的 Accept-Encoding」
+	// 场景才透明解压,显式声明后就不再插手),二是解压会抹掉 Content-Length、让
+	// Range/续传的边界对不上——下载场景压缩毫无收益。
+	req.Header.Set("Accept-Encoding", "identity")
 	// 上游一律走新连接(DoStreamFresh):一是避免复用一条已被网盘降速的旧连接,
 	// 二是中转流量本身不回到池里,不把受降速的连接传染给下一个请求。
 	resp, err := client.DoStreamFresh(req)

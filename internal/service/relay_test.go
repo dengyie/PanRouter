@@ -413,6 +413,40 @@ func TestRelayClientCancelCountedAsClientGone(t *testing.T) {
 	}
 }
 
+// 中转请求必须显式要 identity 编码,且上游即便仍带 Content-Encoding 也要原样透传:
+// 否则客户端会拿到「被 Go 透明解压过的字节 + 缺失的 Content-Encoding」,
+// 或被解压抹掉 Content-Length 导致 Range/续传边界错位。
+func TestRelayAsksIdentityAndPassesContentEncoding(t *testing.T) {
+	payload := []byte("NOT-REALLY-GZIP-BUT-DECLARED-AS-IT")
+	var gotAE string
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotAE = r.Header.Get("Accept-Encoding")
+		w.Header().Set("Content-Encoding", "gzip")
+		w.Header().Set("Content-Type", "application/octet-stream")
+		w.Header().Set("Content-Length", strconv.Itoa(len(payload)))
+		_, _ = w.Write(payload)
+	}))
+	defer up.Close()
+
+	relay, key := newRelayFixture(t, up.URL)
+	rec := httptest.NewRecorder()
+	if err := relay.Serve(context.Background(), rec, StreamInput{Pan: "fake", ShareKey: key, FID: "f1"}, ""); err != nil {
+		t.Fatalf("relay: %v", err)
+	}
+	if gotAE != "identity" {
+		t.Fatalf("relay must ask for identity encoding, upstream saw %q", gotAE)
+	}
+	if rec.Header().Get("Content-Encoding") != "gzip" {
+		t.Fatalf("content-encoding not passed through: %q", rec.Header().Get("Content-Encoding"))
+	}
+	if got := rec.Header().Get("Content-Length"); got != strconv.Itoa(len(payload)) {
+		t.Fatalf("content-length must stay %d, got %q", len(payload), got)
+	}
+	if !bytes.Equal(rec.Body.Bytes(), payload) {
+		t.Fatalf("body must be raw bytes, got %q", rec.Body.String())
+	}
+}
+
 // rangeHandler 造一个「先快后断」的上游:首次请求(无 Range)吐 chunk 字节后掐断连接,
 // 之后按 Range 返回剩余部分。返回已服务的请求数(供断言续传次数)。
 func abortingUpstream(t *testing.T, payload []byte, chunk int) *fakeUpstream {
