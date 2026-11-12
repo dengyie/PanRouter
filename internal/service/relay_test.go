@@ -412,3 +412,157 @@ func TestRelayClientCancelCountedAsClientGone(t *testing.T) {
 		t.Fatalf("client cancel must not be counted as upstream_interrupt:\n%s", body)
 	}
 }
+
+// withStallTimeout 临时把停流看门狗阈值调小,让单测几百毫秒就能触发挂死判定。
+func withStallTimeout(t *testing.T, d time.Duration) {
+	t.Helper()
+	old := relayStallTimeout
+	relayStallTimeout = d
+	t.Cleanup(func() { relayStallTimeout = old })
+}
+
+// rangeHandler 造一个「先快后断」的上游:首次请求(无 Range)吐 chunk 字节后掐断连接,
+// 之后按 Range 返回剩余部分。返回已服务的请求数(供断言续传次数)。
+func abortingUpstream(t *testing.T, payload []byte, chunk int) *fakeUpstream {
+	t.Helper()
+	u := &fakeUpstream{}
+	u.srv = httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		rh := r.Header.Get("Range")
+		u.mu.Lock()
+		u.ranges = append(u.ranges, rh)
+		u.mu.Unlock()
+
+		w.Header().Set("Accept-Ranges", "bytes")
+		start, end := 0, len(payload)-1
+		if rh != "" {
+			s, e, ok := parseTestRange(rh, len(payload))
+			if !ok {
+				w.WriteHeader(http.StatusRequestedRangeNotSatisfiable)
+				return
+			}
+			start, end = s, e
+			w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, len(payload)))
+			w.Header().Set("Content-Length", strconv.Itoa(end-start+1))
+			w.WriteHeader(http.StatusPartialContent)
+		} else {
+			w.Header().Set("Content-Length", strconv.Itoa(len(payload)))
+		}
+		stop := start + chunk
+		if stop > end+1 {
+			stop = end + 1
+		}
+		_, _ = w.Write(payload[start:stop])
+		w.(http.Flusher).Flush()
+		if stop <= end {
+			// 声明了 Content-Length 却提前掐连接:客户端读到 unexpected EOF
+			panic(http.ErrAbortHandler)
+		}
+	}))
+	u.srv.Start()
+	t.Cleanup(u.srv.Close)
+	return u
+}
+
+// 上游中途掐断连接时,已发出的 Content-Length 不可能收回;能 Range 续传就必须续,
+// 否则客户端只能拿到半截文件(表现为「传输中断」)。
+func TestRelayResumesAfterUpstreamAbort(t *testing.T) {
+	payload := bytes.Repeat([]byte("r"), 200<<10)
+	up := abortingUpstream(t, payload, 100<<10)
+
+	relay, key := newRelayFixture(t, up.URL())
+	rec := httptest.NewRecorder()
+	if err := relay.Serve(context.Background(), rec, StreamInput{Pan: "fake", ShareKey: key, FID: "f1"}, ""); err != nil {
+		t.Fatalf("relay: %v", err)
+	}
+	if !bytes.Equal(rec.Body.Bytes(), payload) {
+		t.Fatalf("body incomplete after abort: got %d bytes, want %d", rec.Body.Len(), len(payload))
+	}
+	got := up.reqRanges()
+	if len(got) != 2 {
+		t.Fatalf("want 2 upstream requests (initial+resume), got %d: %v", len(got), got)
+	}
+	if got[1] != fmt.Sprintf("bytes=%d-", 100<<10) {
+		t.Fatalf("resume must continue from pos 102400, got Range=%q", got[1])
+	}
+
+	rr := httptest.NewRecorder()
+	relay.met.Handler().ServeHTTP(rr, httptest.NewRequest("GET", "/metrics", nil))
+	body := rr.Body.String()
+	if !strings.Contains(body, `panrouter_relay_resume_total{pan="fake"} 1`) {
+		t.Fatalf("resume metric missing:\n%s", body)
+	}
+	if !strings.Contains(body, `panrouter_relay_abort_total{pan="fake",reason="upstream_interrupt"} 0`) {
+		t.Fatalf("successful resume must not count as abort:\n%s", body)
+	}
+}
+
+// 上游「一个字节都不再吐」时(黑洞/半开连接),NoBodyTimeout 会让我们永远等下去;
+// 停流看门狗必须打断它并续传,而不是把客户端吊死在 0 B/s。
+func TestRelayResumesAfterStall(t *testing.T) {
+	payload := bytes.Repeat([]byte("s"), 200<<10)
+	const cut = 64 << 10
+	withStallTimeout(t, 200*time.Millisecond)
+
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Accept-Ranges", "bytes")
+		if rh := r.Header.Get("Range"); rh != "" {
+			s, e, ok := parseTestRange(rh, len(payload))
+			if !ok {
+				w.WriteHeader(http.StatusRequestedRangeNotSatisfiable)
+				return
+			}
+			w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", s, e, len(payload)))
+			w.Header().Set("Content-Length", strconv.Itoa(e-s+1))
+			w.WriteHeader(http.StatusPartialContent)
+			_, _ = w.Write(payload[s : e+1])
+			return
+		}
+		w.Header().Set("Content-Length", strconv.Itoa(len(payload)))
+		_, _ = w.Write(payload[:cut])
+		w.(http.Flusher).Flush()
+		// 挂住不再吐字节,直到中转取消这条连接(模拟上游黑洞)
+		select {
+		case <-r.Context().Done():
+		case <-time.After(5 * time.Second):
+			t.Error("relay never canceled the stalled upstream connection")
+		}
+	}))
+	defer up.Close()
+
+	relay, key := newRelayFixture(t, up.URL)
+	rec := httptest.NewRecorder()
+	if err := relay.Serve(context.Background(), rec, StreamInput{Pan: "fake", ShareKey: key, FID: "f1"}, ""); err != nil {
+		t.Fatalf("relay: %v", err)
+	}
+	if !bytes.Equal(rec.Body.Bytes(), payload) {
+		t.Fatalf("body incomplete after stall: got %d bytes, want %d", rec.Body.Len(), len(payload))
+	}
+}
+
+// 上游每次都断时不能无限重连:续满 relayResumeMax 次后按 upstream_interrupt 收尾。
+func TestRelayResumeExhaustedCountsUpstreamInterrupt(t *testing.T) {
+	payload := bytes.Repeat([]byte("e"), 400<<10)
+	up := abortingUpstream(t, payload, 50<<10)
+
+	relay, key := newRelayFixture(t, up.URL())
+	rec := httptest.NewRecorder()
+	if err := relay.Serve(context.Background(), rec, StreamInput{Pan: "fake", ShareKey: key, FID: "f1"}, ""); err != nil {
+		t.Fatalf("relay: %v", err)
+	}
+	if rec.Body.Len() >= len(payload) {
+		t.Fatalf("payload should stay truncated, got %d bytes", rec.Body.Len())
+	}
+	if n := len(up.reqRanges()); n != 1+relayResumeMax {
+		t.Fatalf("want %d upstream requests (1 + %d resumes), got %d", 1+relayResumeMax, relayResumeMax, n)
+	}
+
+	rr := httptest.NewRecorder()
+	relay.met.Handler().ServeHTTP(rr, httptest.NewRequest("GET", "/metrics", nil))
+	body := rr.Body.String()
+	if !strings.Contains(body, fmt.Sprintf(`panrouter_relay_resume_total{pan="fake"} %d`, relayResumeMax)) {
+		t.Fatalf("resume metric wrong:\n%s", body)
+	}
+	if !strings.Contains(body, `panrouter_relay_abort_total{pan="fake",reason="upstream_interrupt"} 1`) {
+		t.Fatalf("exhausted resume must count upstream_interrupt:\n%s", body)
+	}
+}

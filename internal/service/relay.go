@@ -3,12 +3,14 @@ package service
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
 
 	"github.com/dengyie/panrouter/internal/driver"
 	"github.com/dengyie/panrouter/internal/pkg/httpx"
@@ -28,18 +30,31 @@ const (
 	// 13 GB 就是约 40 万次系统调用;下载场景对首字节延迟不敏感,攒到 256 KB
 	// (满速下 ~70 ms)可以省下大半开销,同时对边下边播仍然够快。
 	relayFlushBytes = 256 << 10
+	// relayResumeMax:一次请求最多续传几次(不含最初的连接)。有界是为了不对着
+	// 「每次必断」的上游无限重连——续满次数后按 upstream_interrupt 记账收尾。
+	relayResumeMax = 3
 )
 
-// relayRotateBytes:单条上游连接最多搬运这么多字节就重开一条。
-//
-// 2026-11-13 实测(51 文件 / 13.16 GB 真实下载):quark 对**同一条上游长连接**
-// 在累计约 1 GB 后把速度压到 ~100 KB/s,而新建连接立刻回到 3.5 MB/s——三条老
-// 连接合计 0.32 MB/s、两条新连接合计 7.2 MB/s,同期账号状态始终 ok(既不是
-// 我方限频,也不是账号被风控)。旧实现一条连接跑到底,417 MB 文件要 185~220 s;
-// 按块换连接后 143~167 s,两个 576 MB 文件从「重试耗尽失败」变成正常跑完。
-//
-// 所以这里按固定字节数主动轮换上游连接:响应头早已发出,客户端侧字节流连续。
-var relayRotateBytes int64 = 256 << 20
+var (
+	// relayRotateBytes:单条上游连接最多搬运这么多字节就重开一条。
+	//
+	// 2026-11-13 实测(51 文件 / 13.16 GB 真实下载):quark 对**同一条上游长连接**
+	// 在累计约 1 GB 后把速度压到 ~100 KB/s,而新建连接立刻回到 3.5 MB/s——三条老
+	// 连接合计 0.32 MB/s、两条新连接合计 7.2 MB/s,同期账号状态始终 ok(既不是
+	// 我方限频,也不是账号被风控)。旧实现一条连接跑到底,417 MB 文件要 185~220 s;
+	// 按块换连接后 143~167 s,两个 576 MB 文件从「重试耗尽失败」变成正常跑完。
+	//
+	// 所以这里按固定字节数主动轮换上游连接:响应头早已发出,客户端侧字节流连续。
+	relayRotateBytes int64 = 256 << 20
+
+	// relayStallTimeout:上游连续这么久一个字节都没吐,就判它挂死(黑洞/半开连接),
+	// 取消这条连接并尝试续传。
+	//
+	// 为什么必须有它:stream client 是 NoBodyTimeout=true(慢流不能被整体超时掐断),
+	// 代价是上游真挂死时 Read 会一直阻塞,客户端连接就这么吊着——用户看到的是
+	// 「0 B/s 卡死」而不是一个明确结局。有了看门狗,挂死会退化成一次有界续传/报错。
+	relayStallTimeout = 60 * time.Second
+)
 
 type Relay struct {
 	resolver *Resolver
@@ -56,11 +71,13 @@ func NewRelay(resolver *Resolver, clients map[string]*httpx.Client, store *repo.
 	if met != nil {
 		met.Help("panrouter_relay_bytes_total", "Relay 转发给客户端的字节数(按网盘)")
 		met.Help("panrouter_relay_rotate_total", "Relay 主动轮换上游连接的次数")
+		met.Help("panrouter_relay_resume_total", "Relay 上游断流后按 Range 续传成功的次数")
 		met.Help("panrouter_relay_abort_total", "Relay 未正常读完就结束的次数(按原因)")
 		// 先把各网盘的 0 值序列建出来:没有序列和「全 0」在监控上不可区分。
 		for pan := range clients {
 			met.Add("panrouter_relay_bytes_total", map[string]string{"pan": pan}, 0)
 			met.Add("panrouter_relay_rotate_total", map[string]string{"pan": pan}, 0)
+			met.Add("panrouter_relay_resume_total", map[string]string{"pan": pan}, 0)
 			for _, reason := range []string{"client_gone", "upstream_interrupt", "rotate_failed"} {
 				met.Add("panrouter_relay_abort_total", map[string]string{"pan": pan, "reason": reason}, 0)
 			}
@@ -85,54 +102,97 @@ type streamLink struct {
 	Cookie  []byte
 }
 
+// upstreamConn 是一条上游连接 + 它专用的可取消 ctx + 停流看门狗。
+// 每条连接独立 ctx:看门狗靠取消它来打断挂死的 Read,而客户端 ctx 不受影响,
+// 所以「上游挂死」和「客户端走了」在错误归因上依然可分。
+type upstreamConn struct {
+	resp   *http.Response
+	cancel context.CancelFunc
+	last   atomic.Int64 // 最近一次读到字节的 UnixNano
+	stop   chan struct{}
+	once   sync.Once
+}
+
+func (c *upstreamConn) touch() { c.last.Store(time.Now().UnixNano()) }
+
+// close 幂等:Body.Close / cancel / close(stop) 各只做一次。
+func (c *upstreamConn) close() {
+	c.once.Do(func() {
+		close(c.stop)
+		c.cancel()
+		_ = c.resp.Body.Close()
+	})
+}
+
+func (c *upstreamConn) watchStall() {
+	tick := relayStallTimeout / 4
+	if tick <= 0 {
+		tick = time.Millisecond
+	}
+	t := time.NewTicker(tick)
+	defer t.Stop()
+	for {
+		select {
+		case <-c.stop:
+			return
+		case <-t.C:
+			if time.Since(time.Unix(0, c.last.Load())) >= relayStallTimeout {
+				c.cancel() // 打断 Read,交给 Serve 的续传逻辑
+				return
+			}
+		}
+	}
+}
+
 // Serve 执行中转:取新鲜直链 → 携带约束头请求上游 → 透传响应(含 Range/续传)。
-// 签名只在建立连接时校验;轮换复用同一 URL,不会中途 401。
+// 签名只在建立连接时校验;轮换/续传复用同一 URL,不会中途 401。
 func (s *Relay) Serve(ctx context.Context, w http.ResponseWriter, in StreamInput, rangeHeader string) error {
 	link, err := s.freshLink(ctx, in)
 	if err != nil {
 		return err
 	}
 
-	resp, err := s.openUpstream(ctx, in, link, rangeHeader)
+	conn, err := s.openConn(ctx, in, link, rangeHeader)
 	if err != nil {
 		return err
 	}
-	defer func() { _ = resp.Body.Close() }()
+	defer func() { conn.close() }()
 
-	if resp.StatusCode >= 400 {
+	if conn.resp.StatusCode >= 400 {
 		// 直链可能提前失效(风控/过期):尚未写响应头,可安全报错让上层提示重试
-		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
+		code := conn.resp.StatusCode
+		_, _ = io.Copy(io.Discard, io.LimitReader(conn.resp.Body, 4096))
 		// 上游明确否决时立即失效本地缓存,否则重新解析仍命中同一死链(缓存优先),
 		// 用户会在 TTL 内 (最长 2h) 反复失败。失效后下次 GetFreshLink 触发真实重解析。
-		if isStaleStatus(resp.StatusCode) {
+		if isStaleStatus(code) {
 			s.expireLink(in)
 		}
 		return driver.NewErr(driver.KindUpstream,
-			fmt.Sprintf("上游返回 %d,直链可能已失效,请重新解析", resp.StatusCode), nil)
+			fmt.Sprintf("上游返回 %d,直链可能已失效,请重新解析", code), nil)
 	}
 
-	start, total, hasCR := parseContentRange(resp.Header.Get("Content-Range"))
+	start, total, hasCR := parseContentRange(conn.resp.Header.Get("Content-Range"))
 	// Content-Length 只在非 206 时代表整文件长度;206 时它是本段长度,不能当总量。
 	if !hasCR {
-		if cl := resp.Header.Get("Content-Length"); cl != "" {
+		if cl := conn.resp.Header.Get("Content-Length"); cl != "" {
 			if v, perr := strconv.ParseInt(cl, 10, 64); perr == nil && v > 0 {
 				total = v
 			}
 		}
 	}
-	// 只有「知道总长度 + 上游支持 Range」时才轮换;否则保持旧行为(单连接跑到底),
+	// 只有「知道总长度 + 上游支持 Range」时才轮换/续传;否则保持旧行为(单连接跑到底),
 	// 避免为了一次性小响应(如 lanzou 的 HTML 挑战页)白折腾。
 	// relayRotateBytes<=0 视为关闭轮换(单测/排障用)。
 	canRotate := relayRotateBytes > 0 && total > 0 &&
-		(hasCR || strings.EqualFold(resp.Header.Get("Accept-Ranges"), "bytes"))
+		(hasCR || strings.EqualFold(conn.resp.Header.Get("Accept-Ranges"), "bytes"))
 
 	h := w.Header()
 	for _, k := range []string{"Content-Type", "Content-Length", "Content-Range", "Accept-Ranges", "ETag", "Last-Modified"} {
-		if v := resp.Header.Get(k); v != "" {
+		if v := conn.resp.Header.Get(k); v != "" {
 			h.Set(k, v)
 		}
 	}
-	w.WriteHeader(resp.StatusCode)
+	w.WriteHeader(conn.resp.StatusCode)
 
 	flusher, _ := w.(http.Flusher)
 	buf := make([]byte, relayBufSize)
@@ -140,10 +200,12 @@ func (s *Relay) Serve(ctx context.Context, w http.ResponseWriter, in StreamInput
 	connBytes := int64(0) // 当前这条上游连接已搬运的字节
 	pending := int64(0)   // 尚未 Flush 的字节
 	refreshed := false
+	resumes := 0
 
 	for {
-		n, rerr := resp.Body.Read(buf)
+		n, rerr := conn.resp.Body.Read(buf)
 		if n > 0 {
+			conn.touch() // 喂看门狗:有字节流动就不是挂死
 			if _, werr := w.Write(buf[:n]); werr != nil {
 				s.countAbort(in, "client_gone")
 				return nil // 客户端断开,属正常取消
@@ -166,13 +228,31 @@ func (s *Relay) Serve(ctx context.Context, w http.ResponseWriter, in StreamInput
 				}
 				return nil
 			}
-			// 客户端断开常常先让**上游** Read 返回 context canceled(请求 ctx 被取消),
+			// 客户端断开:父 ctx 先被取消,上游 Read 随之返回 context canceled。
 			// 若一律记成 upstream_interrupt,运维就分不清「上游塌了」和「用户自己关页面」。
-			if ctx.Err() != nil || errors.Is(rerr, context.Canceled) {
+			if ctx.Err() != nil {
 				s.countAbort(in, "client_gone")
 				return nil
 			}
-			// 上游中断:响应头已发出,无法改写状态码;记录日志供排查
+			// 上游自己断了(连接被掐断/停流看门狗取消)。响应头和 Content-Length 早已发出,
+			// 直接收尾只能让客户端收到「传输中断」的半截文件;能 Range 续传就续,续不成才算中断。
+			if canRotate && pos < total && resumes < relayResumeMax {
+				next, rerr2 := s.rotate(ctx, in, &link, pos, &refreshed)
+				if rerr2 == nil {
+					conn.close()
+					conn = next
+					connBytes = 0
+					resumes++
+					if s.met != nil {
+						s.met.Inc("panrouter_relay_resume_total", map[string]string{"pan": in.Pan})
+					}
+					s.log.Warnf("relay resumed after upstream error: share=%s fid=%s pos=%d try=%d err=%v",
+						in.ShareKey, in.FID, pos, resumes, rerr)
+					continue
+				}
+				s.log.Warnf("relay resume failed: share=%s fid=%s pos=%d err=%v",
+					in.ShareKey, in.FID, pos, rerr2)
+			}
 			s.countAbort(in, "upstream_interrupt")
 			s.log.Warnf("relay upstream interrupted: share=%s fid=%s pos=%d err=%v",
 				in.ShareKey, in.FID, pos, rerr)
@@ -188,8 +268,8 @@ func (s *Relay) Serve(ctx context.Context, w http.ResponseWriter, in StreamInput
 					in.ShareKey, in.FID, pos, rerr2)
 				return nil
 			}
-			_ = resp.Body.Close()
-			resp = next
+			conn.close()
+			conn = next
 			connBytes = 0
 			if s.met != nil {
 				s.met.Inc("panrouter_relay_rotate_total", map[string]string{"pan": in.Pan})
@@ -198,31 +278,32 @@ func (s *Relay) Serve(ctx context.Context, w http.ResponseWriter, in StreamInput
 	}
 }
 
-// rotate 从 pos 处重开一条上游连接。上游忽略 Range(回 200)时丢掉已有的 pos 字节
-// 继续用这条连接(用带宽换正确性);直链失效则刷新一次凭据再试。
-func (s *Relay) rotate(ctx context.Context, in StreamInput, link *streamLink, pos int64, refreshed *bool) (*http.Response, error) {
-	resp, err := s.openUpstream(ctx, in, *link, fmt.Sprintf("bytes=%d-", pos))
+// rotate 从 pos 处重开一条上游连接(轮换与续传共用)。上游忽略 Range(回 200)时
+// 丢掉已有的 pos 字节继续用这条连接(用带宽换正确性);直链失效则刷新一次凭据再试。
+func (s *Relay) rotate(ctx context.Context, in StreamInput, link *streamLink, pos int64, refreshed *bool) (*upstreamConn, error) {
+	conn, err := s.openConn(ctx, in, *link, fmt.Sprintf("bytes=%d-", pos))
 	if err != nil {
 		return nil, err
 	}
 	switch {
-	case resp.StatusCode == http.StatusPartialContent:
-		if st, _, ok := parseContentRange(resp.Header.Get("Content-Range")); ok && st == pos {
-			return resp, nil
+	case conn.resp.StatusCode == http.StatusPartialContent:
+		if st, _, ok := parseContentRange(conn.resp.Header.Get("Content-Range")); ok && st == pos {
+			return conn, nil
 		}
-		_ = resp.Body.Close()
+		conn.close()
 		return nil, fmt.Errorf("content-range start mismatch, want %d", pos)
-	case resp.StatusCode == http.StatusOK:
-		if _, err := io.CopyN(io.Discard, resp.Body, pos); err != nil {
-			_ = resp.Body.Close()
+	case conn.resp.StatusCode == http.StatusOK:
+		if _, err := io.CopyN(io.Discard, conn.resp.Body, pos); err != nil {
+			conn.close()
 			return nil, fmt.Errorf("discard %d bytes: %w", pos, err)
 		}
+		conn.touch()
 		s.log.Warnf("relay upstream ignored range on rotate: share=%s fid=%s pos=%d", in.ShareKey, in.FID, pos)
-		return resp, nil
+		return conn, nil
 	}
 
-	code := resp.StatusCode
-	_ = resp.Body.Close()
+	code := conn.resp.StatusCode
+	conn.close()
 	if isStaleStatus(code) && !*refreshed {
 		*refreshed = true
 		s.expireLink(in)
@@ -246,6 +327,22 @@ func (s *Relay) freshLink(ctx context.Context, in StreamInput) (streamLink, erro
 		return streamLink{}, fmt.Errorf("decrypt link cookie: %w", err)
 	}
 	return streamLink{URL: link.DirectLink, UA: link.UA, Referer: link.Referer, Cookie: cookie}, nil
+}
+
+// openConn 建立一条上游连接并启动停流看门狗。
+func (s *Relay) openConn(ctx context.Context, in StreamInput, link streamLink, rangeHeader string) (*upstreamConn, error) {
+	upCtx, cancel := context.WithCancel(ctx)
+	resp, err := s.openUpstream(upCtx, in, link, rangeHeader)
+	if err != nil {
+		cancel()
+		return nil, err
+	}
+	c := &upstreamConn{resp: resp, cancel: cancel, stop: make(chan struct{})}
+	c.touch()
+	if relayStallTimeout > 0 {
+		go c.watchStall()
+	}
+	return c, nil
 }
 
 func (s *Relay) openUpstream(ctx context.Context, in StreamInput, link streamLink, rangeHeader string) (*http.Response, error) {
