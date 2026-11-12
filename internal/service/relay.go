@@ -3,6 +3,7 @@ package service
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -163,6 +164,12 @@ func (s *Relay) Serve(ctx context.Context, w http.ResponseWriter, in StreamInput
 				if flusher != nil && pending > 0 {
 					flusher.Flush()
 				}
+				return nil
+			}
+			// 客户端断开常常先让**上游** Read 返回 context canceled(请求 ctx 被取消),
+			// 若一律记成 upstream_interrupt,运维就分不清「上游塌了」和「用户自己关页面」。
+			if ctx.Err() != nil || errors.Is(rerr, context.Canceled) {
+				s.countAbort(in, "client_gone")
 				return nil
 			}
 			// 上游中断:响应头已发出,无法改写状态码;记录日志供排查

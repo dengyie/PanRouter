@@ -367,3 +367,48 @@ func TestRelayNoRotateWhenUpstreamLacksRange(t *testing.T) {
 		t.Fatalf("upstream without range support must not rotate, got %d requests: %v", len(got), got)
 	}
 }
+
+// 客户端中途断开(取消 ctx)必须记成 client_gone:上游 Read 会先返回
+// context canceled,若按 upstream_interrupt 记,线上就分不清「用户关页面」
+// 和「上游塌了」,报警也会失真。
+func TestRelayClientCancelCountedAsClientGone(t *testing.T) {
+	payload := bytes.Repeat([]byte("q"), 64<<20) // 足够大,不会在取消前读完
+	release := make(chan struct{})
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Length", strconv.Itoa(len(payload)))
+		_, _ = w.Write(payload[:1<<20])
+		w.(http.Flusher).Flush()
+		<-release // 挂住,模拟慢上游;测试结束时由 defer 释放
+	}))
+	defer up.Close()
+	defer close(release)
+
+	relay, key := newRelayFixture(t, up.URL)
+	ctx, cancel := context.WithCancel(context.Background())
+	rec := httptest.NewRecorder()
+	done := make(chan error, 1)
+	go func() {
+		done <- relay.Serve(ctx, rec, StreamInput{Pan: "fake", ShareKey: key, FID: "f1"}, "")
+	}()
+
+	time.Sleep(150 * time.Millisecond) // 让第一块到客户端
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("relay: %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("Serve did not return after client cancel")
+	}
+
+	rrm := httptest.NewRecorder()
+	relay.met.Handler().ServeHTTP(rrm, httptest.NewRequest("GET", "/metrics", nil))
+	body := rrm.Body.String()
+	if !strings.Contains(body, `panrouter_relay_abort_total{pan="fake",reason="client_gone"} 1`) {
+		t.Fatalf("client cancel must be counted as client_gone:\n%s", body)
+	}
+	if !strings.Contains(body, `panrouter_relay_abort_total{pan="fake",reason="upstream_interrupt"} 0`) {
+		t.Fatalf("client cancel must not be counted as upstream_interrupt:\n%s", body)
+	}
+}
