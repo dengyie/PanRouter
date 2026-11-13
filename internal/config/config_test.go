@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 func TestLoadDefaultsWhenNoFile(t *testing.T) {
@@ -54,6 +55,31 @@ drivers:
 	}
 	if len(c.DomainRoutes["quark"]) != 1 {
 		t.Fatalf("domain routes not applied: %+v", c.DomainRoutes)
+	}
+}
+
+// relay 段(stall_timeout / rotate_bytes)可配置,且必须允许热加载:
+// relay 每个请求读一次配置,改阈值不需要重启(只影响新请求)。
+func TestLoadRelaySection(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "c.yaml")
+	yaml := "relay:\n  stall_timeout: 5s\n  rotate_bytes: 1048576\n"
+	if err := os.WriteFile(p, []byte(yaml), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	c, _, err := Load(p)
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if c.Relay.StallTimeout != 5*time.Second || c.Relay.RotateBytes != 1048576 {
+		t.Fatalf("relay section not applied: %+v", c.Relay)
+	}
+
+	next, _, err := LoadReload(p, Default())
+	if err != nil {
+		t.Fatalf("relay tuning must be reloadable, got: %v", err)
+	}
+	if next.Relay.StallTimeout != 5*time.Second || next.Relay.RotateBytes != 1048576 {
+		t.Fatalf("reload relay not applied: %+v", next.Relay)
 	}
 }
 

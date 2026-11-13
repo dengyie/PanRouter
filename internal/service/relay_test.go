@@ -78,7 +78,7 @@ func newRelayFixture(t *testing.T, upstreamURL string) (*Relay, string) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	relay := NewRelay(resolver, map[string]*httpx.Client{"fake": streamCl}, store, aes, met, log)
+	relay := NewRelay(resolver, map[string]*httpx.Client{"fake": streamCl}, store, aes, met, log, cfgp)
 	return relay, resolver.shareKey("fake", shareURL, "")
 }
 
@@ -134,6 +134,55 @@ func TestRelayRangePassthrough(t *testing.T) {
 	}
 	if rec.Header().Get("Content-Range") != "bytes 100-299/300" {
 		t.Fatalf("content-range not passed through: %q", rec.Header().Get("Content-Range"))
+	}
+}
+
+// 多段 Range(multipart/byteranges,如 bytes=0-3,10-13)端到端。多段响应只能整体透传:
+// ①整个 multipart 体必须原样到达,一个字节都不能被当成「越界」钳掉;②轮换必须禁用
+// ——续传/轮换用的是单条 bytes=<pos>-<limit> Range,会把分段边界和跨段字节重写坏。
+func TestRelayMultipartRangePassesThroughVerbatim(t *testing.T) {
+	const boundary = "multi-9a2b7c"
+	partA := []byte("\r\n--" + boundary + "\r\nContent-Type: application/octet-stream\r\nContent-Range: bytes 0-3/300\r\n\r\n0123")
+	partB := []byte("\r\n--" + boundary + "\r\nContent-Type: application/octet-stream\r\nContent-Range: bytes 10-13/300\r\n\r\nabcd")
+	tail := []byte("\r\n--" + boundary + "--\r\n")
+	body := bytes.Join([][]byte{partA, partB, tail}, nil)
+
+	var mu sync.Mutex
+	var ranges []string
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		ranges = append(ranges, r.Header.Get("Range"))
+		mu.Unlock()
+		w.Header().Set("Content-Type", "multipart/byteranges; boundary="+boundary)
+		w.Header().Set("Content-Length", strconv.Itoa(len(body)))
+		w.WriteHeader(http.StatusPartialContent)
+		_, _ = w.Write(body)
+	}))
+	defer up.Close()
+
+	relay, key := newRelayFixture(t, up.URL)
+	// 阈值压到 32 KB:一条 128 KB 的 Read 就足以触发轮换——若多段误开了轮换,这里必现。
+	withRotateBytes(t, relay, 32<<10)
+	rec := httptest.NewRecorder()
+	if err := relay.Serve(context.Background(), rec,
+		StreamInput{Pan: "fake", ShareKey: key, FID: "f1"}, "bytes=0-3,10-13"); err != nil {
+		t.Fatalf("relay: %v", err)
+	}
+	if rec.Code != http.StatusPartialContent {
+		t.Fatalf("status=%d, want 206", rec.Code)
+	}
+	if rec.Header().Get("Content-Type") != "multipart/byteranges; boundary="+boundary {
+		t.Fatalf("content-type not passed through: %q", rec.Header().Get("Content-Type"))
+	}
+	if !bytes.Equal(rec.Body.Bytes(), body) {
+		t.Fatalf("multipart body corrupted: got %d bytes, want %d", rec.Body.Len(), len(body))
+	}
+	// 多段不能续传/轮换:必须恰好 1 次上游请求,且携带的就是原始多段 Range。
+	mu.Lock()
+	got := append([]string(nil), ranges...)
+	mu.Unlock()
+	if len(got) != 1 || got[0] != "bytes=0-3,10-13" {
+		t.Fatalf("want exactly 1 upstream request with the multi-range header, got %v", got)
 	}
 }
 
@@ -567,6 +616,13 @@ func TestRelayResumesAfterStall(t *testing.T) {
 	if !bytes.Equal(rec.Body.Bytes(), payload) {
 		t.Fatalf("body incomplete after stall: got %d bytes, want %d", rec.Body.Len(), len(payload))
 	}
+	// 判挂死必须单独计数:否则运维只能从 resume_total 倒推,分不清
+	// 「上游偶发断流但续上了」和「上游黑洞、看门狗掐了一次」。
+	rr := httptest.NewRecorder()
+	relay.met.Handler().ServeHTTP(rr, httptest.NewRequest("GET", "/metrics", nil))
+	if body := rr.Body.String(); !strings.Contains(body, `panrouter_relay_stall_total{pan="fake"} 1`) {
+		t.Fatalf("stall watchdog firing not counted:\n%s", body)
+	}
 }
 
 // 上游每次都断时不能无限重连:续满 relayResumeMax 次后按 upstream_interrupt 收尾。
@@ -747,6 +803,12 @@ func TestRelaySlowClientDoesNotTripStallWatchdog(t *testing.T) {
 	if !strings.Contains(body, `panrouter_relay_abort_total{pan="fake",reason="upstream_interrupt"} 0`) {
 		t.Fatalf("slow client must not be counted as upstream_interrupt:\n%s", body)
 	}
+	if !strings.Contains(body, `panrouter_relay_stall_total{pan="fake"} 0`) {
+		t.Fatalf("slow client must not trip the stall watchdog:\n%s", body)
+	}
+	if !strings.Contains(body, `panrouter_relay_streams_active{pan="fake"} 0`) {
+		t.Fatalf("streams_active must return to 0 after Serve returns:\n%s", body)
+	}
 }
 
 // 轮换/续传必须校验 ETag/Last-Modified:上游在该位置已经换成另一个对象时,
@@ -839,5 +901,57 @@ func TestRangeEndLimit(t *testing.T) {
 	}
 	if _, ok := rangeEndLimit("bytes=0-1", 0, http.StatusPartialContent); ok {
 		t.Fatal("unknown total must disable rotation")
+	}
+}
+
+// rotateLimit/stallLimit 三级求值:显式字段(单测/排障注入) > 配置 > 内置默认;
+// 负值原样透传(= 关闭该特性),0 一律回落默认。见 config.Relay 的契约注释。
+func TestRelayTuningPrecedence(t *testing.T) {
+	cfg := config.Default()
+	cfgp := &config.Provider{}
+	cfgp.Set(cfg)
+	r := NewRelay(nil, nil, nil, nil, nil, zap.NewNop().Sugar(), cfgp)
+
+	if got := r.rotateLimit(); got != defaultRelayRotateBytes {
+		t.Fatalf("default rotateLimit=%d, want %d", got, defaultRelayRotateBytes)
+	}
+	if got := r.stallLimit(); got != defaultRelayStallTimeout {
+		t.Fatalf("default stallLimit=%v, want %v", got, defaultRelayStallTimeout)
+	}
+
+	// 配置负值 = 关闭,必须原样透传(调用方按「不轮换 / 不看门狗」处理)
+	cfg.Relay.RotateBytes, cfg.Relay.StallTimeout = -1, -1
+	if got := r.rotateLimit(); got != -1 {
+		t.Fatalf("negative rotate must pass through, got %d", got)
+	}
+	if got := r.stallLimit(); got != -1 {
+		t.Fatalf("negative stall must pass through, got %v", got)
+	}
+
+	// 配置 0 = 回落内置默认(手写 Config 或显式写 0)
+	cfg.Relay.RotateBytes, cfg.Relay.StallTimeout = 0, 0
+	if got := r.rotateLimit(); got != defaultRelayRotateBytes {
+		t.Fatalf("zero rotate must fall back to %d, got %d", defaultRelayRotateBytes, got)
+	}
+	if got := r.stallLimit(); got != defaultRelayStallTimeout {
+		t.Fatalf("zero stall must fall back to %v, got %v", defaultRelayStallTimeout, got)
+	}
+
+	// 显式字段优先于配置
+	r.rotateBytes, r.stallTimeout = 4096, 7*time.Second
+	if got := r.rotateLimit(); got != 4096 {
+		t.Fatalf("field override must win for rotate, got %d", got)
+	}
+	if got := r.stallLimit(); got != 7*time.Second {
+		t.Fatalf("field override must win for stall, got %v", got)
+	}
+
+	// 未接配置时也必须回落默认,不能把阈值求成 0(那等于静默关闭两项能力)
+	plain := NewRelay(nil, nil, nil, nil, nil, zap.NewNop().Sugar(), nil)
+	if got := plain.rotateLimit(); got != defaultRelayRotateBytes {
+		t.Fatalf("nil cfgp must fall back to %d, got %d", defaultRelayRotateBytes, got)
+	}
+	if got := plain.stallLimit(); got != defaultRelayStallTimeout {
+		t.Fatalf("nil cfgp must fall back to %v, got %v", defaultRelayStallTimeout, got)
 	}
 }

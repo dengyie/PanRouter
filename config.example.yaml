@@ -87,6 +87,19 @@ transfer:
   dest_dir: /pool/panrouter
   max_bytes: 0                        # 0 = 默认 64GiB,负值 = 不限
 
+# 中转流(/stream)调优:deploy_profile: cloud 时直链绑 IP,下载必须走服务端中转,
+# 这两个值决定单条上游连接的服务质量。两项都可在运行时热加载(改配置即生效,
+# 只影响新请求);0 或不写 = 用括号里的默认值,负值 = 关闭该特性(排障用)。
+relay:
+  # 单条上游连接最多搬运多少字节就主动重开一条。网盘常对同一条长连接限速
+  # (实测 quark 累计约 1 GiB 后掉到 ~100 KB/s),按块换连接是根治手段。
+  # (默认 268435456 = 256 MiB;-1 = 不轮换,一条连接跑到底)
+  rotate_bytes: 0
+  # 上游连续这么久一个字节都不吐就判挂死,取消该连接并尝试 Range 续传。
+  # 只在「正阻塞读上游」时计时,客户端自己读得慢不会误杀。Go duration 格式。
+  # (默认 60s;-1 = 关闭看门狗)
+  stall_timeout: 0
+
 aria2:
   endpoint: http://127.0.0.1:6800/jsonrpc
   secret: ""                          # aria2.conf 里 rpc-secret 的值

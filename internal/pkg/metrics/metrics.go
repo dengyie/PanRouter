@@ -81,6 +81,26 @@ func (r *Registry) Add(name string, labels map[string]string, v float64) {
 	s.value += v
 }
 
+// AddGauge 按增量修改 gauge。gauge 需要「当前值」却仍会并发增减时(如
+// streams_active:多个流同时开始/结束),Set 会互相覆盖,所以提供与
+// Inc/Dec 等价的增量接口;符号由调用方决定(+1/-1)。
+func (r *Registry) AddGauge(name string, labels map[string]string, v float64) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	m, ok := r.gauges[name]
+	if !ok {
+		m = map[string]*series{}
+		r.gauges[name] = m
+	}
+	k := labelKey(labels)
+	s, ok := m[k]
+	if !ok {
+		s = &series{labels: k}
+		m[k] = s
+	}
+	s.value += v
+}
+
 func (r *Registry) Set(name string, labels map[string]string, v float64) {
 	r.mu.Lock()
 	defer r.mu.Unlock()

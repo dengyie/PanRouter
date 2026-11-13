@@ -199,7 +199,7 @@ func Build(o Options) (*App, error) {
 			"unreadable accounts will be skipped and marked expired on use", unreadable, total)
 	}
 	resolver := service.NewResolver(cfgp, reg, store, aes, accSvc, lim, brs, signer, met, o.Logger)
-	relay := service.NewRelay(resolver, relayClients, store, aes, met, o.Logger)
+	relay := service.NewRelay(resolver, relayClients, store, aes, met, o.Logger, cfgp)
 	aria2, err := service.NewAria2(cfgp, signer, resolver, store, aes, met, o.Logger)
 	if err != nil {
 		_ = store.Close()

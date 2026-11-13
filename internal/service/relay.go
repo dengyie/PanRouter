@@ -12,6 +12,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/dengyie/panrouter/internal/config"
 	"github.com/dengyie/panrouter/internal/driver"
 	"github.com/dengyie/panrouter/internal/pkg/httpx"
 	"github.com/dengyie/panrouter/internal/pkg/metrics"
@@ -40,6 +41,8 @@ const (
 	relayMetricRotate = "panrouter_relay_rotate_total"
 	relayMetricResume = "panrouter_relay_resume_total"
 	relayMetricAbort  = "panrouter_relay_abort_total"
+	relayMetricStall  = "panrouter_relay_stall_total"
+	relayMetricActive = "panrouter_relay_streams_active"
 
 	relayAbortClientGone = "client_gone"
 	relayAbortUpstream   = "upstream_interrupt"
@@ -68,36 +71,78 @@ const (
 )
 
 type Relay struct {
-	resolver     *Resolver
-	clients      map[string]*httpx.Client // pan → 只给中转用的 client(带 per-driver 重定向白名单)
-	store        *repo.Store
-	aes          aesCipher
-	met          *metrics.Registry
-	log          *loggerType
+	resolver *Resolver
+	clients  map[string]*httpx.Client // pan → 只给中转用的 client(带 per-driver 重定向白名单)
+	store    *repo.Store
+	aes      aesCipher
+	met      *metrics.Registry
+	log      *loggerType
+	cfgp     *config.Provider // relay 段(stall_timeout / rotate_bytes);nil = 内置默认
+	// rotateBytes / stallTimeout 是**覆盖值**,非 0 时优先于配置:生产恒为 0,
+	// 只有单测用它把阈值压到 KB/百毫秒级。求值见 rotateLimit/stallLimit。
 	rotateBytes  int64
 	stallTimeout time.Duration
 }
 
 func NewRelay(resolver *Resolver, clients map[string]*httpx.Client, store *repo.Store,
-	aes aesCipher, met *metrics.Registry, log *loggerType) *Relay {
-	s := &Relay{resolver: resolver, clients: clients, store: store, aes: aes, met: met, log: log,
-		rotateBytes: defaultRelayRotateBytes, stallTimeout: defaultRelayStallTimeout}
+	aes aesCipher, met *metrics.Registry, log *loggerType, cfgp *config.Provider) *Relay {
+	s := &Relay{resolver: resolver, clients: clients, store: store, aes: aes, met: met, log: log, cfgp: cfgp}
 	if met != nil {
 		met.Help(relayMetricBytes, "Relay 转发给客户端的字节数(按网盘)")
 		met.Help(relayMetricRotate, "Relay 主动轮换上游连接的次数")
 		met.Help(relayMetricResume, "Relay 上游断流后按 Range 续传成功的次数")
 		met.Help(relayMetricAbort, "Relay 未正常读完就结束的次数(按原因)")
+		met.Help(relayMetricStall, "Relay 上游连续 stall_timeout 无字节判挂死而取消连接的次数")
+		met.Help(relayMetricActive, "Relay 当前正在中转的流数(每请求开始时 +1,结束 -1)")
 		// 先把各网盘的 0 值序列建出来:没有序列和「全 0」在监控上不可区分。
 		for pan := range clients {
 			met.Add(relayMetricBytes, map[string]string{"pan": pan}, 0)
 			met.Add(relayMetricRotate, map[string]string{"pan": pan}, 0)
 			met.Add(relayMetricResume, map[string]string{"pan": pan}, 0)
+			met.Add(relayMetricStall, map[string]string{"pan": pan}, 0)
+			met.AddGauge(relayMetricActive, map[string]string{"pan": pan}, 0)
 			for _, reason := range []string{relayAbortClientGone, relayAbortUpstream, relayAbortRotate} {
 				met.Add(relayMetricAbort, map[string]string{"pan": pan, "reason": reason}, 0)
 			}
 		}
 	}
 	return s
+}
+
+// relayCfg 返回 relay 段配置;未接配置(单测)时返回 nil。
+func (s *Relay) relayCfg() *config.Relay {
+	if s.cfgp == nil {
+		return nil
+	}
+	if c := s.cfgp.Get(); c != nil {
+		return &c.Relay
+	}
+	return nil
+}
+
+// rotateLimit 求轮换阈值:显式字段(单测注入) > 配置 > 内置默认。
+//
+// 每个请求只求值一次并锁进局部变量:热加载改 relay.rotate_bytes 只影响新请求,
+// 已开始的流不会在轮换途中阈值突变。负值原样返回,由调用方按「关闭轮换」处理。
+func (s *Relay) rotateLimit() int64 {
+	if s.rotateBytes != 0 {
+		return s.rotateBytes
+	}
+	if c := s.relayCfg(); c != nil && c.RotateBytes != 0 {
+		return c.RotateBytes
+	}
+	return defaultRelayRotateBytes
+}
+
+// stallLimit 求停流看门狗阈值,优先级同 rotateLimit;<=0 表示关闭看门狗。
+func (s *Relay) stallLimit() time.Duration {
+	if s.stallTimeout != 0 {
+		return s.stallTimeout
+	}
+	if c := s.relayCfg(); c != nil && c.StallTimeout != 0 {
+		return c.StallTimeout
+	}
+	return defaultRelayStallTimeout
 }
 
 // StreamInput 是一次中转请求的已验证参数(签名校验在 api 层完成)。
@@ -140,6 +185,7 @@ type upstreamConn struct {
 	reading   atomic.Bool  // 是否正阻塞在 Read 上(写客户端期间不许判挂死)
 	stop      chan struct{}
 	once      sync.Once
+	onStall   func() // 看门狗真正判挂死时回调一次(记 relay_stall_total;可为 nil)
 }
 
 func (c *upstreamConn) touch() { c.last.Store(time.Now().UnixNano()) }
@@ -194,6 +240,11 @@ func (c *upstreamConn) watchStall(timeout time.Duration) {
 				continue
 			}
 			if time.Since(time.Unix(0, c.stallBase())) >= timeout {
+				// 先记账再取消:cancel 之后 Serve 会走续传/归因分支,这里记的是
+				// 「上游真的停流了」这个事实,与后续续传是否成功无关。
+				if c.onStall != nil {
+					c.onStall()
+				}
 				c.cancel() // 打断 Read,交给 Serve 的续传逻辑
 				return
 			}
@@ -258,8 +309,9 @@ func (s *Relay) Serve(ctx context.Context, w http.ResponseWriter, in StreamInput
 	limit, limitKnown := rangeEndLimit(rangeHeader, total, conn.resp.StatusCode)
 	// 只有「知道总长度 + 上游支持 Range」时才轮换/续传;否则保持旧行为(单连接跑到底),
 	// 避免为了一次性小响应(如 lanzou 的 HTML 挑战页)白折腾。
-	// rotateBytes<=0 视为关闭轮换(单测/排障用)。
-	canRotate := s.rotateBytes > 0 && limitKnown && total > 0 && start <= limit &&
+	// rotateBytes<=0 视为关闭轮换(配置负值或单测/排障用)。
+	rotateBytes := s.rotateLimit()
+	canRotate := rotateBytes > 0 && limitKnown && total > 0 && start <= limit &&
 		(hasCR || strings.EqualFold(conn.resp.Header.Get("Accept-Ranges"), "bytes"))
 
 	h := w.Header()
@@ -271,6 +323,10 @@ func (s *Relay) Serve(ctx context.Context, w http.ResponseWriter, in StreamInput
 		}
 	}
 	w.WriteHeader(conn.resp.StatusCode)
+	// streams_active:从中转真正开始(响应头已发)算起,到 Serve 返回为止。
+	// 与 bytes_total 的 rate() 一起看,就能分清「并发高但每条都慢」和「压根没有流」。
+	s.metActiveStream(in, 1)
+	defer s.metActiveStream(in, -1)
 
 	ss := &streamSession{in: in, link: link, orig: conn.resp.Header, pos: start, limit: limit, limited: limitKnown}
 
@@ -358,7 +414,7 @@ func (s *Relay) Serve(ctx context.Context, w http.ResponseWriter, in StreamInput
 		}
 
 		// 主动轮换:这条连接搬够量且文件还有剩余。客户端侧字节流连续,不可感知。
-		if canRotate && connBytes >= s.rotateBytes && ss.pos <= ss.limit {
+		if canRotate && connBytes >= rotateBytes && ss.pos <= ss.limit {
 			next, fellBack, rerr2 := s.rotate(ctx, ss)
 			if rerr2 != nil {
 				s.countAbort(in, relayAbortRotate)
@@ -511,8 +567,11 @@ func (s *Relay) openConn(ctx context.Context, in StreamInput, link streamLink, r
 		return nil, err
 	}
 	c := &upstreamConn{resp: resp, cancel: cancel, stop: make(chan struct{})}
+	if s.met != nil {
+		c.onStall = func() { s.met.Inc(relayMetricStall, map[string]string{"pan": in.Pan}) }
+	}
 	c.touch()
-	if stall := s.stallTimeout; stall > 0 {
+	if stall := s.stallLimit(); stall > 0 {
 		go c.watchStall(stall)
 	}
 	return c, nil
@@ -561,6 +620,13 @@ func (s *Relay) expireLink(in StreamInput) {
 func (s *Relay) countAbort(in StreamInput, reason string) {
 	if s.met != nil {
 		s.met.Inc(relayMetricAbort, map[string]string{"pan": in.Pan, "reason": reason})
+	}
+}
+
+// metActiveStream 增减 streams_active gauge(delta 为 +1/-1)。
+func (s *Relay) metActiveStream(in StreamInput, delta float64) {
+	if s.met != nil {
+		s.met.AddGauge(relayMetricActive, map[string]string{"pan": in.Pan}, delta)
 	}
 }
 
