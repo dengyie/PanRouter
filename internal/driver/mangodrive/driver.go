@@ -96,7 +96,17 @@ func fidFor(p string) string {
 	return FidHashPrefix + hex.EncodeToString(h[:])
 }
 
-// ResolveShare 解析一个存储路径(目录 → 列表,文件 → 单元素)。
+// ResolveShare 解析一个存储路径(目录 → 整棵子树,文件 → 单元素)。
+//
+// mangodrive 是存储路径视图(URL path == 存储 path),没有分享快照可回放,
+// 所以这里自己把树走完:根层 List 一次,再对每个目录 BFS 下探,直到没有新
+// 目录或触达上限。Name 一律重写为**相对分享根的路径**(上游只给叶子名,而
+// 客户端 build_plan/快照回放都要相对路径;根层叶子自然等于自身)。
+//
+// 上限(防循环引用/病态大树把 90s resolve 预算打爆):深度 8 层、总节点
+// 1000 个。触限时对最后一个节点打 Ext["truncated"]="1"(resolver 的
+// listingTruncated 会把它提升为 ResolveShareResult.Truncated),预算耗尽
+// 同样收窄返回,绝不 panic 也绝不静默丢整棵。
 func (d *Driver) ResolveShare(ctx context.Context, share driver.ShareLink, cred *driver.Credential) ([]driver.FileNode, error) {
 	api, p, err := d.target(share.URL, cred)
 	if err != nil {
@@ -109,15 +119,66 @@ func (d *Driver) ResolveShare(ctx context.Context, share driver.ShareLink, cred 
 	if !obj.IsDir {
 		return []driver.FileNode{nodeOf(p, *obj)}, nil
 	}
-	list, err := api.List(ctx, p)
-	if err != nil {
-		return nil, err
-	}
-	nodes := make([]driver.FileNode, 0, len(list))
-	for i := range list {
-		nodes = append(nodes, nodeOf(join(p, list[i].Name), list[i]))
+	nodes, truncated := listTree(ctx, api, p)
+	if truncated && len(nodes) > 0 {
+		nodes[len(nodes)-1].Ext["truncated"] = "1"
 	}
 	return nodes, nil
+}
+
+// 树遍历上限:与 ingest_tree 客户端展开(8 层/200 目录)同量级,服务端略宽
+// (节点口径而非目录口径,一个千文件平铺目录也要能整树返回)。
+const (
+	treeMaxDepth = 8
+	treeMaxNodes = 1000
+)
+
+// listTree 从根目录 BFS 整棵子树;返回节点(相对名)与是否触限截断。
+func listTree(ctx context.Context, api *API, root string) ([]driver.FileNode, bool) {
+	type queued struct {
+		path string // 存储内绝对路径
+		rel  string // 相对 root 的路径("" = 根层)
+	}
+	nodes := make([]driver.FileNode, 0, 16)
+	truncated := false
+	queue := []queued{{path: root, rel: ""}}
+	seen := map[string]bool{root: true} // 目录去重(防御性:软链/异常上游可能成环)
+	for depth := 0; depth < treeMaxDepth && len(queue) > 0; depth++ {
+		var next []queued
+		for _, q := range queue {
+			if len(nodes) >= treeMaxNodes || ctx.Err() != nil {
+				return nodes, true
+			}
+			list, err := api.List(ctx, q.path)
+			if err != nil {
+				// 单层列表失败:该子目录弃置,其余继续(上游瞬时抖动不毁整树)。
+				continue
+			}
+			for i := range list {
+				if len(nodes) >= treeMaxNodes || ctx.Err() != nil {
+					return nodes, true
+				}
+				child := list[i]
+				full := join(q.path, child.Name)
+				rel := child.Name
+				if q.rel != "" {
+					rel = q.rel + "/" + child.Name
+				}
+				n := nodeOf(full, child)
+				n.Name = rel
+				nodes = append(nodes, n)
+				if child.IsDir && !seen[full] {
+					seen[full] = true
+					next = append(next, queued{path: full, rel: rel})
+				}
+			}
+		}
+		queue = next
+	}
+	if len(queue) > 0 { // 深度触限仍有未下探目录
+		truncated = true
+	}
+	return nodes, truncated
 }
 
 // target 解析链接并返回已鉴权的 API。
