@@ -3,10 +3,13 @@ package service
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -623,6 +626,11 @@ func TestRelayResumesAfterStall(t *testing.T) {
 	if body := rr.Body.String(); !strings.Contains(body, `panrouter_relay_stall_total{pan="fake"} 1`) {
 		t.Fatalf("stall watchdog firing not counted:\n%s", body)
 	}
+	// 等待归因:上游黑洞段(read 阻塞到被看门狗取消)必须落到 upstream_wait,
+	// 而不是把时间混进客户端侧——否则「网盘限速」和「客户端拖慢」永远分不开。
+	if v := metricValue(t, relay, "panrouter_relay_upstream_wait_seconds_total", map[string]string{"pan": "fake"}); v < 0.15 {
+		t.Fatalf("upstream_wait_seconds_total=%v, want >=0.15 (relay dead-blocked reading upstream)", v)
+	}
 }
 
 // 上游每次都断时不能无限重连:续满 relayResumeMax 次后按 upstream_interrupt 收尾。
@@ -809,6 +817,128 @@ func TestRelaySlowClientDoesNotTripStallWatchdog(t *testing.T) {
 	if !strings.Contains(body, `panrouter_relay_streams_active{pan="fake"} 0`) {
 		t.Fatalf("streams_active must return to 0 after Serve returns:\n%s", body)
 	}
+	// 等待归因:600ms 的客户端阻塞必须落在 client_wait,且明显大于 upstream_wait。
+	// 这两条序列就是「瓶颈在我方/客户端」与「瓶颈在网盘」的判据。
+	cw := metricValue(t, relay, "panrouter_relay_client_wait_seconds_total", map[string]string{"pan": "fake"})
+	uw := metricValue(t, relay, "panrouter_relay_upstream_wait_seconds_total", map[string]string{"pan": "fake"})
+	if cw < 0.5 {
+		t.Fatalf("client_wait_seconds_total=%v, want >=0.5 (client blocked 600ms)", cw)
+	}
+	if uw >= cw {
+		t.Fatalf("upstream_wait=%v must stay below client_wait=%v for a slow client", uw, cw)
+	}
+}
+
+// metricValue 从 relay 的指标快照里取出某序列的数值(序列不存在时返回 -1)。
+func metricValue(t *testing.T, relay *Relay, name string, labels map[string]string) float64 {
+	t.Helper()
+	rr := httptest.NewRecorder()
+	relay.met.Handler().ServeHTTP(rr, httptest.NewRequest("GET", "/metrics", nil))
+	keys := make([]string, 0, len(labels))
+	for k := range labels {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	var sb strings.Builder
+	for i, k := range keys {
+		if i > 0 {
+			sb.WriteString(",")
+		}
+		fmt.Fprintf(&sb, `%s=%q`, k, labels[k])
+	}
+	prefix := name + "{" + sb.String() + "} "
+	for _, line := range strings.Split(rr.Body.String(), "\n") {
+		if strings.HasPrefix(line, prefix) {
+			v, err := strconv.ParseFloat(strings.TrimPrefix(line, prefix), 64)
+			if err != nil {
+				t.Fatalf("bad metric value in %q: %v", line, err)
+			}
+			return v
+		}
+	}
+	return -1
+}
+
+// deadlineWriter 模拟「客户端半死不活」:SetWriteDeadline 生效、Write 阻塞到截止时间
+// 然后如实返回 ErrDeadlineExceeded(与 net/http 在写超时后的行为一致)。
+type deadlineWriter struct {
+	rec      *httptest.ResponseRecorder
+	mu       sync.Mutex
+	deadline time.Time
+	blocked  chan struct{}
+	once     sync.Once
+}
+
+func (d *deadlineWriter) Header() http.Header  { return d.rec.Header() }
+func (d *deadlineWriter) WriteHeader(code int) { d.rec.WriteHeader(code) }
+
+func (d *deadlineWriter) SetWriteDeadline(t time.Time) error {
+	d.mu.Lock()
+	d.deadline = t
+	d.mu.Unlock()
+	return nil
+}
+
+func (d *deadlineWriter) Write(p []byte) (int, error) {
+	d.once.Do(func() { close(d.blocked) })
+	d.mu.Lock()
+	dl := d.deadline
+	d.mu.Unlock()
+	if dl.IsZero() {
+		return 0, errors.New("write with no deadline set")
+	}
+	if w := time.Until(dl); w > 0 {
+		time.Sleep(w)
+	}
+	return 0, os.ErrDeadlineExceeded
+}
+
+// 客户端既不接收也不关闭(暂停下载/进程被杀但 TCP 未断开)时,写必须有个归因清楚的
+// 结局:client_stalled(写超时放弃),而不是永远吊着上游连接、也不是误记 client_gone。
+func TestRelayClientStallAbortedAndAttributed(t *testing.T) {
+	payload := bytes.Repeat([]byte("c"), 256<<10)
+	up := newFakeUpstream(t, payload, true)
+
+	relay, key := newRelayFixture(t, up.URL())
+	relay.clientStallTimeout = 150 * time.Millisecond
+
+	dw := &deadlineWriter{
+		rec:     httptest.NewRecorder(),
+		blocked: make(chan struct{}),
+	}
+	done := make(chan error, 1)
+	go func() {
+		done <- relay.Serve(context.Background(), dw, StreamInput{Pan: "fake", ShareKey: key, FID: "f1"}, "")
+	}()
+
+	select {
+	case <-dw.blocked:
+	case <-time.After(3 * time.Second):
+		t.Fatal("relay never wrote to the client")
+	}
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("relay: %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("Serve must give up on a stalled client instead of hanging")
+	}
+
+	// 归因:写超时是 client_stalled,不是 client_gone;active 必须回到 0。
+	if v := metricValue(t, relay, "panrouter_relay_abort_total", map[string]string{"pan": "fake", "reason": "client_stalled"}); v != 1 {
+		t.Fatalf("client_stalled=%v, want 1", v)
+	}
+	if v := metricValue(t, relay, "panrouter_relay_abort_total", map[string]string{"pan": "fake", "reason": "client_gone"}); v != 0 {
+		t.Fatalf("client_gone=%v, want 0 (a stalled client is not a gone client)", v)
+	}
+	if v := metricValue(t, relay, "panrouter_relay_streams_active", map[string]string{"pan": "fake"}); v != 0 {
+		t.Fatalf("streams_active=%v, want 0 after Serve returns", v)
+	}
+	// 这段等待时间属于客户端侧(读不过来),必须记在 client_wait 名下。
+	if v := metricValue(t, relay, "panrouter_relay_client_wait_seconds_total", map[string]string{"pan": "fake"}); v < 0.1 {
+		t.Fatalf("client_wait_seconds_total=%v, want >=0.1", v)
+	}
 }
 
 // 轮换/续传必须校验 ETag/Last-Modified:上游在该位置已经换成另一个对象时,
@@ -918,32 +1048,47 @@ func TestRelayTuningPrecedence(t *testing.T) {
 	if got := r.stallLimit(); got != defaultRelayStallTimeout {
 		t.Fatalf("default stallLimit=%v, want %v", got, defaultRelayStallTimeout)
 	}
+	if got := r.clientStallLimit(); got != defaultRelayClientStallTimeout {
+		t.Fatalf("default clientStallLimit=%v, want %v", got, defaultRelayClientStallTimeout)
+	}
 
 	// 配置负值 = 关闭,必须原样透传(调用方按「不轮换 / 不看门狗」处理)
 	cfg.Relay.RotateBytes, cfg.Relay.StallTimeout = -1, -1
+	cfg.Relay.ClientStallTimeout = -1
 	if got := r.rotateLimit(); got != -1 {
 		t.Fatalf("negative rotate must pass through, got %d", got)
 	}
 	if got := r.stallLimit(); got != -1 {
 		t.Fatalf("negative stall must pass through, got %v", got)
 	}
+	if got := r.clientStallLimit(); got != -1 {
+		t.Fatalf("negative client stall must pass through, got %v", got)
+	}
 
 	// 配置 0 = 回落内置默认(手写 Config 或显式写 0)
 	cfg.Relay.RotateBytes, cfg.Relay.StallTimeout = 0, 0
+	cfg.Relay.ClientStallTimeout = 0
 	if got := r.rotateLimit(); got != defaultRelayRotateBytes {
 		t.Fatalf("zero rotate must fall back to %d, got %d", defaultRelayRotateBytes, got)
 	}
 	if got := r.stallLimit(); got != defaultRelayStallTimeout {
 		t.Fatalf("zero stall must fall back to %v, got %v", defaultRelayStallTimeout, got)
 	}
+	if got := r.clientStallLimit(); got != defaultRelayClientStallTimeout {
+		t.Fatalf("zero client stall must fall back to %v, got %v", defaultRelayClientStallTimeout, got)
+	}
 
 	// 显式字段优先于配置
 	r.rotateBytes, r.stallTimeout = 4096, 7*time.Second
+	r.clientStallTimeout = 3 * time.Second
 	if got := r.rotateLimit(); got != 4096 {
 		t.Fatalf("field override must win for rotate, got %d", got)
 	}
 	if got := r.stallLimit(); got != 7*time.Second {
 		t.Fatalf("field override must win for stall, got %v", got)
+	}
+	if got := r.clientStallLimit(); got != 3*time.Second {
+		t.Fatalf("field override must win for client stall, got %v", got)
 	}
 
 	// 未接配置时也必须回落默认,不能把阈值求成 0(那等于静默关闭两项能力)
@@ -953,5 +1098,8 @@ func TestRelayTuningPrecedence(t *testing.T) {
 	}
 	if got := plain.stallLimit(); got != defaultRelayStallTimeout {
 		t.Fatalf("nil cfgp must fall back to %v, got %v", defaultRelayStallTimeout, got)
+	}
+	if got := plain.clientStallLimit(); got != defaultRelayClientStallTimeout {
+		t.Fatalf("nil cfgp must fall back to %v, got %v", defaultRelayClientStallTimeout, got)
 	}
 }

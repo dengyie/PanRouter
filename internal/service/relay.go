@@ -3,9 +3,11 @@ package service
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -37,16 +39,19 @@ const (
 
 	// 指标名与归因标签集中在这里:同一名字在 NewRelay/Serve/countAbort 三处出现,
 	// 一旦手写拼错就会悄悄多出一条空序列,监控上看不出异常。
-	relayMetricBytes  = "panrouter_relay_bytes_total"
-	relayMetricRotate = "panrouter_relay_rotate_total"
-	relayMetricResume = "panrouter_relay_resume_total"
-	relayMetricAbort  = "panrouter_relay_abort_total"
-	relayMetricStall  = "panrouter_relay_stall_total"
-	relayMetricActive = "panrouter_relay_streams_active"
+	relayMetricBytes        = "panrouter_relay_bytes_total"
+	relayMetricRotate       = "panrouter_relay_rotate_total"
+	relayMetricResume       = "panrouter_relay_resume_total"
+	relayMetricAbort        = "panrouter_relay_abort_total"
+	relayMetricStall        = "panrouter_relay_stall_total"
+	relayMetricActive       = "panrouter_relay_streams_active"
+	relayMetricUpstreamWait = "panrouter_relay_upstream_wait_seconds_total"
+	relayMetricClientWait   = "panrouter_relay_client_wait_seconds_total"
 
-	relayAbortClientGone = "client_gone"
-	relayAbortUpstream   = "upstream_interrupt"
-	relayAbortRotate     = "rotate_failed"
+	relayAbortClientGone    = "client_gone"
+	relayAbortClientStalled = "client_stalled"
+	relayAbortUpstream      = "upstream_interrupt"
+	relayAbortRotate        = "rotate_failed"
 
 	// defaultRelayRotateBytes:单条上游连接最多搬运这么多字节就重开一条。
 	//
@@ -68,6 +73,17 @@ const (
 	// 看门狗只在「正阻塞在读上游」时生效(见 upstreamConn.reading):客户端自己
 	// 写不动(w.Write 阻塞)不算上游挂死,那种情况取消连接只会白白重连。
 	defaultRelayStallTimeout = 60 * time.Second
+
+	// defaultRelayClientStallTimeout:写客户端时,一次 w.Write / Flush 允许的时长。
+	// w.Write 只在「客户端把数据读走」时才返回——客户端半死不活(既不读也不关,
+	// 暂停下载/杀进程但 TCP 未 RST)时,Write 会阻塞到上游断或连接 RSS 级别超时,
+	// 一条上游连接 + 128 KB 缓冲就这样被永远吊住,HTTP 连接池也在空转。
+	//
+	// http.Server 特意不设 WriteTimeout(流式代理不能给整体写设硬超时,否则大文件
+	// 慢速客户端必被掐),所以这个**每写一次的软截止**是必须自己兜的。只对「写」计时,
+	// 客户端恢复读之后每次 Write 都会重设截止时间,不会误杀慢而健康的客户端。
+	// ErrNotSupported(响应器不支持写截止,如 httptest recorder)直接忽略。
+	defaultRelayClientStallTimeout = 120 * time.Second
 )
 
 type Relay struct {
@@ -77,11 +93,13 @@ type Relay struct {
 	aes      aesCipher
 	met      *metrics.Registry
 	log      *loggerType
-	cfgp     *config.Provider // relay 段(stall_timeout / rotate_bytes);nil = 内置默认
-	// rotateBytes / stallTimeout 是**覆盖值**,非 0 时优先于配置:生产恒为 0,
-	// 只有单测用它把阈值压到 KB/百毫秒级。求值见 rotateLimit/stallLimit。
-	rotateBytes  int64
-	stallTimeout time.Duration
+	cfgp     *config.Provider // relay 段(rotate_bytes / stall_timeout / client_stall_timeout);nil = 内置默认
+	// rotateBytes / stallTimeout / clientStallTimeout 是**覆盖值**,非 0 时优先于配置:
+	// 生产恒为 0,只有单测用它把阈值压到 KB/百毫秒级。求值见 rotateLimit/stallLimit/
+	// clientStallLimit。
+	rotateBytes        int64
+	stallTimeout       time.Duration
+	clientStallTimeout time.Duration
 }
 
 func NewRelay(resolver *Resolver, clients map[string]*httpx.Client, store *repo.Store,
@@ -94,14 +112,18 @@ func NewRelay(resolver *Resolver, clients map[string]*httpx.Client, store *repo.
 		met.Help(relayMetricAbort, "Relay 未正常读完就结束的次数(按原因)")
 		met.Help(relayMetricStall, "Relay 上游连续 stall_timeout 无字节判挂死而取消连接的次数")
 		met.Help(relayMetricActive, "Relay 当前正在中转的流数(每请求开始时 +1,结束 -1)")
+		met.Help(relayMetricUpstreamWait, "Relay 阻塞等待上游吐字节的累计秒数(按网盘)")
+		met.Help(relayMetricClientWait, "Relay 阻塞等待客户端接收(Write/Flush)的累计秒数(按网盘)")
 		// 先把各网盘的 0 值序列建出来:没有序列和「全 0」在监控上不可区分。
 		for pan := range clients {
 			met.Add(relayMetricBytes, map[string]string{"pan": pan}, 0)
 			met.Add(relayMetricRotate, map[string]string{"pan": pan}, 0)
 			met.Add(relayMetricResume, map[string]string{"pan": pan}, 0)
 			met.Add(relayMetricStall, map[string]string{"pan": pan}, 0)
+			met.Add(relayMetricUpstreamWait, map[string]string{"pan": pan}, 0)
+			met.Add(relayMetricClientWait, map[string]string{"pan": pan}, 0)
 			met.AddGauge(relayMetricActive, map[string]string{"pan": pan}, 0)
-			for _, reason := range []string{relayAbortClientGone, relayAbortUpstream, relayAbortRotate} {
+			for _, reason := range []string{relayAbortClientGone, relayAbortClientStalled, relayAbortUpstream, relayAbortRotate} {
 				met.Add(relayMetricAbort, map[string]string{"pan": pan, "reason": reason}, 0)
 			}
 		}
@@ -143,6 +165,17 @@ func (s *Relay) stallLimit() time.Duration {
 		return c.StallTimeout
 	}
 	return defaultRelayStallTimeout
+}
+
+// clientStallLimit 求「单次写客户端」的软截止,优先级同 stallLimit;<=0 表示不限。
+func (s *Relay) clientStallLimit() time.Duration {
+	if s.clientStallTimeout != 0 {
+		return s.clientStallTimeout
+	}
+	if c := s.relayCfg(); c != nil && c.ClientStallTimeout != 0 {
+		return c.ClientStallTimeout
+	}
+	return defaultRelayClientStallTimeout
 }
 
 // StreamInput 是一次中转请求的已验证参数(签名校验在 api 层完成)。
@@ -331,12 +364,43 @@ func (s *Relay) Serve(ctx context.Context, w http.ResponseWriter, in StreamInput
 	ss := &streamSession{in: in, link: link, orig: conn.resp.Header, pos: start, limit: limit, limited: limitKnown}
 
 	flusher, _ := w.(http.Flusher)
+	// 客户端写软截止:每次 Write/Flush 前重设。http.Server 特意没设 WriteTimeout
+	// (流式代理给整体写设硬超时会把慢速大文件下载掐断),于是「客户端半死不活」
+	// 这条路径没人兜——Write 阻塞期间上游连接和缓冲一直被占着,还占着连接池。
+	clientStall := s.clientStallLimit()
+	var rc *http.ResponseController
+	if clientStall > 0 {
+		rc = http.NewResponseController(w)
+		// keep-alive 的坑:server 的 WriteTimeout=0 不会在下一个请求开始时重置写
+		// 截止,本请求留下的值会延续到这条连接上后续的请求——空闲一会儿再来的
+		// 请求一写就超时。所以离开前必须清掉(ErrNotSupported 的响应器忽略即可)。
+		defer func() { _ = rc.SetWriteDeadline(time.Time{}) }()
+	}
+	panLabels := map[string]string{"pan": in.Pan} // 复用:分块循环里每块都新建 map 纯属制造垃圾
 	buf := make([]byte, relayBufSize)
 	connBytes := int64(0) // 当前这条上游连接已搬运的字节
 	pending := int64(0)   // 尚未 Flush 的字节
 
+	// flush 沿用「攒够再刷」语义,只是把写截止一并前移:Flush 同样会阻塞在 socket,
+	// 而它不返回 error,所以只能靠截止时间让后续 Write 报出错误。
+	flush := func() {
+		if flusher == nil || pending == 0 {
+			return
+		}
+		if clientStall > 0 {
+			_ = rc.SetWriteDeadline(time.Now().Add(clientStall))
+		}
+		flusher.Flush()
+		pending = 0
+	}
+
 	for {
+		rt0 := time.Now()
 		n, rerr := conn.read(buf)
+		// 等待归因:relay 的全部时间只会花在这两处阻塞上(读上游 / 写客户端)。
+		// 与 bytes_total 的 rate() 一起看,就能分清「网盘限速」(upstream_wait 高、
+		// bytes rate 低)与「我方或客户端拖慢」(client_wait 高)。
+		s.addWait(relayMetricUpstreamWait, panLabels, time.Since(rt0))
 		if n > 0 {
 			conn.touch() // 喂看门狗:有字节流动就不是挂死
 			// 绝不越过客户端要的终点:一旦写超 Content-Length,net/http 会拒收整块
@@ -350,33 +414,46 @@ func (s *Relay) Serve(ctx context.Context, w http.ResponseWriter, in StreamInput
 				}
 			}
 			if n > 0 {
-				if _, werr := w.Write(buf[:n]); werr != nil {
+				if clientStall > 0 {
+					// 每次写都重设:上一次的截止可能早已过期(上游读了几分钟),
+					// 不重设会让一次正常写立刻报超时。
+					_ = rc.SetWriteDeadline(time.Now().Add(clientStall))
+				}
+				wt0 := time.Now()
+				_, werr := w.Write(buf[:n])
+				s.addWait(relayMetricClientWait, panLabels, time.Since(wt0))
+				if werr != nil {
+					// 写到期 = 客户端既不收也不关(暂停下载/进程被杀但 TCP 未 RST)。
+					// 放弃这条流,否则上游连接被永远吊住;与「主动断开」分开归因,
+					// 否则运维会以为用户都正常走了。
+					if clientStall > 0 && (errors.Is(werr, os.ErrDeadlineExceeded) ||
+						errors.Is(werr, context.DeadlineExceeded)) {
+						s.countAbort(in, relayAbortClientStalled)
+						s.log.Warnf("relay client stalled: share=%s fid=%s pos=%d timeout=%v err=%v",
+							in.ShareKey, in.FID, ss.pos, clientStall, werr)
+						return nil
+					}
 					s.countAbort(in, relayAbortClientGone)
 					return nil // 客户端断开,属正常取消
 				}
 				if s.met != nil {
-					s.met.Add(relayMetricBytes, map[string]string{"pan": in.Pan}, float64(n))
+					s.met.Add(relayMetricBytes, panLabels, float64(n))
 				}
 				ss.pos += int64(n)
 				connBytes += int64(n)
 				pending += int64(n)
-				if flusher != nil && pending >= relayFlushBytes {
-					flusher.Flush()
-					pending = 0
+				if pending >= relayFlushBytes {
+					flush()
 				}
 			}
 			if ss.limited && ss.pos > ss.limit {
-				if flusher != nil && pending > 0 {
-					flusher.Flush()
-				}
+				flush()
 				return nil // 客户端要的范围已送满,不必再读上游
 			}
 		}
 		if rerr != nil {
 			if rerr == io.EOF {
-				if flusher != nil && pending > 0 {
-					flusher.Flush()
-				}
+				flush()
 				return nil
 			}
 			// 客户端断开:父 ctx 先被取消,上游 Read 随之返回 context canceled。
@@ -620,6 +697,13 @@ func (s *Relay) expireLink(in StreamInput) {
 func (s *Relay) countAbort(in StreamInput, reason string) {
 	if s.met != nil {
 		s.met.Inc(relayMetricAbort, map[string]string{"pan": in.Pan, "reason": reason})
+	}
+}
+
+// addWait 累加一次阻塞等待的秒数(标签按网盘复用,避免每块都新建 map)。
+func (s *Relay) addWait(metric string, labels map[string]string, d time.Duration) {
+	if s.met != nil && d > 0 {
+		s.met.Add(metric, labels, d.Seconds())
 	}
 }
 

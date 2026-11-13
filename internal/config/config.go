@@ -98,7 +98,7 @@ type Transfer struct {
 	OfflineConfirmPoll time.Duration `mapstructure:"offline_confirm_poll"`
 }
 
-// Relay 是中转流(/stream)的调优参数。两项都按「0 = 内置默认,负值 = 关闭」解释,
+// Relay 是中转流(/stream)的调优参数。各项都按「0 = 内置默认,负值 = 关闭」解释,
 // 且都在每个请求开始时读一次配置:改配置**不需要重启**,但不影响已开始的流。
 type Relay struct {
 	// RotateBytes 单条上游连接最多搬运多少字节就主动重开一条。网盘对同一条长连接
@@ -109,6 +109,13 @@ type Relay struct {
 	// 0 = 默认 60s;负值 = 关闭看门狗(仅排障:挂死会一直吊着客户端)。
 	// 客户端自己慢(写阻塞)不算挂死,见 upstreamConn.reading。
 	StallTimeout time.Duration `mapstructure:"stall_timeout"`
+	// ClientStallTimeout 一次「写客户端 / Flush」允许的时长。客户端半死不活(既不读
+	// 也不关,如暂停下载/进程被杀但 TCP 未断开)时,Write 会一直阻塞,把上游连接和
+	// 缓冲永久吊住——http.Server 不设 WriteTimeout(流式代理不能给整体写设硬超时),
+	// 所以这里按每次写设**软截止**,客户端恢复读后每次写都会自动重设,不误杀慢而
+	// 健康的客户端。
+	// 0 = 默认 120s;负值 = 关闭该保护(一写就挂死,仅排障/回退用)。
+	ClientStallTimeout time.Duration `mapstructure:"client_stall_timeout"`
 }
 
 type Log struct {
@@ -177,6 +184,7 @@ func Default() *Config {
 	c.Aria2.SameHost = true
 	c.Relay.RotateBytes = 256 << 20
 	c.Relay.StallTimeout = 60 * time.Second
+	c.Relay.ClientStallTimeout = 120 * time.Second
 	c.Log.Level = "info"
 	// dest_dir 无默认:未配置时落到端点根目录(由 OpenList 自身决定归属),
 	// 本仓库参考部署在 config.yaml 里显式配置了 /pool/panrouter。

@@ -62,7 +62,7 @@ drivers:
 // relay 每个请求读一次配置,改阈值不需要重启(只影响新请求)。
 func TestLoadRelaySection(t *testing.T) {
 	p := filepath.Join(t.TempDir(), "c.yaml")
-	yaml := "relay:\n  stall_timeout: 5s\n  rotate_bytes: 1048576\n"
+	yaml := "relay:\n  stall_timeout: 5s\n  rotate_bytes: 1048576\n  client_stall_timeout: 90s\n"
 	if err := os.WriteFile(p, []byte(yaml), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -70,7 +70,7 @@ func TestLoadRelaySection(t *testing.T) {
 	if err != nil {
 		t.Fatalf("load: %v", err)
 	}
-	if c.Relay.StallTimeout != 5*time.Second || c.Relay.RotateBytes != 1048576 {
+	if c.Relay.StallTimeout != 5*time.Second || c.Relay.RotateBytes != 1048576 || c.Relay.ClientStallTimeout != 90*time.Second {
 		t.Fatalf("relay section not applied: %+v", c.Relay)
 	}
 
@@ -78,7 +78,7 @@ func TestLoadRelaySection(t *testing.T) {
 	if err != nil {
 		t.Fatalf("relay tuning must be reloadable, got: %v", err)
 	}
-	if next.Relay.StallTimeout != 5*time.Second || next.Relay.RotateBytes != 1048576 {
+	if next.Relay.StallTimeout != 5*time.Second || next.Relay.RotateBytes != 1048576 || next.Relay.ClientStallTimeout != 90*time.Second {
 		t.Fatalf("reload relay not applied: %+v", next.Relay)
 	}
 }
