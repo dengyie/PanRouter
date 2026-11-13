@@ -1045,11 +1045,18 @@ func (r *Resolver) driverStat(ctx context.Context, drv driver.Driver, rawURL, fi
 
 // buildResult 由 repo.Link 派生下载路径与签名链接。
 func (r *Resolver) buildResult(pan, key string, l *repo.Link, clientUA string, cacheHit bool) *ResolveFileResult {
-	cookie, _ := r.aes.DecryptBytes(l.CookieEnc)
+	cookie, cerr := r.aes.DecryptBytes(l.CookieEnc)
 	meta := LinkMeta{UA: l.UA, Referer: l.Referer, Cookie: string(cookie), BindIP: l.BindIP}
 	cfg := r.cfg.Get()
 	env := RouteEnv{Profile: cfg.Server.DeployProfile, ClientUA: clientUA, Aria2SameHost: cfg.Aria2.SameHost}
 	route := Route(meta, env)
+	needHeaders := NeedHeaders(l.UA, l.Referer, string(cookie), clientUA)
+	if cerr != nil {
+		// 解不开 = 无法判断这条直链是否带 Cookie 约束。当成「无 Cookie」会给出错误的
+		// 302/aria2 路径(用户拿到 CDN 的 403);退回中转这一条,relay 会在那里明确
+		// 报出凭据错误,界面能给出「重新解析」的可操作提示。
+		route, needHeaders = "stream", true
+	}
 	// 下载入口签名统一使用配置 sign_ttl,与上游直链剩余有效期(ExpiresAt)解耦:
 	// 短 TTL 直链过期后签名仍有效,GetFreshLink 可在入口有效期内续命(P2-5)。
 	sig := r.signer.Sign(pan+"|"+key+"|"+l.FID, cfg.Server.EffectiveSignTTL())
@@ -1062,7 +1069,7 @@ func (r *Resolver) buildResult(pan, key string, l *repo.Link, clientUA string, c
 		DirectURL:   l.DirectLink,
 		UA:          l.UA,
 		Referer:     l.Referer,
-		NeedHeaders: NeedHeaders(l.UA, l.Referer, string(cookie), clientUA),
+		NeedHeaders: needHeaders,
 		ExpiresAt:   l.ExpiresAt,
 		CacheHit:    cacheHit,
 	}

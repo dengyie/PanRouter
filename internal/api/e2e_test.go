@@ -4,12 +4,15 @@ package api
 // 通过 HTTP 全栈验证鉴权、解析、路径决策、302 降级、中转、账号与下载任务。
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"sort"
 	"strconv"
 	"strings"
 	"testing"
@@ -43,6 +46,8 @@ func (d *e2eDriver) ResolveShare(context.Context, driver.ShareLink, *driver.Cred
 		{FID: "fbind", Name: "bound.bin", Size: 11, Ext: map[string]string{}},
 		// path 形态 fid(含 "/",mangodrive 的真实形态):回归下载入口 URL 编码
 		{FID: "/deep/dir/f.bin", Name: "deep.bin", Size: 5, Ext: map[string]string{"path": "/deep/dir/f.bin"}},
+		// 大文件:供「客户端停读 → 写挂死」用例把 socket 缓冲写满
+		{FID: "fbig", Name: "big.bin", Size: int64(len(e2eBigBody)), Ext: map[string]string{}},
 	}, nil
 }
 
@@ -56,6 +61,8 @@ func (d *e2eDriver) GetDirectLink(_ context.Context, _ *driver.Credential, ref d
 		}, nil
 	case "fbind": // 绑定解析 IP → cloud 画像或 aria2 异机时走中转
 		return driver.DirectLink{URL: d.upstream + "/file/b", BindIP: true, ExpiresAt: time.Now().Add(time.Hour)}, nil
+	case "fbig":
+		return driver.DirectLink{URL: d.upstream + "/file/big", ExpiresAt: time.Now().Add(time.Hour)}, nil
 	case "/deep/dir/f.bin": // 路径形态 fid:裸链 → 浏览器 302
 		return driver.DirectLink{URL: d.upstream + "/file/deep", ExpiresAt: time.Now().Add(time.Hour)}, nil
 	default: // f1:裸链 → 浏览器 302
@@ -65,6 +72,10 @@ func (d *e2eDriver) GetDirectLink(_ context.Context, _ *driver.Credential, ref d
 func (d *e2eDriver) CheckCredential(context.Context, driver.Credential) (driver.CredStatus, error) {
 	return driver.CredStatus{Valid: true, Nickname: "e2e"}, nil
 }
+
+// e2eBigBody 是 /file/big 的响应体:必须大到把 socket 收发缓冲写满,「客户端停读」
+// 才会真的让服务端 Write 阻塞(否则整段瞬间塞进内核缓冲,写截止永远不触发)。
+var e2eBigBody = bytes.Repeat([]byte("B"), 32<<20)
 
 // e2eUpstream:直链目标(mock 网盘 CDN),支持 Range。
 func e2eUpstream() *httptest.Server {
@@ -84,6 +95,8 @@ func e2eUpstream() *httptest.Server {
 			_, _ = w.Write([]byte("UPSTREAM-b"))
 		case "/file/deep":
 			_, _ = w.Write([]byte("UPSTREAM-deep"))
+		case "/file/big":
+			_, _ = w.Write(e2eBigBody)
 		default:
 			w.WriteHeader(http.StatusNotFound)
 		}
@@ -115,6 +128,7 @@ func e2eAria2() (*httptest.Server, *string) {
 
 type e2eEnv struct {
 	ts        *httptest.Server
+	cfgp      *config.Provider
 	store     *repo.Store
 	upstream  *httptest.Server
 	aria2mock *httptest.Server
@@ -200,7 +214,7 @@ func newE2E(t *testing.T, sameHost bool) *e2eEnv {
 	cfg.Server.BaseURL = ts.URL
 	a.ApplyConfig(cfg)
 
-	env := &e2eEnv{ts: ts, store: a.Store, upstream: upstream, aria2mock: aria2mock, aria2Body: aria2Body}
+	env := &e2eEnv{ts: ts, cfgp: a.Cfg, store: a.Store, upstream: upstream, aria2mock: aria2mock, aria2Body: aria2Body}
 	env.client = &http.Client{CheckRedirect: func(*http.Request, []*http.Request) error {
 		return http.ErrUseLastResponse
 	}}
@@ -316,7 +330,7 @@ func TestE2EResolveAndRoute302(t *testing.T) {
 
 	// 分享列表:一次解析即自动提链,文件行应带 download_url
 	st, body := e.do(t, "POST", "/api/v1/resolve", e.token, `{"url":"`+e2eShareURL+`"}`)
-	if st != http.StatusOK || len(body["files"].([]any)) != 4 {
+	if st != http.StatusOK || len(body["files"].([]any)) != 5 {
 		t.Fatalf("share: %d %v", st, body)
 	}
 	first := body["files"].([]any)[0].(map[string]any)
@@ -421,6 +435,90 @@ func TestE2EBadSignatureRejected(t *testing.T) {
 	e := newE2E(t, true)
 	if st, body := e.do(t, "GET", "/d/fake/k/f?sig=bad", "", ""); st != http.StatusNotFound {
 		t.Fatalf("bad sig: %d %v", st, body)
+	}
+}
+
+// metric 读取 /metrics 中某序列的当前值(序列不存在时返回 -1)。
+func (e *e2eEnv) metric(t *testing.T, name string, labels map[string]string) float64 {
+	t.Helper()
+	resp, err := e.ts.Client().Get(e.ts.URL + "/metrics")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	raw, _ := io.ReadAll(resp.Body)
+	keys := make([]string, 0, len(labels))
+	for k := range labels {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	var sb strings.Builder
+	for i, k := range keys {
+		if i > 0 {
+			sb.WriteString(",")
+		}
+		fmt.Fprintf(&sb, `%s=%q`, k, labels[k])
+	}
+	prefix := name + "{" + sb.String() + "} "
+	for _, line := range strings.Split(string(raw), "\n") {
+		if strings.HasPrefix(line, prefix) {
+			v, err := strconv.ParseFloat(strings.TrimPrefix(line, prefix), 64)
+			if err != nil {
+				t.Fatalf("bad metric value in %q: %v", line, err)
+			}
+			return v
+		}
+	}
+	return -1
+}
+
+// waitMetric 轮询到指标等于 want,超时则失败。
+func (e *e2eEnv) waitMetric(t *testing.T, name string, labels map[string]string, want float64) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		got := e.metric(t, name, labels)
+		if got == want {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("%s%v=%v, want %v", name, labels, got, want)
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+}
+
+// 写保护必须真的穿透中间件链(chi 的 WrapResponseWriter 由 zapLogger 包上):
+// 客户端读一点点就不再读(TCP 不断),服务端必须在 client_stall_timeout 内放弃这条流,
+// 而不是把上游连接和 128 KB 缓冲永久吊住。relay 的单测用的是裸 writer,绕过了中间件,
+// 测不出「包装器没实现 Unwrap / 中间件换了实现」这类让保护静默失效的回归。
+func TestE2EStreamClientStallThroughMiddleware(t *testing.T) {
+	e := newE2E(t, true)
+	nc := *e.cfgp.Get()
+	nc.Relay.ClientStallTimeout = 200 * time.Millisecond
+	e.cfgp.Set(&nc)
+
+	res := e.resolveFile(t, "fbig")
+	req, _ := http.NewRequest("GET", res["stream_url"].(string), nil)
+	resp, err := e.ts.Client().Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("stream status=%d", resp.StatusCode)
+	}
+	// 只读 1 KB 就停:把「客户端半死不活」压缩成一次可断言的写超时。
+	if _, err := io.ReadFull(resp.Body, make([]byte, 1024)); err != nil {
+		t.Fatalf("first read: %v", err)
+	}
+	e.waitMetric(t, "panrouter_relay_abort_total",
+		map[string]string{"pan": "fake", "reason": "client_stalled"}, 1)
+	// 收尾后 active 必须归零:否则保护只是「换了个地方漏资源」。
+	e.waitMetric(t, "panrouter_relay_streams_active", map[string]string{"pan": "fake"}, 0)
+	if v := e.metric(t, "panrouter_relay_abort_total",
+		map[string]string{"pan": "fake", "reason": "client_gone"}); v != 0 {
+		t.Fatalf("client_gone=%v, want 0 (a stalled client is not a gone client)", v)
 	}
 }
 

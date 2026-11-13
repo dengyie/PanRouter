@@ -6,6 +6,7 @@ import (
 	"github.com/go-chi/chi/v5"
 
 	"github.com/dengyie/panrouter/internal/driver"
+	"github.com/dengyie/panrouter/internal/repo"
 	"github.com/dengyie/panrouter/internal/service"
 )
 
@@ -28,6 +29,23 @@ func (d *Deps) verifySig(w http.ResponseWriter, r *http.Request) (pan, key, fid 
 	return pan, key, fid, true
 }
 
+// linkRoute 由缓存直链派生路径决策所需的约束(meta)与部署画像(env)。
+//
+// 解密失败不能被当成「没有 Cookie」:那会把一条需要 Cookie 的直链 302 给浏览器,
+// 用户只会看到 CDN 的 403 而无从表达;这里直接报错,与 /stream(freshLink)、
+// aria2(download) 的失败语义一致,错误对用户可解释。
+func (d *Deps) linkRoute(link *repo.Link, ua string) (service.LinkMeta, service.RouteEnv, error) {
+	cookie, err := d.AES.DecryptBytes(link.CookieEnc)
+	if err != nil {
+		return service.LinkMeta{}, service.RouteEnv{},
+			driver.NewErr(driver.KindUpstream, "读取直链凭据失败,请重新解析", err)
+	}
+	cfg := d.Cfg.Get()
+	meta := service.LinkMeta{UA: link.UA, Referer: link.Referer, Cookie: string(cookie), BindIP: link.BindIP}
+	env := service.RouteEnv{Profile: cfg.Server.DeployProfile, ClientUA: ua, Aria2SameHost: cfg.Aria2.SameHost}
+	return meta, env, nil
+}
+
 // handleDownload302 GET /d/{pan}/{key}/{fid}:302 直链;Can302 不满足时无感降级到 /stream。
 func (d *Deps) handleDownload302(w http.ResponseWriter, r *http.Request) {
 	pan, key, fid, ok := d.verifySig(w, r)
@@ -40,10 +58,12 @@ func (d *Deps) handleDownload302(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, err)
 		return
 	}
-	cookie, _ := d.AES.DecryptBytes(link.CookieEnc)
+	meta, env, err := d.linkRoute(link, ua)
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
 	cfg := d.Cfg.Get()
-	meta := service.LinkMeta{UA: link.UA, Referer: link.Referer, Cookie: string(cookie), BindIP: link.BindIP}
-	env := service.RouteEnv{Profile: cfg.Server.DeployProfile, ClientUA: ua, Aria2SameHost: cfg.Aria2.SameHost}
 	if !service.Can302(meta, env) {
 		// 浏览器无法满足直链约束 → 降级中转,用户无感
 		sig := d.Signer.Sign(pan+"|"+key+"|"+fid, cfg.Server.EffectiveSignTTL())
@@ -84,10 +104,12 @@ func (d *Deps) handleDirectJSON(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, err)
 		return
 	}
-	cookie, _ := d.AES.DecryptBytes(link.CookieEnc)
+	meta, env, err := d.linkRoute(link, ua)
+	if err != nil {
+		writeErr(w, err)
+		return
+	}
 	cfg := d.Cfg.Get()
-	meta := service.LinkMeta{UA: link.UA, Referer: link.Referer, Cookie: string(cookie), BindIP: link.BindIP}
-	env := service.RouteEnv{Profile: cfg.Server.DeployProfile, ClientUA: ua, Aria2SameHost: cfg.Aria2.SameHost}
 	sig := d.Signer.Sign(pan+"|"+key+"|"+fid, cfg.Server.EffectiveSignTTL())
 	base := cfg.Server.BaseURL
 	writeJSON(w, http.StatusOK, map[string]any{
@@ -102,7 +124,7 @@ func (d *Deps) handleDirectJSON(w http.ResponseWriter, r *http.Request) {
 		"stream_url":   service.EntryURL(base, "stream", pan, key, fid, sig),
 		"ua":           link.UA,
 		"referer":      link.Referer,
-		"need_headers": service.NeedHeaders(link.UA, link.Referer, string(cookie), ua),
+		"need_headers": service.NeedHeaders(meta.UA, meta.Referer, meta.Cookie, ua),
 		"expires_at":   link.ExpiresAt,
 	})
 }

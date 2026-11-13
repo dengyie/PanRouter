@@ -115,7 +115,7 @@ func NewRelay(resolver *Resolver, clients map[string]*httpx.Client, store *repo.
 		met.Help(relayMetricActive, "Relay 当前正在中转的流数(每请求开始时 +1,结束 -1)")
 		met.Help(relayMetricUpstreamWait, "Relay 阻塞等待上游吐字节的累计秒数(按网盘)")
 		met.Help(relayMetricClientWait, "Relay 阻塞等待客户端接收(Write/Flush)的累计秒数(按网盘)")
-		met.Help(relayMetricLinkRefresh, "Relay 中转途中直链失效后重新解析成功的次数(按网盘)")
+		met.Help(relayMetricLinkRefresh, "Relay 中转流因直链失效重解析而恢复的次数(按网盘;并发流各自计数,重解析本身经 singleflight 合并)")
 		// 先把各网盘的 0 值序列建出来:没有序列和「全 0」在监控上不可区分。
 		for pan := range clients {
 			met.Add(relayMetricBytes, map[string]string{"pan": pan}, 0)
@@ -207,7 +207,7 @@ type streamSession struct {
 	limit     int64       // 客户端允许的包含式终点(仅 limited 时有意义)
 	limited   bool
 	resumes   int
-	refreshed bool // 直链失效后是否已重解析过(防死循环)
+	refreshed bool // 本轮「直链过期事件」是否已重解析(防递归;续接成功后由 Serve 复位)
 }
 
 // upstreamConn 是一条上游连接 + 它专用的可取消 ctx + 停流看门狗。
@@ -288,11 +288,15 @@ func (c *upstreamConn) watchStall(timeout time.Duration) {
 	}
 }
 
-// touchReader 只用来统计「这条连接还在吐字节」,供丢弃 Range 前缀时喂看门狗。
+// touchReader 供「主循环之外」的上游体读取使用(丢 Range 前缀、排空 4xx 响应体)。
+//
+// 它必须走 upstreamConn.read 而不是直读 resp.Body:直读时 reading 恒为 false,
+// 看门狗按设计不会判挂死,于是这段阻塞既没有写截止也没有任何出口——上游把响应体
+// 挂住就能永久占住一个 Serve goroutine + 一条上游连接(streams_active 只涨不落)。
 type touchReader struct{ c *upstreamConn }
 
 func (t touchReader) Read(p []byte) (int, error) {
-	n, err := t.c.resp.Body.Read(p)
+	n, err := t.c.read(p)
 	if n > 0 {
 		t.c.touch()
 	}
@@ -319,7 +323,9 @@ func (s *Relay) Serve(ctx context.Context, w http.ResponseWriter, in StreamInput
 	if conn.resp.StatusCode >= 400 {
 		// 直链可能提前失效(风控/过期):尚未写响应头,可安全报错让上层提示重试
 		code := conn.resp.StatusCode
-		_, _ = io.Copy(io.Discard, io.LimitReader(conn.resp.Body, 4096))
+		// 排空也要走 touchReader:响应体同样可能挂在半路,而这里既没有写截止,
+		// 又是在写响应头之前——挂住就没有任何东西能把它推走。
+		_, _ = io.Copy(io.Discard, io.LimitReader(touchReader{conn}, 4096))
 		// 上游明确否决时立即失效本地缓存,否则重新解析仍命中同一死链(缓存优先),
 		// 用户会在 TTL 内 (最长 2h) 反复失败。失效后下次 GetFreshLink 触发真实重解析。
 		if isStaleStatus(code) {
@@ -343,6 +349,17 @@ func (s *Relay) Serve(ctx context.Context, w http.ResponseWriter, in StreamInput
 	// known=false(总长未知 / 多段 / 语法不认识)时既要关掉轮换,也不能钳制写入:
 	// 那种响应就是一个普通字节流,按「无上界」处理才对。
 	limit, limitKnown := rangeEndLimit(rangeHeader, total, conn.resp.StatusCode)
+	// 上游可以对 Range 只回一个更窄的段(Content-Range 终点 < 请求终点,RFC 7233 允许)。
+	// 这时发给客户端的 Content-Length 就是「这一段的长度」,写入终点必须收紧到
+	// 声明的末尾:越过它 net/http 会拒收整块(written > contentLength → ErrContentLength,
+	// 整块丢弃),客户端反而少收尾巴,而且会被误归因为 client_gone。
+	if limitKnown && hasCR && conn.resp.StatusCode == http.StatusPartialContent {
+		if cl, perr := strconv.ParseInt(conn.resp.Header.Get("Content-Length"), 10, 64); perr == nil && cl > 0 {
+			if end := start + cl - 1; end < limit {
+				limit = end
+			}
+		}
+	}
 	// 只有「知道总长度 + 上游支持 Range」时才轮换/续传;否则保持旧行为(单连接跑到底),
 	// 避免为了一次性小响应(如 lanzou 的 HTML 挑战页)白折腾。
 	// rotateBytes<=0 视为关闭轮换(配置负值或单测/排障用)。
@@ -366,14 +383,15 @@ func (s *Relay) Serve(ctx context.Context, w http.ResponseWriter, in StreamInput
 
 	ss := &streamSession{in: in, link: link, orig: conn.resp.Header, pos: start, limit: limit, limited: limitKnown}
 
-	flusher, _ := w.(http.Flusher)
 	// 客户端写软截止:每次 Write/Flush 前重设。http.Server 特意没设 WriteTimeout
 	// (流式代理给整体写设硬超时会把慢速大文件下载掐断),于是「客户端半死不活」
 	// 这条路径没人兜——Write 阻塞期间上游连接和缓冲一直被占着,还占着连接池。
+	//
+	// ResponseController 还顺带解决 Flush 的错误可见性:http.Flusher.Flush() 不返回
+	// error,写失败会被吞掉,只能等下一次 Write 才暴露——而「最后一块」往往没有下一次。
 	clientStall := s.clientStallLimit()
-	var rc *http.ResponseController
+	rc := http.NewResponseController(w)
 	if clientStall > 0 {
-		rc = http.NewResponseController(w)
 		// keep-alive 的坑:server 的 WriteTimeout=0 不会在下一个请求开始时重置写
 		// 截止,本请求留下的值会延续到这条连接上后续的请求——空闲一会儿再来的
 		// 请求一写就超时。所以离开前必须清掉(ErrNotSupported 的响应器忽略即可)。
@@ -383,18 +401,30 @@ func (s *Relay) Serve(ctx context.Context, w http.ResponseWriter, in StreamInput
 	buf := make([]byte, relayBufSize)
 	connBytes := int64(0) // 当前这条上游连接已搬运的字节
 	pending := int64(0)   // 尚未 Flush 的字节
-
-	// flush 沿用「攒够再刷」语义,只是把写截止一并前移:Flush 同样会阻塞在 socket,
-	// 而它不返回 error,所以只能靠截止时间让后续 Write 报出错误。
-	flush := func() {
-		if flusher == nil || pending == 0 {
-			return
-		}
+	// arming 每次写/刷前重设截止:上一次的截止可能早已过期(上游读了几分钟),
+	// 不重设会让一次正常写立刻报超时。
+	arming := func() {
 		if clientStall > 0 {
 			_ = rc.SetWriteDeadline(time.Now().Add(clientStall))
 		}
-		flusher.Flush()
+	}
+
+	// flush 沿用「攒够再刷」语义,并把写截止一并前移。返回的错误来自 Flush 本身
+	// (ResponseController.Flush 会交出 FlushError),调用方据此归因;响应器不支持
+	// Flush 时 net/http 侧返回 ErrNotSupported,等同于「无需刷」。
+	flush := func() error {
+		if pending == 0 {
+			return nil
+		}
+		arming()
+		ft0 := time.Now()
+		err := rc.Flush()
+		s.addWait(relayMetricClientWait, panLabels, time.Since(ft0))
 		pending = 0
+		if err != nil && !errors.Is(err, http.ErrNotSupported) {
+			return err
+		}
+		return nil
 	}
 
 	for {
@@ -417,11 +447,7 @@ func (s *Relay) Serve(ctx context.Context, w http.ResponseWriter, in StreamInput
 				}
 			}
 			if n > 0 {
-				if clientStall > 0 {
-					// 每次写都重设:上一次的截止可能早已过期(上游读了几分钟),
-					// 不重设会让一次正常写立刻报超时。
-					_ = rc.SetWriteDeadline(time.Now().Add(clientStall))
-				}
+				arming()
 				wt0 := time.Now()
 				_, werr := w.Write(buf[:n])
 				s.addWait(relayMetricClientWait, panLabels, time.Since(wt0))
@@ -429,15 +455,8 @@ func (s *Relay) Serve(ctx context.Context, w http.ResponseWriter, in StreamInput
 					// 写到期 = 客户端既不收也不关(暂停下载/进程被杀但 TCP 未 RST)。
 					// 放弃这条流,否则上游连接被永远吊住;与「主动断开」分开归因,
 					// 否则运维会以为用户都正常走了。
-					if clientStall > 0 && (errors.Is(werr, os.ErrDeadlineExceeded) ||
-						errors.Is(werr, context.DeadlineExceeded)) {
-						s.countAbort(in, relayAbortClientStalled)
-						s.log.Warnf("relay client stalled: share=%s fid=%s pos=%d timeout=%v err=%v",
-							in.ShareKey, in.FID, ss.pos, clientStall, werr)
-						return nil
-					}
-					s.countAbort(in, relayAbortClientGone)
-					return nil // 客户端断开,属正常取消
+					s.countClientAbort(in, ss.pos, "write", werr, clientStall)
+					return nil
 				}
 				if s.met != nil {
 					s.met.Add(relayMetricBytes, panLabels, float64(n))
@@ -446,17 +465,24 @@ func (s *Relay) Serve(ctx context.Context, w http.ResponseWriter, in StreamInput
 				connBytes += int64(n)
 				pending += int64(n)
 				if pending >= relayFlushBytes {
-					flush()
+					if ferr := flush(); ferr != nil {
+						s.countClientAbort(in, ss.pos, "flush", ferr, clientStall)
+						return nil
+					}
 				}
 			}
 			if ss.limited && ss.pos > ss.limit {
-				flush()
+				if ferr := flush(); ferr != nil {
+					s.countClientAbort(in, ss.pos, "flush", ferr, clientStall)
+				}
 				return nil // 客户端要的范围已送满,不必再读上游
 			}
 		}
 		if rerr != nil {
 			if rerr == io.EOF {
-				flush()
+				if ferr := flush(); ferr != nil {
+					s.countClientAbort(in, ss.pos, "flush", ferr, clientStall)
+				}
 				return nil
 			}
 			// 客户端断开:父 ctx 先被取消,上游 Read 随之返回 context canceled。
@@ -474,6 +500,7 @@ func (s *Relay) Serve(ctx context.Context, w http.ResponseWriter, in StreamInput
 					conn = next
 					connBytes = 0
 					ss.resumes++
+					ss.refreshed = false // 这次续上了:往后每「一次过期事件」仍允许刷新一次
 					if fellBack {
 						canRotate = false // 上游忽略 Range:续用这条连接跑到底,不再轮换
 					}
@@ -505,6 +532,7 @@ func (s *Relay) Serve(ctx context.Context, w http.ResponseWriter, in StreamInput
 			conn.close()
 			conn = next
 			connBytes = 0
+			ss.refreshed = false // 轮换成功即视为「过期事件」结束,下一次过期还能再刷新
 			if fellBack {
 				// 上游忽略 Range 却声明了 Accept-Ranges:再轮换就会把 pos 字节反复重下
 				// (256 MB 起跳的带宽放大),所以这条连接直接跑到底。
@@ -543,12 +571,12 @@ func (s *Relay) rotate(ctx context.Context, ss *streamSession) (*upstreamConn, b
 		return nil, false, fmt.Errorf("content-range start mismatch, want %d", ss.pos)
 	case conn.resp.StatusCode == http.StatusOK:
 		// 上游忽略 Range:丢掉已有的 pos 字节继续用(用带宽换正确性)。
-		// 丢前缀时也要喂看门狗,否则 pos 很大时(256 MB 起)会被判成挂死。
+		// 丢前缀同样要经 touchReader 喂看门狗:pos 很大时(256 MB 起)这段读取
+		// 本身就可能挂住,逃过看门狗就等于把客户端钉在这里。
 		if _, err := io.CopyN(io.Discard, touchReader{conn}, ss.pos); err != nil {
 			conn.close()
 			return nil, false, fmt.Errorf("discard %d bytes: %w", ss.pos, err)
 		}
-		conn.touch()
 		s.log.Warnf("relay upstream ignored range: share=%s fid=%s pos=%d", in.ShareKey, in.FID, ss.pos)
 		return conn, true, nil
 	}
@@ -556,7 +584,11 @@ func (s *Relay) rotate(ctx context.Context, ss *streamSession) (*upstreamConn, b
 	code := conn.resp.StatusCode
 	conn.close()
 	if isStaleStatus(code) && !ss.refreshed {
-		ss.refreshed = true // 只重解析一次:再失效就说明直链/账号真有问题,别死循环
+		// 一次过期事件只刷新一次:刷新后的重试仍 stale 就说明直链/账号真有问题,
+		// 立刻收尾(而非「刷新→失败→再刷新」递归)。递归深度因此恒为 1。
+		// 这是「每次事件」而不是「每条流」——下载跨两轮过期是常态,不能一次用完
+		// 整个流生命周期再也刷新不了;事件结束由 Serve 在续接成功后复位。
+		ss.refreshed = true
 		s.expireLink(in)
 		nl, ferr := s.freshLink(ctx, in)
 		if ferr != nil {
@@ -708,6 +740,19 @@ func (s *Relay) countAbort(in StreamInput, reason string) {
 	if s.met != nil {
 		s.met.Inc(relayMetricAbort, map[string]string{"pan": in.Pan, "reason": reason})
 	}
+}
+
+// countClientAbort 把一次「写给客户端失败」按原因归因:写截止到期 = 客户端既不读
+// 也不关(暂停下载/进程被杀但 TCP 未 RST);其余 = 客户端主动断开。两者都不该计成
+// 上游问题——否则慢用户会伪装成网盘故障,告警和排障一起失真。
+func (s *Relay) countClientAbort(in StreamInput, pos int64, stage string, err error, clientStall time.Duration) {
+	if clientStall > 0 && (errors.Is(err, os.ErrDeadlineExceeded) || errors.Is(err, context.DeadlineExceeded)) {
+		s.countAbort(in, relayAbortClientStalled)
+		s.log.Warnf("relay client stalled on %s: share=%s fid=%s pos=%d timeout=%v err=%v",
+			stage, in.ShareKey, in.FID, pos, clientStall, err)
+		return
+	}
+	s.countAbort(in, relayAbortClientGone)
 }
 
 // addWait 累加一次阻塞等待的秒数(标签按网盘复用,避免每块都新建 map)。

@@ -2,10 +2,12 @@ package httpx
 
 import (
 	"context"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -176,5 +178,64 @@ func TestRedirectInjectsCachedACWCookie(t *testing.T) {
 	resp2.Body.Close()
 	if string(body2) != filePayload {
 		t.Fatalf("second body=%q", body2)
+	}
+}
+
+// blockingBody 模拟「4xx 响应体挂在半路」:Read 阻塞到 Close。
+type blockingBody struct {
+	mu     sync.Mutex
+	prefix []byte
+	closed bool
+	done   chan struct{}
+	once   sync.Once
+}
+
+func (b *blockingBody) Read(p []byte) (int, error) {
+	b.mu.Lock()
+	if len(b.prefix) > 0 {
+		n := copy(p, b.prefix)
+		b.prefix = b.prefix[n:]
+		b.mu.Unlock()
+		return n, nil
+	}
+	b.mu.Unlock()
+	<-b.done // Close 之前永远等不到
+	return 0, errors.New("body closed")
+}
+
+func (b *blockingBody) Close() error {
+	b.once.Do(func() { close(b.done) })
+	return nil
+}
+
+// 挑战页窥探必须自己兜住「响应体挂住」:中转 client 是 NoBodyTimeout=true,
+// 这里的读发生在任何超时机制接管之前,不设界就是一次永久阻塞(连 *http.Response
+// 都还没交到调用方,停流看门狗无从介入)。
+func TestInspectChallengeProbeIsBounded(t *testing.T) {
+	body := &blockingBody{prefix: []byte("denied-but-not-a-challenge"), done: make(chan struct{})}
+	resp := &http.Response{
+		StatusCode:    http.StatusForbidden,
+		Header:        http.Header{"Content-Type": []string{"text/html"}},
+		Body:          body,
+		ContentLength: -1,
+	}
+
+	start := time.Now()
+	peek, challenge, err := inspectChallenge(resp, 50*time.Millisecond)
+	if err != nil {
+		t.Fatalf("probe timeout must not fail the request: %v", err)
+	}
+	if challenge {
+		t.Fatal("a stalled body is not an acw challenge")
+	}
+	if elapsed := time.Since(start); elapsed > 2*time.Second {
+		t.Fatalf("probe blocked for %v, want bounded by the probe budget", elapsed)
+	}
+	// 已窥探到的字节必须交回调用方(原 Body 已不可用,替换后的 Body 交出已读部分),
+	// 不能因为窥探超时把数据丢掉。
+	rest, _ := io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
+	if string(rest) != string(peek) || string(peek) != "denied-but-not-a-challenge" {
+		t.Fatalf("peeked bytes lost: peek=%q rest=%q", peek, rest)
 	}
 }

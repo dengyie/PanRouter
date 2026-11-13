@@ -63,11 +63,6 @@ func newRelayFixture(t *testing.T, upstreamURL string) (*Relay, string) {
 	return relay, key
 }
 
-// newRelayFixtureWithDriver 额外把 fakeDriver 交出去,供中途改写直链的用例使用。
-func newRelayFixtureWithDriver(t *testing.T, upstreamURL string) (*Relay, string, *fakeDriver) {
-	return newRelayFixtureLink(t, upstreamURL+"/file")
-}
-
 // newRelayFixtureLink 直链由调用方给全(可带 token),用于模拟「直链过期后重新解析」。
 func newRelayFixtureLink(t *testing.T, linkURL string) (*Relay, string, *fakeDriver) {
 	t.Helper()
@@ -887,6 +882,240 @@ func TestRelayRefreshesExpiredLinkOnlyOnce(t *testing.T) {
 	}
 }
 
+// 上游返回 4xx 后响应体挂住不结束:排空 4xx 体的那次读同样必须受看门狗保护。
+// 旧实现直读 resp.Body,reading 恒为 false → 看门狗按设计不判挂死,于是这条 Serve
+// goroutine、上游连接和 128 KB 缓冲被永久占住(streams_active 只涨不落)。
+func TestRelayStalledBodyDrainDoesNotHang(t *testing.T) {
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// octet-stream 让 httpx 跳过挑战页窥探,把这段体原样交到中转手上;
+		// 体只吐几个字节就停:排空(上限 4 KB)读不到 EOF,必然阻塞在这里。
+		w.Header().Set("Content-Type", "application/octet-stream")
+		w.WriteHeader(http.StatusForbidden)
+		_, _ = w.Write([]byte("denied"))
+		w.(http.Flusher).Flush()
+		// 响应体不结束:等中转取消这条连接(黑洞/半开连接的典型表现)
+		<-r.Context().Done()
+	}))
+	defer up.Close()
+
+	relay, key := newRelayFixture(t, up.URL)
+	relay.stallTimeout = 100 * time.Millisecond
+
+	done := make(chan error, 1)
+	go func() {
+		done <- relay.Serve(context.Background(), httptest.NewRecorder(),
+			StreamInput{Pan: "fake", ShareKey: key, FID: "f1"}, "")
+	}()
+	select {
+	case err := <-done:
+		if err == nil || !strings.Contains(err.Error(), "403") {
+			t.Fatalf("want the upstream 403 surfaced, got %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("Serve hung draining a stalled 4xx body (watchdog blind spot)")
+	}
+	if v := metricValue(t, relay, "panrouter_relay_stall_total", map[string]string{"pan": "fake"}); v < 1 {
+		t.Fatalf("stall_total=%v, want >=1 (watchdog must cover the drain)", v)
+	}
+}
+
+// 上游声明 Accept-Ranges 却回 200 时,轮换回退要丢弃 pos 字节;这段丢弃同样可能
+// 挂在半路(第二条连接吐得比 pos 少就停住)。它必须经看门狗保护的读完成,否则
+// 客户端会钉死在「重连后丢前缀」这一步,既没有字节也没有结局。
+func TestRelayStalledPrefixDiscardDoesNotHang(t *testing.T) {
+	payload := bytes.Repeat([]byte("p"), 2<<20)
+	const firstChunk = 128 << 10
+	var mu sync.Mutex
+	reqs := 0
+
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		reqs++
+		n := reqs
+		mu.Unlock()
+
+		// 一律回 200:续传必然走「丢弃 pos 前缀」的回退分支
+		w.Header().Set("Accept-Ranges", "bytes")
+		w.Header().Set("Content-Length", strconv.Itoa(len(payload)))
+		chunk := firstChunk
+		if n > 1 {
+			chunk = 64 << 10 // 比 pos 少:丢弃到一半就挂住
+		}
+		_, _ = w.Write(payload[:chunk])
+		w.(http.Flusher).Flush()
+		select {
+		case <-r.Context().Done():
+		case <-time.After(5 * time.Second):
+			t.Error("relay never canceled the stalled connection")
+		}
+	}))
+	defer up.Close()
+
+	relay, key := newRelayFixture(t, up.URL)
+	relay.stallTimeout = 100 * time.Millisecond
+	withRotateBytes(t, relay, 64<<10)
+
+	done := make(chan error, 1)
+	go func() {
+		done <- relay.Serve(context.Background(), httptest.NewRecorder(),
+			StreamInput{Pan: "fake", ShareKey: key, FID: "f1"}, "")
+	}()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("relay: %v", err)
+		}
+	case <-time.After(4 * time.Second):
+		t.Fatal("Serve hung discarding the range prefix (watchdog blind spot)")
+	}
+}
+
+// 上游对 Range 只回一个更窄的段(RFC 7233 允许)时,写入终点必须收紧到已经发给
+// 客户端的 Content-Length。越过它 net/http 会整块拒收(written > contentLength →
+// ErrContentLength,整块丢弃),客户端反而少收尾巴,还被误归因为 client_gone。
+func TestRelayNeverWritesPastDeclaredContentLength(t *testing.T) {
+	payload := bytes.Repeat([]byte("b"), 200<<10)
+	const seg = 100 << 10 // 上游无论请求多大,每次最多给 100 KB
+
+	var mu sync.Mutex
+	var ranges []string
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		ranges = append(ranges, r.Header.Get("Range"))
+		mu.Unlock()
+
+		start := 0
+		if rh := r.Header.Get("Range"); rh != "" {
+			if s, _, ok := parseTestRange(rh, len(payload)); ok {
+				start = s
+			}
+		}
+		end := start + seg - 1
+		if end > len(payload)-1 {
+			end = len(payload) - 1
+		}
+		w.Header().Set("Accept-Ranges", "bytes")
+		w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, len(payload)))
+		w.Header().Set("Content-Length", strconv.Itoa(end-start+1))
+		w.WriteHeader(http.StatusPartialContent)
+		_, _ = w.Write(payload[start : end+1])
+	}))
+	defer up.Close()
+
+	relay, key := newRelayFixture(t, up.URL)
+	withRotateBytes(t, relay, 32<<10)
+
+	rec := httptest.NewRecorder()
+	if err := relay.Serve(context.Background(), rec,
+		StreamInput{Pan: "fake", ShareKey: key, FID: "f1"}, "bytes=0-"); err != nil {
+		t.Fatalf("relay: %v", err)
+	}
+	// 已声明的长度是 100 KB:一个字节都不能多。
+	if rec.Body.Len() != seg {
+		t.Fatalf("wrote %d bytes, declared Content-Length is %d", rec.Body.Len(), seg)
+	}
+	// 轮换的 Range 终点必须是 99999,而不是客户端请求的文件尾 204799。
+	for i, rh := range ranges[1:] {
+		if _, e, ok := parseTestRange(rh, len(payload)); !ok || e != seg-1 {
+			t.Fatalf("rotation #%d Range=%q must end at the declared end %d (all=%v)",
+				i+1, rh, seg-1, ranges)
+		}
+	}
+}
+
+// 长下载跨两轮直链过期:第一次刷新拿到的新直链同样有自己的 TTL。刷新开关必须
+// 按「过期事件」而不是「整条流」复位,否则第二次过期必然 rotate_failed 截断——
+// 明明能自愈却自己关掉了能力。
+func TestRelayRefreshesExpiredLinkTwiceInOneStream(t *testing.T) {
+	payload := bytes.Repeat([]byte("T"), 512<<10)
+	const secondExpiryAt = 300 << 10
+
+	var mu sync.Mutex
+	current := "tok1"
+	forbidden := 0
+	var fd *fakeDriver
+	var up *httptest.Server
+
+	expireTo := func(next string) { // 调用方持 mu
+		current = next
+		fd.setLink(up.URL + "/file?k=" + next)
+	}
+
+	up = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		rh := r.Header.Get("Range")
+		mu.Lock()
+		tok := r.URL.Query().Get("k")
+		// 过期按「搬到哪个位置」触发,与连接时序无关,用例因此是确定性的。
+		if rh != "" && tok == current {
+			if s, _, ok := parseTestRange(rh, len(payload)); ok {
+				switch {
+				case tok == "tok1" && s >= 64<<10:
+					expireTo("tok2")
+					forbidden++
+					mu.Unlock()
+					w.WriteHeader(http.StatusForbidden)
+					return
+				case tok == "tok2" && s >= secondExpiryAt:
+					expireTo("tok3")
+					forbidden++
+					mu.Unlock()
+					w.WriteHeader(http.StatusForbidden)
+					return
+				}
+			}
+		}
+		ok := tok == current
+		if !ok {
+			forbidden++
+		}
+		mu.Unlock()
+		if !ok {
+			w.WriteHeader(http.StatusForbidden)
+			return
+		}
+		w.Header().Set("ETag", `"v1"`)
+		w.Header().Set("Accept-Ranges", "bytes")
+		start, end := 0, len(payload)-1
+		if rh != "" {
+			s, e, rok := parseTestRange(rh, len(payload))
+			if !rok {
+				w.WriteHeader(http.StatusRequestedRangeNotSatisfiable)
+				return
+			}
+			start, end = s, e
+			w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, len(payload)))
+			w.WriteHeader(http.StatusPartialContent)
+		}
+		w.Header().Set("Content-Length", strconv.Itoa(end-start+1))
+		_, _ = w.Write(payload[start : end+1])
+	}))
+	defer up.Close()
+
+	relay, key, drv := newRelayFixtureLink(t, up.URL+"/file?k=tok1")
+	fd = drv
+	withRotateBytes(t, relay, 32<<10)
+
+	rec := httptest.NewRecorder()
+	if err := relay.Serve(context.Background(), rec, StreamInput{Pan: "fake", ShareKey: key, FID: "f1"}, ""); err != nil {
+		t.Fatalf("relay: %v", err)
+	}
+	if !bytes.Equal(rec.Body.Bytes(), payload) {
+		t.Fatalf("body incomplete after two link expiries: got %d bytes, want %d", rec.Body.Len(), len(payload))
+	}
+	mu.Lock()
+	n := forbidden
+	mu.Unlock()
+	if n != 2 {
+		t.Fatalf("each expiry must be rejected exactly once, got %d 403s", n)
+	}
+	if v := metricValue(t, relay, "panrouter_relay_link_refresh_total", map[string]string{"pan": "fake"}); v != 2 {
+		t.Fatalf("link_refresh_total=%v, want 2 (one refresh per expiry event)", v)
+	}
+	if v := metricValue(t, relay, "panrouter_relay_abort_total", map[string]string{"pan": "fake", "reason": "rotate_failed"}); v != 0 {
+		t.Fatalf("rotate_failed=%v, want 0", v)
+	}
+}
+
 // blockingWriter 模拟「客户端读得很慢」:Write 阻塞到 release 关闭。
 type blockingWriter struct {
 	rec     *httptest.ResponseRecorder
@@ -1083,6 +1312,68 @@ func TestRelayClientStallAbortedAndAttributed(t *testing.T) {
 	// 这段等待时间属于客户端侧(读不过来),必须记在 client_wait 名下。
 	if v := metricValue(t, relay, "panrouter_relay_client_wait_seconds_total", map[string]string{"pan": "fake"}); v < 0.1 {
 		t.Fatalf("client_wait_seconds_total=%v, want >=0.1", v)
+	}
+}
+
+// flushFailWriter:Write 正常,Flush 阻塞到写截止后失败——模拟「客户端在最后一次
+// Flush 时既不收也不关」。旧实现用 http.Flusher(Flush 无返回值),这条错误被吞掉,
+// 流会被记成正常完成,监控上成功率 100% 而用户报下载失败。
+type flushFailWriter struct {
+	rec      *httptest.ResponseRecorder
+	mu       sync.Mutex
+	deadline time.Time
+}
+
+func (f *flushFailWriter) Header() http.Header  { return f.rec.Header() }
+func (f *flushFailWriter) WriteHeader(code int) { f.rec.WriteHeader(code) }
+func (f *flushFailWriter) Write(p []byte) (int, error) {
+	return f.rec.Write(p)
+}
+func (f *flushFailWriter) SetWriteDeadline(t time.Time) error {
+	f.mu.Lock()
+	f.deadline = t
+	f.mu.Unlock()
+	return nil
+}
+func (f *flushFailWriter) Flush() { _ = f.FlushError() }
+func (f *flushFailWriter) FlushError() error {
+	f.mu.Lock()
+	dl := f.deadline
+	f.mu.Unlock()
+	if dl.IsZero() {
+		return errors.New("flush with no deadline set")
+	}
+	if w := time.Until(dl); w > 0 {
+		time.Sleep(w)
+	}
+	return os.ErrDeadlineExceeded
+}
+
+// 最后一次 Flush 的写超时必须归因成 client_stalled 并计入 client_wait:
+// 这条流既不是「正常读完」也不是「客户端主动断开」。
+func TestRelayFlushStallAttributedAsClientStalled(t *testing.T) {
+	payload := bytes.Repeat([]byte("f"), 64<<10) // < relayFlushBytes:只在收尾处刷一次
+	up := newFakeUpstream(t, payload, true)
+
+	relay, key := newRelayFixture(t, up.URL())
+	relay.clientStallTimeout = 150 * time.Millisecond
+
+	fw := &flushFailWriter{rec: httptest.NewRecorder()}
+	start := time.Now()
+	if err := relay.Serve(context.Background(), fw, StreamInput{Pan: "fake", ShareKey: key, FID: "f1"}, ""); err != nil {
+		t.Fatalf("relay: %v", err)
+	}
+	if elapsed := time.Since(start); elapsed < 100*time.Millisecond {
+		t.Fatalf("flush must block until the write deadline before failing, elapsed=%v", elapsed)
+	}
+	if v := metricValue(t, relay, "panrouter_relay_abort_total", map[string]string{"pan": "fake", "reason": "client_stalled"}); v != 1 {
+		t.Fatalf("client_stalled=%v, want 1 (flush timeout must be attributed)", v)
+	}
+	if v := metricValue(t, relay, "panrouter_relay_abort_total", map[string]string{"pan": "fake", "reason": "client_gone"}); v != 0 {
+		t.Fatalf("client_gone=%v, want 0", v)
+	}
+	if v := metricValue(t, relay, "panrouter_relay_client_wait_seconds_total", map[string]string{"pan": "fake"}); v < 0.1 {
+		t.Fatalf("client_wait_seconds_total=%v, want >=0.1 (flush wait must be counted)", v)
 	}
 }
 

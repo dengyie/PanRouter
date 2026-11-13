@@ -221,7 +221,7 @@ func (c *Client) doWithACW(req *http.Request, hc *http.Client) (*http.Response, 
 		if err != nil {
 			return nil, err
 		}
-		page, challenge, err := inspectChallenge(resp)
+		page, challenge, err := inspectChallenge(resp, challengeProbe)
 		if err != nil {
 			return nil, err
 		}
