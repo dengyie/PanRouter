@@ -8,6 +8,7 @@ import (
 	"regexp"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -128,28 +129,36 @@ func isACWChallenge(status int, body []byte) bool {
 	return status == http.StatusPreconditionFailed
 }
 
-func skipChallengeInspect(resp *http.Response) bool {
-	if resp.StatusCode == http.StatusPartialContent {
+// shouldProbeChallenge 判断响应是否值得窥探。
+//
+// 挑战页只有几 KB 的 HTML。对二进制/未知长度的流做窥探没有收益,代价却真实存在:
+// 首块交付要等满 64 KB 或读完;而首 64 KB 慢于 probe 时(冷 CDN、网盘限速、半挂)
+// 会把一条合法慢流判死。所以反过来只窥探「可能承载挑战页」的响应:
+//   - 412:阿里云 WAF 挑战的常见状态码,无条件窥探(哪怕 CT 异常);
+//   - 无 Content-Type(部分 CDN 不带)或文本类(挑战页一定是 HTML/JS)。
+//
+// 206 是 Range 命中、3xx 由 CheckRedirect 内部消化,都不可能是挑战页。
+func shouldProbeChallenge(resp *http.Response) bool {
+	if resp.StatusCode == http.StatusPartialContent || (resp.StatusCode >= 300 && resp.StatusCode < 400) {
+		return false
+	}
+	if resp.StatusCode == http.StatusPreconditionFailed {
 		return true
 	}
-	if resp.StatusCode >= 300 && resp.StatusCode < 400 {
-		return true
-	}
-	if resp.StatusCode == http.StatusOK && resp.ContentLength > maxChallengePeek {
-		return true
+	if resp.ContentLength > maxChallengePeek {
+		return false
 	}
 	ct := resp.Header.Get("Content-Type")
 	if i := strings.IndexByte(ct, ';'); i >= 0 {
 		ct = ct[:i]
 	}
 	ct = strings.ToLower(strings.TrimSpace(ct))
-	switch {
-	case strings.HasPrefix(ct, "video/"), strings.HasPrefix(ct, "audio/"), strings.HasPrefix(ct, "image/"):
-		return true
-	case ct == "application/octet-stream", ct == "application/zip", ct == "application/pdf":
+	switch ct {
+	case "", "text/html", "application/xhtml+xml", "text/plain",
+		"text/javascript", "application/javascript", "application/json":
 		return true
 	}
-	return false
+	return strings.HasPrefix(ct, "text/")
 }
 
 type readCloser struct {
@@ -159,29 +168,47 @@ type readCloser struct {
 
 // inspectChallenge 窥探响应是否为 acw 挑战页。
 // 非挑战:把已读字节塞回 Body;挑战:耗尽并关闭 Body,返回页内容。
+//
+// 窥探失败必须返回错误,不能把已读前缀伪装成完整响应:relay 会把「Body 读到 EOF」
+// 当正常收尾,chunked 下客户端于是拿到一个「HTTP 完整」的截断文件且无任何错误。
 func inspectChallenge(resp *http.Response, probe time.Duration) (page []byte, challenge bool, err error) {
-	if skipChallengeInspect(resp) {
+	if !shouldProbeChallenge(resp) {
 		return nil, false, nil
 	}
-	// 窥探必须有界:这里读的是「还没交到调用方手上」的响应体,任何一方的超时机制
-	// 都还不生效(见 challengeProbe)。
+	// 闭包只捕获局部变量:若捕获 resp.Body 字段,会与下面替换 resp.Body 形成数据竞争
+	// (Stop 不等待定时器函数结束)。
+	body := resp.Body
+	var timedOut atomic.Bool
 	stop := time.AfterFunc(probe, func() {
-		_ = resp.Body.Close() // 打断阻塞中的 Read;Close 之后的 Read 立即返回错误
+		timedOut.Store(true)
+		_ = body.Close() // 打断阻塞中的 Read;Close 之后的 Read 立即返回错误
 	})
-	peek, err := io.ReadAll(io.LimitReader(resp.Body, maxChallengePeek))
-	stop.Stop()
-	if err != nil {
-		// 窥探超时/被打断时已读的字节同样要交回调用方:这不是挑战页,而是一个
-		// 慢热或挂住的响应体,该由调用方自己的超时/看门狗决定怎么收尾。
-		resp.Body = io.NopCloser(bytes.NewReader(peek))
-		return peek, false, nil
+	peek, rerr := io.ReadAll(io.LimitReader(body, maxChallengePeek))
+	stopped := stop.Stop()
+	if rerr != nil {
+		// 窥探被超时打断(或读体本身出错):响应体已不可继续读。此时尚未下发响应头,
+		// 干净的失败好过一条静默截断的流。
+		if timedOut.Load() {
+			return peek, false, fmt.Errorf("challenge probe timed out after %v: %w", probe, rerr)
+		}
+		return peek, false, fmt.Errorf("challenge probe read: %w", rerr)
+	}
+	if !stopped {
+		// 竞态窗口:ReadAll 成功返回的同时定时器已开跑并关掉了 Body。ReadAll 返回 nil
+		// 且未达上限 ⇒ 已读到 EOF,peek 就是完整体,可以安全交回;达到上限则无法确认
+		// 尾部,按超时失败处理(返回一条读不动的半截流更糟)。
+		if len(peek) < maxChallengePeek {
+			resp.Body = io.NopCloser(bytes.NewReader(peek))
+			return peek, false, nil
+		}
+		return peek, false, fmt.Errorf("challenge probe timed out after %v", probe)
 	}
 	if !isACWChallenge(resp.StatusCode, peek) {
-		resp.Body = &readCloser{Reader: io.MultiReader(bytes.NewReader(peek), resp.Body), Closer: resp.Body}
+		resp.Body = &readCloser{Reader: io.MultiReader(bytes.NewReader(peek), body), Closer: body}
 		return peek, false, nil
 	}
-	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 1<<20))
-	resp.Body.Close()
+	_, _ = io.Copy(io.Discard, io.LimitReader(body, 1<<20))
+	_ = body.Close()
 	return peek, true, nil
 }
 

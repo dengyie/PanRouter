@@ -288,6 +288,29 @@ func (c *upstreamConn) watchStall(timeout time.Duration) {
 	}
 }
 
+// flushErr 把 Flush 的错误暴露出来(标准库的 ResponseController.Flush 在遇到
+// 只实现 Flusher 的包装器时会提前返回 nil,永远走不到内层的 FlushError)。
+// 顺序:FlushError → Unwrap → Flusher;都没有时视为「无需刷」。
+func flushErr(w http.ResponseWriter) error {
+	for {
+		switch t := w.(type) {
+		case interface{ FlushError() error }:
+			err := t.FlushError()
+			if errors.Is(err, http.ErrNotSupported) {
+				return nil
+			}
+			return err
+		case interface{ Unwrap() http.ResponseWriter }:
+			w = t.Unwrap()
+		case http.Flusher:
+			t.Flush()
+			return nil
+		default:
+			return nil
+		}
+	}
+}
+
 // touchReader 供「主循环之外」的上游体读取使用(丢 Range 前缀、排空 4xx 响应体)。
 //
 // 它必须走 upstreamConn.read 而不是直读 resp.Body:直读时 reading 恒为 false,
@@ -387,8 +410,11 @@ func (s *Relay) Serve(ctx context.Context, w http.ResponseWriter, in StreamInput
 	// (流式代理给整体写设硬超时会把慢速大文件下载掐断),于是「客户端半死不活」
 	// 这条路径没人兜——Write 阻塞期间上游连接和缓冲一直被占着,还占着连接池。
 	//
-	// ResponseController 还顺带解决 Flush 的错误可见性:http.Flusher.Flush() 不返回
-	// error,写失败会被吞掉,只能等下一次 Write 才暴露——而「最后一块」往往没有下一次。
+	// Flush 的错误可见性不能交给 http.ResponseController:它的判定顺序是
+	// FlushError → Flusher → Unwrap,而生产中间件链上 chi 的 WrapResponseWriter
+	// 只实现 Flusher(无 FlushError),于是永远停在 Flusher 分支并返回 nil,底层
+	// *http.response 的 FlushError 根本看不到——而那正是「最后一块写失败」的唯一
+	// 可观测点。这里用自写的 flushErr:优先向下 unwrap 找 FlushError。
 	clientStall := s.clientStallLimit()
 	rc := http.NewResponseController(w)
 	if clientStall > 0 {
@@ -409,22 +435,18 @@ func (s *Relay) Serve(ctx context.Context, w http.ResponseWriter, in StreamInput
 		}
 	}
 
-	// flush 沿用「攒够再刷」语义,并把写截止一并前移。返回的错误来自 Flush 本身
-	// (ResponseController.Flush 会交出 FlushError),调用方据此归因;响应器不支持
-	// Flush 时 net/http 侧返回 ErrNotSupported,等同于「无需刷」。
+	// flush 沿用「攒够再刷」语义,并把写截止一并前移。错误来自 flushErr(已剥掉
+	// ErrNotSupported),调用方据此归因。
 	flush := func() error {
 		if pending == 0 {
 			return nil
 		}
 		arming()
 		ft0 := time.Now()
-		err := rc.Flush()
+		err := flushErr(w)
 		s.addWait(relayMetricClientWait, panLabels, time.Since(ft0))
 		pending = 0
-		if err != nil && !errors.Is(err, http.ErrNotSupported) {
-			return err
-		}
-		return nil
+		return err
 	}
 
 	for {
@@ -513,11 +535,23 @@ func (s *Relay) Serve(ctx context.Context, w http.ResponseWriter, in StreamInput
 				}
 				s.log.Warnf("relay resume failed: share=%s fid=%s pos=%d err=%v",
 					in.ShareKey, in.FID, ss.pos, rerr2)
+				// rotate 内部的请求共用同一个 ctx:客户端在重连窗口里断开时它会返回
+				// context.Canceled。这里必须补一次归因,否则「用户关页面」会被记成
+				// 「上游塌了」——正是上面那段注释要避免的混淆。
+				if ctx.Err() != nil || errors.Is(rerr2, context.Canceled) {
+					s.countAbort(in, relayAbortClientGone)
+					return nil
+				}
 			}
 			s.countAbort(in, relayAbortUpstream)
 			s.log.Warnf("relay upstream interrupted: share=%s fid=%s pos=%d err=%v",
 				in.ShareKey, in.FID, ss.pos, rerr)
-			return nil
+			// 响应头已发出,这里没有「干净报错」的余地:
+			//   - 有 Content-Length 时正常 return 会让客户端看到 unexpected EOF(可发现);
+			//   - chunked(总长未知)时正常 return 反而由 net/http 补上结束块,客户端把
+			//     截断当成功——这是唯一会静默产出坏文件的路径。
+			// ErrAbortHandler 让连接直接断开(net/http 不打印堆栈),客户端必然看到中断。
+			panic(http.ErrAbortHandler)
 		}
 
 		// 主动轮换:这条连接搬够量且文件还有剩余。客户端侧字节流连续,不可感知。
@@ -573,10 +607,14 @@ func (s *Relay) rotate(ctx context.Context, ss *streamSession) (*upstreamConn, b
 		// 上游忽略 Range:丢掉已有的 pos 字节继续用(用带宽换正确性)。
 		// 丢前缀同样要经 touchReader 喂看门狗:pos 很大时(256 MB 起)这段读取
 		// 本身就可能挂住,逃过看门狗就等于把客户端钉在这里。
+		dt0 := time.Now()
 		if _, err := io.CopyN(io.Discard, touchReader{conn}, ss.pos); err != nil {
 			conn.close()
 			return nil, false, fmt.Errorf("discard %d bytes: %w", ss.pos, err)
 		}
+		// pos 可能到 GB 级:这段纯上游读取必须计入 upstream_wait,否则监控上表现为
+		// 「流还在、bytes_total 与 upstream_wait 同时不涨」,无法解释。
+		s.addWait(relayMetricUpstreamWait, map[string]string{"pan": in.Pan}, time.Since(dt0))
 		s.log.Warnf("relay upstream ignored range: share=%s fid=%s pos=%d", in.ShareKey, in.FID, ss.pos)
 		return conn, true, nil
 	}

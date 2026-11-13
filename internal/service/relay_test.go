@@ -19,6 +19,8 @@ import (
 
 	"go.uber.org/zap"
 
+	"github.com/go-chi/chi/v5/middleware"
+
 	"github.com/dengyie/panrouter/internal/config"
 	"github.com/dengyie/panrouter/internal/driver"
 	"github.com/dengyie/panrouter/internal/pkg/breaker"
@@ -657,8 +659,16 @@ func TestRelayResumeExhaustedCountsUpstreamInterrupt(t *testing.T) {
 
 	relay, key := newRelayFixture(t, up.URL())
 	rec := httptest.NewRecorder()
-	if err := relay.Serve(context.Background(), rec, StreamInput{Pan: "fake", ShareKey: key, FID: "f1"}, ""); err != nil {
-		t.Fatalf("relay: %v", err)
+	// 响应头/Content-Length 早已发出,续传也彻底失败:此时唯一正确的收尾是断开连接
+	// (panic(http.ErrAbortHandler))。若这里改成正常 return,chunked 响应会被 net/http
+	// 补上结束块,客户端拿到一个「HTTP 完整」的截断文件且毫无报错。
+	var aborted any
+	func() {
+		defer func() { aborted = recover() }()
+		_ = relay.Serve(context.Background(), rec, StreamInput{Pan: "fake", ShareKey: key, FID: "f1"}, "")
+	}()
+	if aborted != http.ErrAbortHandler {
+		t.Fatalf("exhausted resume must abort the response, got panic=%v", aborted)
 	}
 	if rec.Body.Len() >= len(payload) {
 		t.Fatalf("payload should stay truncated, got %d bytes", rec.Body.Len())
@@ -1374,6 +1384,26 @@ func TestRelayFlushStallAttributedAsClientStalled(t *testing.T) {
 	}
 	if v := metricValue(t, relay, "panrouter_relay_client_wait_seconds_total", map[string]string{"pan": "fake"}); v < 0.1 {
 		t.Fatalf("client_wait_seconds_total=%v, want >=0.1 (flush wait must be counted)", v)
+	}
+}
+
+// chi 的 WrapResponseWriter 只实现 Flush()(无返回值)。标准库
+// http.ResponseController.Flush 的解析顺序是 FlushError → Flusher → Unwrap,
+// 于是它在包装器这一层就 t.Flush(); return nil 提前收工,内层的写超时永远看不到。
+// 生产上每个请求都被 zapLogger 这样包了一层,所以 flushErr 必须自己先 Unwrap。
+func TestFlushErrSeesThroughFlusherOnlyWrapper(t *testing.T) {
+	inner := &flushFailWriter{rec: httptest.NewRecorder()}
+	if err := inner.SetWriteDeadline(time.Now().Add(-time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	wrapped := middleware.NewWrapResponseWriter(inner, 1)
+	if err := flushErr(wrapped); !errors.Is(err, os.ErrDeadlineExceeded) {
+		t.Fatalf("flush error hidden by chi wrapper: %v", err)
+	}
+	// 健康 writer:包装器下面没有 FlushError 时退化成 Flusher.Flush(),视为成功。
+	healthy := middleware.NewWrapResponseWriter(httptest.NewRecorder(), 1)
+	if err := flushErr(healthy); err != nil {
+		t.Fatalf("flushErr on healthy writer: %v", err)
 	}
 }
 

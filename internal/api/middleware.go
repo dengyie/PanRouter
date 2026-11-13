@@ -55,6 +55,12 @@ func (d *Deps) recoverer(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		defer func() {
 			if rec := recover(); rec != nil {
+				// ErrAbortHandler 是「主动断连接」的信号(net/http 约定不打印堆栈):
+				// 中转已发出的响应头收不回来,只有让它继续上抛,连接才会真的断掉。
+				// 若在这里吞掉并写 500,net/http 会用结束块把截断的流收尾得像个正常响应。
+				if rec == http.ErrAbortHandler {
+					panic(rec)
+				}
 				d.Log.Errorf("panic: %v", rec)
 				writeJSON(w, http.StatusInternalServerError, map[string]any{
 					"code": 500, "kind": "internal", "message": "internal error",

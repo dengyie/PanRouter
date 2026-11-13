@@ -248,6 +248,11 @@ func (c *Client) doWithACW(req *http.Request, hc *http.Client) (*http.Response, 
 		if resp.Request != nil {
 			tmpl = resp.Request
 		}
+		// 重放前必须确认 body 可重读:没有 GetBody 的流式 body(io.Pipe 等)此刻
+		// 已被消费,再发一次只会是空体,上游回 4xx 后还会被误归因成「挑战持续」。
+		if err := rewindable(tmpl); err != nil {
+			return nil, err
+		}
 		replay, err := cloneRequest(tmpl, origCtx)
 		if err != nil {
 			return nil, err
@@ -271,6 +276,15 @@ func cloneRequest(r *http.Request, ctx context.Context) (*http.Request, error) {
 		nr.Body = body
 	}
 	return nr, nil
+}
+
+// rewindable 校验请求体能否重放。首次克隆(注入 acw token)时 body 尚未被消费,
+// 共享无妨;挑战重放发生在响应体已读之后,没有 GetBody 就等于重发空体。
+func rewindable(r *http.Request) error {
+	if r.Body == nil || r.Body == http.NoBody || r.GetBody != nil {
+		return nil
+	}
+	return fmt.Errorf("httpx: cannot replay request with non-rewindable body")
 }
 
 // DoJSON 发送 JSON 请求并反序列化响应。

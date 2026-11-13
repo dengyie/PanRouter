@@ -1,6 +1,7 @@
 package httpx
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"io"
@@ -222,8 +223,8 @@ func TestInspectChallengeProbeIsBounded(t *testing.T) {
 
 	start := time.Now()
 	peek, challenge, err := inspectChallenge(resp, 50*time.Millisecond)
-	if err != nil {
-		t.Fatalf("probe timeout must not fail the request: %v", err)
+	if err == nil || !strings.Contains(err.Error(), "timed out") {
+		t.Fatalf("probe timeout must surface as an error (peek is not a complete body): err=%v", err)
 	}
 	if challenge {
 		t.Fatal("a stalled body is not an acw challenge")
@@ -231,11 +232,62 @@ func TestInspectChallengeProbeIsBounded(t *testing.T) {
 	if elapsed := time.Since(start); elapsed > 2*time.Second {
 		t.Fatalf("probe blocked for %v, want bounded by the probe budget", elapsed)
 	}
-	// 已窥探到的字节必须交回调用方(原 Body 已不可用,替换后的 Body 交出已读部分),
-	// 不能因为窥探超时把数据丢掉。
-	rest, _ := io.ReadAll(resp.Body)
+	// 超时即失败:调用方(relay)会干净报错,而不是把 peek 伪装成完整响应——
+	// 那会让 chunked 下客户端拿到「HTTP 完整」的截断文件且无任何错误。
+	_ = peek
 	_ = resp.Body.Close()
-	if string(rest) != string(peek) || string(peek) != "denied-but-not-a-challenge" {
-		t.Fatalf("peeked bytes lost: peek=%q rest=%q", peek, rest)
+}
+
+// 二进制流(即使 chunked/总长未知)不该被窥探:挑战页一定是文本/412,对
+// application/octet-stream 做探测只有延迟和误杀,没有任何收益。
+func TestInspectChallengeSkipsBinaryChunkedStream(t *testing.T) {
+	const payload = "some-binary-payload"
+	resp := &http.Response{
+		StatusCode:    http.StatusOK,
+		Header:        http.Header{"Content-Type": []string{"application/octet-stream"}},
+		Body:          io.NopCloser(strings.NewReader(payload)),
+		ContentLength: -1, // chunked
+	}
+	peek, challenge, err := inspectChallenge(resp, time.Millisecond)
+	if err != nil {
+		t.Fatalf("binary stream must not be probed: %v", err)
+	}
+	if challenge || peek != nil {
+		t.Fatalf("binary stream is never a challenge: challenge=%v peek=%q", challenge, peek)
+	}
+	rest, err := io.ReadAll(resp.Body) // 原 Body 必须原封不动
+	_ = resp.Body.Close()
+	if err != nil {
+		t.Fatalf("read body: %v", err)
+	}
+	if string(rest) != payload {
+		t.Fatalf("binary body was consumed by probe: %q", rest)
+	}
+}
+
+// 没有 GetBody 的流式请求体(io.Pipe 等)在挑战/307 重放时已不可再读,必须显式
+// 拒绝,否则重放发出的是空体,上游 4xx 还会被误归因成「挑战持续」。
+func TestRewindableRejectsStreamBody(t *testing.T) {
+	pr, _ := io.Pipe()
+	req, err := http.NewRequest(http.MethodPost, "http://example.invalid/", pr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := rewindable(req); err == nil {
+		t.Fatal("streaming body must be rejected as non-rewindable")
+	}
+	bufReq, err := http.NewRequest(http.MethodPost, "http://example.invalid/", bytes.NewReader([]byte("x")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := rewindable(bufReq); err != nil {
+		t.Fatalf("rewindable body rejected: %v", err)
+	}
+	nilReq, err := http.NewRequest(http.MethodPost, "http://example.invalid/", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := rewindable(nilReq); err != nil {
+		t.Fatalf("nil body rejected: %v", err)
 	}
 }
