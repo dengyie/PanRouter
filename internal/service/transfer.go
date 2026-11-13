@@ -329,6 +329,15 @@ func (s *Transfer) Submit(req TransferRequest) (*TransferTask, error) {
 	s.mu.Unlock()
 
 	go func() {
+		// 独立 goroutine 不在 HTTP handler 栈内,api 层 recoverer 保护不到:
+		// resolver/driver 解析畸形上游数据触发 panic 会直接崩掉整个进程。
+		// 收口成 failed 让客户端可见,进程继续服务其他请求。
+		defer func() {
+			if p := recover(); p != nil {
+				task.finishFailed(fmt.Sprintf("internal panic: %v", p), string(driver.KindUpstream))
+				s.log.Errorw("transfer panicked", "id", task.ID, "panic", p)
+			}
+		}()
 		rctx, cancel := context.WithCancel(context.Background())
 		defer cancel()
 		// 后台任务已过管理员鉴权(路由挂在 auth 组内):显式打标,
@@ -646,9 +655,14 @@ func (s *Transfer) watchOfflineArtifact(task *TransferTask, destPath string, exp
 				s.confirmOfflineArtifact(task, obj, size)
 				return
 			}
+			// offlineToken 由 transferOffline 在 t.mu 内写入(确认器已启动后仍可能
+			// 迟到写),日志读取必须同样持锁,否则 -race 下数据竞争。
+			task.mu.Lock()
+			rt := task.offlineToken
+			task.mu.Unlock()
 			s.log.Warnw("offline artifact not confirmed within window",
 				"id", task.ID, "dest", destPath, "expect", expect, "window", after,
-				"remote_token", task.offlineToken)
+				"remote_token", rt)
 			task.finishFailed("artifact not landed within window: "+destPath,
 				string(driver.KindUpstream))
 			return
@@ -663,8 +677,11 @@ func (s *Transfer) watchOfflineArtifact(task *TransferTask, destPath string, exp
 			ticks++
 			if ticks%remoteFailCheckEvery == 0 {
 				if failed, remoteErr := s.offlineRemoteFailed(ctx, task); failed {
+					task.mu.Lock()
+					rt := task.offlineToken
+					task.mu.Unlock()
 					s.log.Warnw("offline artifact remote task failed",
-						"id", task.ID, "dest", destPath, "remote_token", task.offlineToken)
+						"id", task.ID, "dest", destPath, "remote_token", rt)
 					task.finishFailed("remote offline task failed: "+remoteErr,
 						string(driver.KindUpstream))
 					return
@@ -1105,8 +1122,11 @@ func (s *Transfer) transferStream(ctx context.Context, task *TransferTask, src *
 		if err == nil {
 			break
 		}
-		s.log.Warnw("upstream fetch failed, retrying", "upstream", src.upstream,
-			"attempt", attempt+1, "err", err.Error())
+		// 末次失败已无「下一次」:retrying 只在还有重试机会时打,避免误导排障。
+		if attempt == 0 {
+			s.log.Warnw("upstream fetch failed, retrying", "upstream", src.upstream,
+				"err", err.Error())
+		}
 	}
 	if err != nil {
 		return driver.NewErr(driver.KindUpstream, "上游直链请求失败", err)

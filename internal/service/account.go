@@ -98,6 +98,9 @@ func (s *AccountService) Pick(pan string) (*repo.Account, *driver.Credential, er
 		}
 		cred, derr := s.DecryptCred(&acc)
 		if derr == nil {
+			// gauge 以库内全量为准,一次 Pick 至多刷一次:循环内逐号刷新会让
+			// n 个坏号触发 n 次全量 ListAccounts 重算,放大 DB 压力。
+			s.RefreshStatusMetrics()
 			return &acc, cred, nil
 		}
 		s.log.Warnf("account %d pan=%s credential unreadable, mark expired: %v", acc.ID, acc.PanType, derr)
@@ -106,10 +109,10 @@ func (s *AccountService) Pick(pan string) (*repo.Account, *driver.Credential, er
 		}
 		s.store.AddAudit("cred_unreadable",
 			fmt.Sprintf("account=%d pan=%s: %v", acc.ID, acc.PanType, derr))
-		s.RefreshStatusMetrics()
 	}
 	// 全部候选都解不开:按「无可用账号」处理(免登录盘可继续匿名解析),
 	// 上面已逐个标记 expired 并留审计,不再用 502 掩盖真实原因。
+	s.RefreshStatusMetrics()
 	return nil, nil, nil
 }
 
