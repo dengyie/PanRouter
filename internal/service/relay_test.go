@@ -31,8 +31,16 @@ import (
 )
 
 type fakeDriver struct {
+	mu        sync.Mutex // linkURL 会被「直链过期重解析」用例在测试中途改写
 	linkURL   string
 	serverURL string // 可选:服务端自取直链;空 = 复用 linkURL
+}
+
+// setLink 模拟重新解析拿到了新的直链(老链接已过期)。
+func (f *fakeDriver) setLink(u string) {
+	f.mu.Lock()
+	f.linkURL = u
+	f.mu.Unlock()
 }
 
 func (f *fakeDriver) ID() string { return "fake" }
@@ -40,7 +48,10 @@ func (f *fakeDriver) ResolveShare(context.Context, driver.ShareLink, *driver.Cre
 	return []driver.FileNode{{FID: "f1", Name: "n.bin", Size: 300, Ext: map[string]string{}}}, nil
 }
 func (f *fakeDriver) GetDirectLink(context.Context, *driver.Credential, driver.FileRef) (driver.DirectLink, error) {
-	return driver.DirectLink{URL: f.linkURL, ServerURL: f.serverURL, ExpiresAt: time.Now().Add(time.Hour)}, nil
+	f.mu.Lock()
+	u, su := f.linkURL, f.serverURL
+	f.mu.Unlock()
+	return driver.DirectLink{URL: u, ServerURL: su, ExpiresAt: time.Now().Add(time.Hour)}, nil
 }
 func (f *fakeDriver) CheckCredential(context.Context, driver.Credential) (driver.CredStatus, error) {
 	return driver.CredStatus{Valid: true}, nil
@@ -48,6 +59,17 @@ func (f *fakeDriver) CheckCredential(context.Context, driver.Credential) (driver
 
 // fixture:完整装配 Resolver + Relay,直链指向 mock 上游;返回 shareKey 供 StreamInput 使用。
 func newRelayFixture(t *testing.T, upstreamURL string) (*Relay, string) {
+	relay, key, _ := newRelayFixtureLink(t, upstreamURL+"/file")
+	return relay, key
+}
+
+// newRelayFixtureWithDriver 额外把 fakeDriver 交出去,供中途改写直链的用例使用。
+func newRelayFixtureWithDriver(t *testing.T, upstreamURL string) (*Relay, string, *fakeDriver) {
+	return newRelayFixtureLink(t, upstreamURL+"/file")
+}
+
+// newRelayFixtureLink 直链由调用方给全(可带 token),用于模拟「直链过期后重新解析」。
+func newRelayFixtureLink(t *testing.T, linkURL string) (*Relay, string, *fakeDriver) {
 	t.Helper()
 	store, err := repo.Open(t.TempDir() + "/t.db")
 	if err != nil {
@@ -60,7 +82,7 @@ func newRelayFixture(t *testing.T, upstreamURL string) (*Relay, string) {
 	aes := crypto.New("test-key")
 	log := zap.NewNop().Sugar()
 
-	fd := &fakeDriver{linkURL: upstreamURL + "/file"}
+	fd := &fakeDriver{linkURL: linkURL}
 	reg := driver.NewRegistry([]driver.Driver{fd}, map[string][]string{"fake": {"fake.example"}})
 	met := metrics.New()
 	acc := NewAccountService(store, aes, met, log)
@@ -82,7 +104,7 @@ func newRelayFixture(t *testing.T, upstreamURL string) (*Relay, string) {
 		t.Fatal(err)
 	}
 	relay := NewRelay(resolver, map[string]*httpx.Client{"fake": streamCl}, store, aes, met, log, cfgp)
-	return relay, resolver.shareKey("fake", shareURL, "")
+	return relay, resolver.shareKey("fake", shareURL, ""), fd
 }
 
 // P1 回归:响应头即时返回、体传输持续超过 Timeout 的慢流必须完整送达,不得截断。
@@ -739,6 +761,129 @@ func TestRelayAdvertisedRangeIgnoredStopsRotating(t *testing.T) {
 	relay.met.Handler().ServeHTTP(rr, httptest.NewRequest("GET", "/metrics", nil))
 	if body := rr.Body.String(); !strings.Contains(body, `panrouter_relay_rotate_total{pan="fake"} 1`) {
 		t.Fatalf("expected exactly 1 rotation before fallback:\n%s", body)
+	}
+}
+
+// 大文件下载可能持续数小时,直链中途过期是常态:轮换/续传拿到 401/403/404/410/412 时
+// 必须 ExpireLink → 重新解析 → 用新直链从 pos 继续,客户端字节流不断。这条路径此前
+// 完全没有测试(只在「首次请求就 403」的用例里覆盖过开头)。
+func TestRelayRefreshesExpiredLinkMidStream(t *testing.T) {
+	payload := bytes.Repeat([]byte("R"), 256<<10)
+
+	var mu sync.Mutex
+	current := "tok1" // 上游当前认可的直链 token
+	forbidden := 0    // 老 token 被拒的次数
+	var fd *fakeDriver
+	var up *httptest.Server // 先声明:handler 里要用 up.URL 拼新直链
+
+	up = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		ok := r.URL.Query().Get("k") == current
+		if !ok {
+			forbidden++
+		}
+		mu.Unlock()
+		if !ok {
+			w.WriteHeader(http.StatusForbidden)
+			return
+		}
+		w.Header().Set("ETag", `"v1"`)
+		w.Header().Set("Accept-Ranges", "bytes")
+		start, end := 0, len(payload)-1
+		if rh := r.Header.Get("Range"); rh != "" {
+			s, e, rok := parseTestRange(rh, len(payload))
+			if !rok {
+				w.WriteHeader(http.StatusRequestedRangeNotSatisfiable)
+				return
+			}
+			start, end = s, e
+			w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, len(payload)))
+			w.WriteHeader(http.StatusPartialContent)
+		} else {
+			// 整份响应发出去之后,老直链就到期了(长下载的真实情形:链接 TTL 短于下载时长)
+			mu.Lock()
+			if fd != nil {
+				current = "tok2"
+				fd.setLink(up.URL + "/file?k=tok2")
+			}
+			mu.Unlock()
+		}
+		w.Header().Set("Content-Length", strconv.Itoa(end-start+1))
+		_, _ = w.Write(payload[start : end+1])
+	}))
+	defer up.Close()
+
+	relay, key, drv := newRelayFixtureLink(t, up.URL+"/file?k=tok1")
+	fd = drv
+	withRotateBytes(t, relay, 32<<10)
+
+	rec := httptest.NewRecorder()
+	if err := relay.Serve(context.Background(), rec, StreamInput{Pan: "fake", ShareKey: key, FID: "f1"}, ""); err != nil {
+		t.Fatalf("relay: %v", err)
+	}
+	if !bytes.Equal(rec.Body.Bytes(), payload) {
+		t.Fatalf("body incomplete after link refresh: got %d bytes, want %d", rec.Body.Len(), len(payload))
+	}
+	mu.Lock()
+	n := forbidden
+	mu.Unlock()
+	if n != 1 {
+		t.Fatalf("expired link must be rejected exactly once, got %d 403s", n)
+	}
+	if v := metricValue(t, relay, "panrouter_relay_link_refresh_total", map[string]string{"pan": "fake"}); v != 1 {
+		t.Fatalf("link_refresh_total=%v, want 1", v)
+	}
+	if v := metricValue(t, relay, "panrouter_relay_abort_total", map[string]string{"pan": "fake", "reason": "rotate_failed"}); v != 0 {
+		t.Fatalf("a refreshed link must not be counted as rotate_failed, got %v", v)
+	}
+	if v := metricValue(t, relay, "panrouter_relay_resume_total", map[string]string{"pan": "fake"}); v != 0 {
+		t.Fatalf("link refresh is a rotation, not a resume, got resume=%v", v)
+	}
+}
+
+// 重解析只允许一次:刷新后还失效说明直链/账号真有问题,必须收尾(rotate_failed)
+// 而不是无限「刷新→再失败」递归。
+func TestRelayRefreshesExpiredLinkOnlyOnce(t *testing.T) {
+	payload := bytes.Repeat([]byte("L"), 256<<10)
+	var mu sync.Mutex
+	forbidden := 0
+
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Range") != "" { // 轮换一律被拒
+			mu.Lock()
+			forbidden++
+			mu.Unlock()
+			w.WriteHeader(http.StatusForbidden)
+			return
+		}
+		w.Header().Set("ETag", `"v1"`)
+		w.Header().Set("Accept-Ranges", "bytes")
+		w.Header().Set("Content-Length", strconv.Itoa(len(payload)))
+		_, _ = w.Write(payload)
+	}))
+	defer up.Close()
+
+	relay, key, _ := newRelayFixtureLink(t, up.URL+"/file")
+	withRotateBytes(t, relay, 32<<10)
+
+	rec := httptest.NewRecorder()
+	if err := relay.Serve(context.Background(), rec, StreamInput{Pan: "fake", ShareKey: key, FID: "f1"}, ""); err != nil {
+		t.Fatalf("relay: %v", err)
+	}
+	if rec.Body.Len() >= len(payload) {
+		t.Fatalf("body must stop at the second failure, got %d bytes", rec.Body.Len())
+	}
+	mu.Lock()
+	n := forbidden
+	mu.Unlock()
+	if n != 2 {
+		t.Fatalf("want exactly 2 rejected range requests (1 + 1 retry after refresh), got %d", n)
+	}
+	if v := metricValue(t, relay, "panrouter_relay_link_refresh_total", map[string]string{"pan": "fake"}); v != 1 {
+		t.Fatalf("link_refresh_total=%v, want 1 (refresh only once)", v)
+	}
+	if v := metricValue(t, relay, "panrouter_relay_abort_total", map[string]string{"pan": "fake", "reason": "rotate_failed"}); v != 1 {
+		t.Fatalf("rotate_failed=%v, want 1", v)
 	}
 }
 

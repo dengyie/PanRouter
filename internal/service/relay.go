@@ -47,6 +47,7 @@ const (
 	relayMetricActive       = "panrouter_relay_streams_active"
 	relayMetricUpstreamWait = "panrouter_relay_upstream_wait_seconds_total"
 	relayMetricClientWait   = "panrouter_relay_client_wait_seconds_total"
+	relayMetricLinkRefresh  = "panrouter_relay_link_refresh_total"
 
 	relayAbortClientGone    = "client_gone"
 	relayAbortClientStalled = "client_stalled"
@@ -114,6 +115,7 @@ func NewRelay(resolver *Resolver, clients map[string]*httpx.Client, store *repo.
 		met.Help(relayMetricActive, "Relay 当前正在中转的流数(每请求开始时 +1,结束 -1)")
 		met.Help(relayMetricUpstreamWait, "Relay 阻塞等待上游吐字节的累计秒数(按网盘)")
 		met.Help(relayMetricClientWait, "Relay 阻塞等待客户端接收(Write/Flush)的累计秒数(按网盘)")
+		met.Help(relayMetricLinkRefresh, "Relay 中转途中直链失效后重新解析成功的次数(按网盘)")
 		// 先把各网盘的 0 值序列建出来:没有序列和「全 0」在监控上不可区分。
 		for pan := range clients {
 			met.Add(relayMetricBytes, map[string]string{"pan": pan}, 0)
@@ -122,6 +124,7 @@ func NewRelay(resolver *Resolver, clients map[string]*httpx.Client, store *repo.
 			met.Add(relayMetricStall, map[string]string{"pan": pan}, 0)
 			met.Add(relayMetricUpstreamWait, map[string]string{"pan": pan}, 0)
 			met.Add(relayMetricClientWait, map[string]string{"pan": pan}, 0)
+			met.Add(relayMetricLinkRefresh, map[string]string{"pan": pan}, 0)
 			met.AddGauge(relayMetricActive, map[string]string{"pan": pan}, 0)
 			for _, reason := range []string{relayAbortClientGone, relayAbortClientStalled, relayAbortUpstream, relayAbortRotate} {
 				met.Add(relayMetricAbort, map[string]string{"pan": pan, "reason": reason}, 0)
@@ -553,13 +556,20 @@ func (s *Relay) rotate(ctx context.Context, ss *streamSession) (*upstreamConn, b
 	code := conn.resp.StatusCode
 	conn.close()
 	if isStaleStatus(code) && !ss.refreshed {
-		ss.refreshed = true
+		ss.refreshed = true // 只重解析一次:再失效就说明直链/账号真有问题,别死循环
 		s.expireLink(in)
 		nl, ferr := s.freshLink(ctx, in)
 		if ferr != nil {
 			return nil, false, ferr
 		}
 		ss.link = nl
+		// 大文件下载可能持续数小时,直链中途过期是常态而非异常:这次刷新让客户端
+		// 的字节流继续,但它必须可见——否则运维只会看到「偶尔慢一下」,查不到原因。
+		if s.met != nil {
+			s.met.Inc(relayMetricLinkRefresh, map[string]string{"pan": in.Pan})
+		}
+		s.log.Warnf("relay refreshed expired direct link mid-stream: share=%s fid=%s pos=%d status=%d",
+			in.ShareKey, in.FID, ss.pos, code)
 		return s.rotate(ctx, ss)
 	}
 	return nil, false, fmt.Errorf("upstream %d on rotate", code)
