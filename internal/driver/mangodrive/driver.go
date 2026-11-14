@@ -251,6 +251,12 @@ func (d *Driver) GetDirectLink(ctx context.Context, cred *driver.Credential, ref
 	}, nil
 }
 
+// MaxParallelLinks 声明可并发提链数。fs/get 是无状态只读请求,生产配置
+// limit_qps=10 / download_concurrency=8;4 路并发把「分享内 8 个文件自动
+// 提链」从 8 个串行往返压成 2 波(实测单次 fs/get 约 2.5-3s),同时给其它
+// 请求留足令牌。
+func (d *Driver) MaxParallelLinks() int { return 4 }
+
 // CheckCredential 用 /api/me 探测 token 是否有效。
 func (d *Driver) CheckCredential(ctx context.Context, cred driver.Credential) (driver.CredStatus, error) {
 	if cred.Cookie == "" {

@@ -115,6 +115,14 @@ type Driver interface {
 	CheckCredential(ctx context.Context, cred Credential) (CredStatus, error)
 }
 
+// LinkParallel 是**可选**能力接口:实现者声明自身可安全承载的并发提链数。
+// 未实现 = 1(串行)。service 层会把声明值再与 download_concurrency、
+// limit_qps 取小,保证并发起点不超出本地令牌桶容量。
+//
+// 语义约束:实现者必须保证 GetDirectLink 无共享可变状态(只读请求),
+// 且并发数不超过上游真实承受能力。
+type LinkParallel interface{ MaxParallelLinks() int }
+
 // ---- 注册表与域名路由 ----
 
 type route struct {

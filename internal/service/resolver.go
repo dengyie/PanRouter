@@ -90,6 +90,9 @@ const (
 	quarkAutoLinkMax   = 2 // 转存链单文件可达 ~30s;2 个仍低于 CF 524
 	resolveShareBudget = 90 * time.Second
 	minAutoLinkBudget  = 15 * time.Second
+	// slowResolveWarn:整次分享解析(列表+自动提链)超过该值时打点,便于
+	// 在不加全量日志的前提下定位尾延迟(生产实证:8 文件串行提链 23s)。
+	slowResolveWarn = 5 * time.Second
 )
 
 func autoLinkMaxFor(pan string) int {
@@ -339,6 +342,7 @@ func (r *Resolver) linkHoldsCookie(l *repo.Link) bool {
 func (r *Resolver) ResolveShare(ctx context.Context, rawURL, pwd, clientUA string) (*ResolveShareResult, error) {
 	ctx, cancel := withDeadlineIfNone(ctx, resolveShareBudget)
 	defer cancel()
+	start := time.Now()
 
 	drv, err := r.reg.Detect(rawURL)
 	if err != nil {
@@ -383,50 +387,220 @@ func (r *Resolver) ResolveShare(ctx context.Context, rawURL, pwd, clientUA strin
 		r.log.Warnw("save share: %v", err)
 	}
 	items := make([]FileItem, 0, len(nodes))
-	linked, authBlocked, budgetStop := 0, false, false
-	hint := ""
-	limit := autoLinkMaxFor(pan)
 	for _, n := range nodes {
-		it := FileItem{FID: n.FID, Name: n.Name, Size: n.Size, IsDir: n.IsDir}
-		if !n.IsDir && n.FID != "" && linked < limit && !authBlocked && !budgetStop {
-			if !canAutoLink(ctx) {
-				budgetStop = true
-				hint = joinHints(hint, "请求剩余时间不足,未继续自动提链")
-				r.log.Warnw("auto-link skipped: deadline", "pan", pan, "fid", n.FID)
-			} else {
-				linked++
-				file, lerr := r.ResolveFile(ctx, rawURL, pwd, n.FID, false, clientUA)
-				if lerr != nil {
-					kind := "upstream_error"
-					var de *driver.Error
-					if errors.As(lerr, &de) {
-						kind = string(de.Kind)
-						it.LinkError = de.UserHint
-						if de.Kind == driver.KindAuthExpired {
-							authBlocked = true
-							hint = joinHints(hint, de.UserHint)
-						}
-					} else {
-						it.LinkError = lerr.Error()
-					}
-					if errors.Is(lerr, context.DeadlineExceeded) || errors.Is(lerr, context.Canceled) {
-						budgetStop = true
-						hint = joinHints(hint, "请求已超时或取消,未继续自动提链")
-					}
-					r.log.Warnw("auto-link failed", "pan", pan, "fid", n.FID, "kind", kind, "hint", it.LinkError)
-				} else {
-					it.Route = file.Route
-					it.DownloadURL = file.DownloadURL
-				}
-			}
+		items = append(items, FileItem{FID: n.FID, Name: n.Name, Size: n.Size, IsDir: n.IsDir})
+	}
+	limit := autoLinkMaxFor(pan)
+	pending := make([]int, 0, limit)
+	for i, n := range nodes {
+		if len(pending) >= limit {
+			break
 		}
-		items = append(items, it)
+		if !n.IsDir && n.FID != "" {
+			pending = append(pending, i)
+		}
+	}
+	var linked int
+	var hint string
+	linkStart := time.Now()
+	if len(pending) > 0 {
+		// 串行是基线语义(鉴权失败立即停止、预算不足停止、顺序回填)。
+		// 仅当 driver 显式声明并发能力、且配置的并发/限频额度支持时才并发,
+		// 否则保持逐文件串行——不为了提速改变错误与停链语义。
+		if conc := r.autoLinkConcurrency(drv, pan, len(pending)); conc > 1 {
+			linked, _, _, hint = r.autoLinkParallel(ctx, rawURL, pwd, nodes, items, pending, conc, clientUA, pan)
+		} else {
+			linked, _, _, hint = r.autoLinkSerial(ctx, rawURL, pwd, nodes, items, pending, clientUA, pan)
+		}
+	}
+	if elapsed := time.Since(start); elapsed > slowResolveWarn {
+		r.log.Warnw("slow resolve share",
+			"pan", pan, "files", len(nodes), "pending", len(pending), "linked", linked,
+			"list_ms", linkStart.Sub(start).Milliseconds(),
+			"link_ms", time.Since(linkStart).Milliseconds(),
+			"truncated", truncated)
 	}
 	if truncated {
 		hint = joinHints(hint, fmt.Sprintf("分享过大,仅展开前 %d 个文件", len(nodes)))
 	}
 	r.met.Inc("panrouter_resolve_total", map[string]string{"pan": pan, "kind": "share"})
 	return &ResolveShareResult{Pan: pan, ShareKey: key, Files: items, Hint: hint, Truncated: truncated}, nil
+}
+
+// autoLinkConcurrency 决定自动提链的并发度:默认 1(串行)。
+// 仅 driver 实现 driver.LinkParallel 时放开,并与 download_concurrency、
+// limit_qps 取小 —— 并发起点不得超过本地令牌桶容量(容量=速率),否则
+// 多出来的调用会被本地限频直接拒成 risk_control。
+func (r *Resolver) autoLinkConcurrency(drv driver.Driver, pan string, pending int) int {
+	if pending < 2 {
+		return 1
+	}
+	pl, ok := drv.(driver.LinkParallel)
+	if !ok {
+		return 1
+	}
+	conc := pl.MaxParallelLinks()
+	cfg := r.driverCfg(pan)
+	if cfg.DownloadConc > 0 && conc > cfg.DownloadConc {
+		conc = cfg.DownloadConc
+	}
+	if cfg.LimitQPS > 0 && float64(conc) > cfg.LimitQPS {
+		conc = int(cfg.LimitQPS)
+	}
+	if conc > pending {
+		conc = pending
+	}
+	if conc < 2 {
+		return 1
+	}
+	return conc
+}
+
+// autoLinkSerial 逐个自动提链(基线语义):鉴权失败立即停、预算不足停、
+// 结果按原顺序回填。返回已尝试数/鉴权阻断/预算停止/提示。
+func (r *Resolver) autoLinkSerial(ctx context.Context, rawURL, pwd string, nodes []driver.FileNode,
+	items []FileItem, pending []int, clientUA, pan string) (linked int, authBlocked, budgetStop bool, hint string) {
+	for _, idx := range pending {
+		if authBlocked {
+			break
+		}
+		fid := nodes[idx].FID
+		if !canAutoLink(ctx) {
+			budgetStop = true
+			hint = joinHints(hint, "请求剩余时间不足,未继续自动提链")
+			r.log.Warnw("auto-link skipped: deadline", "pan", pan, "fid", fid)
+			break
+		}
+		linked++
+		file, lerr := r.ResolveFile(ctx, rawURL, pwd, fid, false, clientUA)
+		if lerr != nil {
+			kind := "upstream_error"
+			var de *driver.Error
+			if errors.As(lerr, &de) {
+				kind = string(de.Kind)
+				items[idx].LinkError = de.UserHint
+				if de.Kind == driver.KindAuthExpired {
+					authBlocked = true
+					hint = joinHints(hint, de.UserHint)
+				}
+			} else {
+				items[idx].LinkError = lerr.Error()
+			}
+			if errors.Is(lerr, context.DeadlineExceeded) || errors.Is(lerr, context.Canceled) {
+				budgetStop = true
+				hint = joinHints(hint, "请求已超时或取消,未继续自动提链")
+			}
+			r.log.Warnw("auto-link failed", "pan", pan, "fid", fid, "kind", kind, "hint", items[idx].LinkError)
+		} else {
+			items[idx].Route = file.Route
+			items[idx].DownloadURL = file.DownloadURL
+		}
+	}
+	return
+}
+
+// autoLinkParallel 有界并发自动提链。与串行版语义对齐:
+//   - 结果按原 pending 顺序回填(items 下标);
+//   - 任一文件鉴权失败 → 立即取消在途、不再发起新提链(在途的 context
+//     取消不计为失败,避免把「主动停」误报成每个文件都出错);
+//   - 预算不足 → 不再发起新提链并给出与串行一致的提示;
+//   - 只有真正拿到直链的文件才写 Route/DownloadURL。
+func (r *Resolver) autoLinkParallel(ctx context.Context, rawURL, pwd string, nodes []driver.FileNode,
+	items []FileItem, pending []int, conc int, clientUA, pan string) (linked int, authBlocked, budgetStop bool, hint string) {
+	cctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	var (
+		mu          sync.Mutex
+		stop        bool
+		stoppedByUs bool // 主动 cancel 后,在途任务返回的 context 错误不算失败
+	)
+	stopAll := func() {
+		mu.Lock()
+		stop, stoppedByUs = true, true
+		mu.Unlock()
+		cancel()
+	}
+	tasks := make(chan int)
+	var wg sync.WaitGroup
+	for w := 0; w < conc; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for idx := range tasks {
+				mu.Lock()
+				stopped := stop
+				mu.Unlock()
+				if stopped {
+					continue
+				}
+				if !canAutoLink(cctx) {
+					mu.Lock()
+					if !stop {
+						stop, budgetStop = true, true
+						hint = joinHints(hint, "请求剩余时间不足,未继续自动提链")
+					}
+					mu.Unlock()
+					continue
+				}
+				mu.Lock()
+				linked++
+				mu.Unlock()
+				file, lerr := r.ResolveFile(cctx, rawURL, pwd, nodes[idx].FID, false, clientUA)
+				if lerr == nil {
+					mu.Lock()
+					items[idx].Route = file.Route
+					items[idx].DownloadURL = file.DownloadURL
+					mu.Unlock()
+					continue
+				}
+				mu.Lock()
+				ours := stoppedByUs && (errors.Is(lerr, context.Canceled) || errors.Is(lerr, context.DeadlineExceeded))
+				mu.Unlock()
+				if ours {
+					continue
+				}
+				kind := "upstream_error"
+				var de *driver.Error
+				hintText := ""
+				authFail := false
+				if errors.As(lerr, &de) {
+					kind = string(de.Kind)
+					hintText = de.UserHint
+					authFail = de.Kind == driver.KindAuthExpired
+				} else {
+					hintText = lerr.Error()
+				}
+				mu.Lock()
+				items[idx].LinkError = hintText
+				if authFail {
+					authBlocked = true
+					hint = joinHints(hint, de.UserHint)
+				}
+				if errors.Is(lerr, context.DeadlineExceeded) || errors.Is(lerr, context.Canceled) {
+					budgetStop = true
+					hint = joinHints(hint, "请求已超时或取消,未继续自动提链")
+				}
+				mu.Unlock()
+				r.log.Warnw("auto-link failed", "pan", pan, "fid", nodes[idx].FID, "kind", kind, "hint", hintText)
+				if authFail {
+					stopAll()
+				}
+			}
+		}()
+	}
+	for _, idx := range pending {
+		mu.Lock()
+		stopped := stop
+		mu.Unlock()
+		if stopped {
+			break
+		}
+		tasks <- idx
+	}
+	close(tasks)
+	wg.Wait()
+	return
 }
 
 // ResolveFile 获取单个文件直链:缓存未过期直接返回,否则走 driver 并落库。
