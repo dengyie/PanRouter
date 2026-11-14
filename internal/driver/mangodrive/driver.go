@@ -8,6 +8,7 @@ import (
 	"encoding/hex"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/dengyie/panrouter/internal/driver"
@@ -131,34 +132,84 @@ func (d *Driver) ResolveShare(ctx context.Context, share driver.ShareLink, cred 
 const (
 	treeMaxDepth = 8
 	treeMaxNodes = 1000
+	// treeListConc 同一层目录的并发列表上限。生产实证:66 节点整树串行
+	// fs/list 耗时 9.3s(每目录约 200-300ms),而提链阶段并发后只有 0.45s;
+	// 4 路并发把目录层压到 1-2 波,同时远低于 OpenList 的承受上限。
+	treeListConc = 4
 )
 
-// listTree 从根目录 BFS 整棵子树;返回节点(相对名)与是否触限截断。
-func listTree(ctx context.Context, api *API, root string) ([]driver.FileNode, bool) {
-	type queued struct {
-		path string // 存储内绝对路径
-		rel  string // 相对 root 的路径("" = 根层)
+type treeDir struct {
+	path string // 存储内绝对路径
+	rel  string // 相对 root 的路径("" = 根层)
+}
+
+type treeListed struct {
+	list []Obj
+	err  error
+}
+
+// listDirsBounded 并发列一组目录,结果与入参同序(下标对应),便于上层按
+// 原 BFS 顺序回填节点;ctx 取消后不再派发新目录。
+func listDirsBounded(ctx context.Context, api *API, dirs []treeDir) []treeListed {
+	out := make([]treeListed, len(dirs))
+	conc := treeListConc
+	if conc > len(dirs) {
+		conc = len(dirs)
 	}
+	if conc <= 1 {
+		for i := range dirs {
+			out[i].list, out[i].err = api.List(ctx, dirs[i].path)
+		}
+		return out
+	}
+	idx := make(chan int)
+	var wg sync.WaitGroup
+	for w := 0; w < conc; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := range idx {
+				out[i].list, out[i].err = api.List(ctx, dirs[i].path)
+			}
+		}()
+	}
+	for i := range dirs {
+		if ctx.Err() != nil {
+			break
+		}
+		idx <- i
+	}
+	close(idx)
+	wg.Wait()
+	return out
+}
+
+// listTree 从根目录 BFS 整棵子树;返回节点(相对名)与是否触限截断。
+// 同层目录并发列表(有界),节点仍按 BFS 原顺序回填,截断口径不变。
+func listTree(ctx context.Context, api *API, root string) ([]driver.FileNode, bool) {
 	nodes := make([]driver.FileNode, 0, 16)
-	truncated := false
-	queue := []queued{{path: root, rel: ""}}
+	queue := []treeDir{{path: root}}
 	seen := map[string]bool{root: true} // 目录去重(防御性:软链/异常上游可能成环)
 	for depth := 0; depth < treeMaxDepth && len(queue) > 0; depth++ {
-		var next []queued
-		for _, q := range queue {
+		if len(nodes) >= treeMaxNodes || ctx.Err() != nil {
+			return nodes, true
+		}
+		listed := listDirsBounded(ctx, api, queue)
+		var next []treeDir
+		for i, q := range queue {
 			if len(nodes) >= treeMaxNodes || ctx.Err() != nil {
 				return nodes, true
 			}
-			list, err := api.List(ctx, q.path)
-			if err != nil {
+			if listed[i].err != nil {
 				// 单层列表失败:该子目录弃置,其余继续(上游瞬时抖动不毁整树)。
 				continue
 			}
-			for i := range list {
+			list := listed[i].list
+			for j := range list {
 				if len(nodes) >= treeMaxNodes || ctx.Err() != nil {
 					return nodes, true
 				}
-				child := list[i]
+				child := list[j]
 				full := join(q.path, child.Name)
 				rel := child.Name
 				if q.rel != "" {
@@ -169,16 +220,13 @@ func listTree(ctx context.Context, api *API, root string) ([]driver.FileNode, bo
 				nodes = append(nodes, n)
 				if child.IsDir && !seen[full] {
 					seen[full] = true
-					next = append(next, queued{path: full, rel: rel})
+					next = append(next, treeDir{path: full, rel: rel})
 				}
 			}
 		}
 		queue = next
 	}
-	if len(queue) > 0 { // 深度触限仍有未下探目录
-		truncated = true
-	}
-	return nodes, truncated
+	return nodes, len(queue) > 0 // 深度触限仍有未下探目录
 }
 
 // target 解析链接并返回已鉴权的 API。
