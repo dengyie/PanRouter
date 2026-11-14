@@ -6,6 +6,7 @@ import (
 	"context"
 	"crypto/sha1"
 	"encoding/hex"
+	"fmt"
 	"net/url"
 	"strings"
 	"sync"
@@ -106,8 +107,9 @@ func fidFor(p string) string {
 //
 // 上限(防循环引用/病态大树把 90s resolve 预算打爆):深度 8 层、总节点
 // 1000 个。触限时对最后一个节点打 Ext["truncated"]="1"(resolver 的
-// listingTruncated 会把它提升为 ResolveShareResult.Truncated),预算耗尽
-// 同样收窄返回,绝不 panic 也绝不静默丢整棵。
+// listingFlags 会把它提升为 ResolveShareResult.Truncated);目录读取失败
+// 重试一次仍失败则打 Ext["incomplete"]="1"(子树缺失,快照不完整);预算
+// 耗尽同样收窄返回,绝不 panic 也绝不静默丢整棵。
 func (d *Driver) ResolveShare(ctx context.Context, share driver.ShareLink, cred *driver.Credential) ([]driver.FileNode, error) {
 	api, p, err := d.target(share.URL, cred)
 	if err != nil {
@@ -120,9 +122,20 @@ func (d *Driver) ResolveShare(ctx context.Context, share driver.ShareLink, cred 
 	if !obj.IsDir {
 		return []driver.FileNode{nodeOf(p, *obj)}, nil
 	}
-	nodes, truncated := listTree(ctx, api, p)
-	if truncated && len(nodes) > 0 {
-		nodes[len(nodes)-1].Ext["truncated"] = "1"
+	nodes, truncated, incomplete, err := listTree(ctx, api, p)
+	if err != nil {
+		return nil, err
+	}
+	if len(nodes) > 0 {
+		last := &nodes[len(nodes)-1]
+		if truncated {
+			last.Ext["truncated"] = "1"
+		}
+		if incomplete {
+			// 子树缺失(重试后仍读不到):让 resolver 把「列表不完整」如实
+			// 告诉客户端,而不是把缺节点的快照当成完整结果。
+			last.Ext["incomplete"] = "1"
+		}
 	}
 	return nodes, nil
 }
@@ -148,6 +161,36 @@ type treeListed struct {
 	err  error
 }
 
+// listSem 是全进程共享的目录列表并发闸。
+//
+// treeListConc 只约束**单次解析**内部的并发;而桌面端可以并发发起多次解析
+// (批量解析上限 50),没有进程级闸时上游瞬时并发会按「请求数 × 4」放大,
+// OpenList 被自家客户端打出限流,表现就是部分目录读取失败、整树缺节点。
+// 故把并发额度做成进程级共享:单请求空闲时仍能拿满 4 路,多请求并发时
+// 排队而不是叠加。
+var listSem = make(chan struct{}, treeListConc)
+
+// listOne 列一个目录:先拿进程级并发额度,再把 panic 收口成错误。
+//
+// ★ listDirsBounded 在**独立 goroutine** 里调用它:driver 的 panic 不会经过
+//   chi 的 recoverer(net/http 只 recover 处理请求的那个 goroutine),逃出去
+//   就是整个进程崩溃。单个目录读坏没有理由毁掉服务,故在此收口。
+func listOne(ctx context.Context, api *API, p string) (list []Obj, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			list, err = nil, driver.NewErr(driver.KindUpstream,
+				"Mango Drive 列目录时发生内部错误", fmt.Errorf("panic: %v", r))
+		}
+	}()
+	select {
+	case listSem <- struct{}{}:
+		defer func() { <-listSem }()
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+	return api.List(ctx, p)
+}
+
 // listDirsBounded 并发列一组目录,结果与入参同序(下标对应),便于上层按
 // 原 BFS 顺序回填节点;ctx 取消后不再派发新目录。
 func listDirsBounded(ctx context.Context, api *API, dirs []treeDir) []treeListed {
@@ -158,7 +201,7 @@ func listDirsBounded(ctx context.Context, api *API, dirs []treeDir) []treeListed
 	}
 	if conc <= 1 {
 		for i := range dirs {
-			out[i].list, out[i].err = api.List(ctx, dirs[i].path)
+			out[i].list, out[i].err = listOne(ctx, api, dirs[i].path)
 		}
 		return out
 	}
@@ -169,7 +212,7 @@ func listDirsBounded(ctx context.Context, api *API, dirs []treeDir) []treeListed
 		go func() {
 			defer wg.Done()
 			for i := range idx {
-				out[i].list, out[i].err = api.List(ctx, dirs[i].path)
+				out[i].list, out[i].err = listOne(ctx, api, dirs[i].path)
 			}
 		}()
 	}
@@ -184,30 +227,47 @@ func listDirsBounded(ctx context.Context, api *API, dirs []treeDir) []treeListed
 	return out
 }
 
-// listTree 从根目录 BFS 整棵子树;返回节点(相对名)与是否触限截断。
-// 同层目录并发列表(有界),节点仍按 BFS 原顺序回填,截断口径不变。
-func listTree(ctx context.Context, api *API, root string) ([]driver.FileNode, bool) {
-	nodes := make([]driver.FileNode, 0, 16)
+// listTree 从根目录 BFS 整棵子树。
+//
+// 返回值:
+//   - nodes: 相对名节点,按 BFS 原顺序;
+//   - truncated: 触达深度/节点上限(有内容未展开);
+//   - incomplete: 有目录读取失败(重试一次后仍失败),该子树缺失;
+//   - err: 根目录列表失败 —— 此时没有任何有效内容,必须如实报错,
+//     不能返回空列表让上层把分享当成「空文件夹」。
+//
+// 子目录失败不再静默跳过:先原地重试一次(上游限流/抖动多为瞬时),仍失败
+// 才记 incomplete。缺了子树的快照必须让调用方知道,否则「静默少文件」比
+// 报错危险得多。
+func listTree(ctx context.Context, api *API, root string) (nodes []driver.FileNode, truncated, incomplete bool, err error) {
+	nodes = make([]driver.FileNode, 0, 16)
 	queue := []treeDir{{path: root}}
 	seen := map[string]bool{root: true} // 目录去重(防御性:软链/异常上游可能成环)
 	for depth := 0; depth < treeMaxDepth && len(queue) > 0; depth++ {
 		if len(nodes) >= treeMaxNodes || ctx.Err() != nil {
-			return nodes, true
+			return nodes, true, incomplete, nil
 		}
 		listed := listDirsBounded(ctx, api, queue)
 		var next []treeDir
 		for i, q := range queue {
 			if len(nodes) >= treeMaxNodes || ctx.Err() != nil {
-				return nodes, true
+				return nodes, true, incomplete, nil
+			}
+			if listed[i].err != nil && ctx.Err() == nil {
+				// 瞬时失败(限流/网络抖动)重试一次;串行重试,不再叠加并发。
+				listed[i].list, listed[i].err = listOne(ctx, api, q.path)
 			}
 			if listed[i].err != nil {
-				// 单层列表失败:该子目录弃置,其余继续(上游瞬时抖动不毁整树)。
+				if depth == 0 {
+					return nil, false, false, listed[i].err
+				}
+				incomplete = true
 				continue
 			}
 			list := listed[i].list
 			for j := range list {
 				if len(nodes) >= treeMaxNodes || ctx.Err() != nil {
-					return nodes, true
+					return nodes, true, incomplete, nil
 				}
 				child := list[j]
 				full := join(q.path, child.Name)
@@ -226,7 +286,7 @@ func listTree(ctx context.Context, api *API, root string) ([]driver.FileNode, bo
 		}
 		queue = next
 	}
-	return nodes, len(queue) > 0 // 深度触限仍有未下探目录
+	return nodes, len(queue) > 0, incomplete, nil // 深度触限仍有未下探目录
 }
 
 // target 解析链接并返回已鉴权的 API。

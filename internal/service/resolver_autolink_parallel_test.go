@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -139,6 +140,109 @@ func TestAutoLinkParallelAuthStops(t *testing.T) {
 	}
 	if _, calls := d.stats(); calls > 3 {
 		t.Fatalf("鉴权失败后仍继续提链: calls=%d", calls)
+	}
+}
+
+// panicDriver 在指定 fid 上 panic:串行与并发两条自动提链路径都必须把 panic
+// 收口成该文件的 LinkError。并发 worker 是独立 goroutine,panic 逃出去会
+// 绕过 chi 的 recoverer 直接崩掉进程。
+type panicDriver struct {
+	files    []driver.FileNode
+	panicFID string
+	calls    atomic.Int32
+}
+
+func (d *panicDriver) ID() string { return "fake" }
+
+func (d *panicDriver) ResolveShare(context.Context, driver.ShareLink, *driver.Credential) ([]driver.FileNode, error) {
+	return d.files, nil
+}
+
+func (d *panicDriver) GetDirectLink(_ context.Context, _ *driver.Credential, ref driver.FileRef) (driver.DirectLink, error) {
+	d.calls.Add(1)
+	if ref.FID == d.panicFID {
+		panic("driver boom")
+	}
+	return driver.DirectLink{URL: "https://up.invalid/" + ref.FID, ExpiresAt: time.Now().Add(time.Hour)}, nil
+}
+
+func (d *panicDriver) CheckCredential(context.Context, driver.Credential) (driver.CredStatus, error) {
+	return driver.CredStatus{Valid: true}, nil
+}
+
+// parPanicDriver 复用同一 panic 行为,但声明并发能力 → 走并发提链路径。
+type parPanicDriver struct{ *panicDriver }
+
+func (d *parPanicDriver) MaxParallelLinks() int { return 3 }
+
+// 串行路径:一个文件 panic 只让该文件带 LinkError,其余文件照常提链,
+// 整次 resolve 不失败。
+func TestAutoLinkSerialRecoversPanic(t *testing.T) {
+	files := parFiles(3)
+	d := &panicDriver{files: files, panicFID: "f1"}
+	resolver, _ := newTestResolver(t, d, config.DriverCommon{Enabled: true, LimitQPS: 1000, DownloadConc: 1})
+
+	res, err := resolver.ResolveShare(context.Background(), testShareURL, "", "")
+	if err != nil {
+		t.Fatalf("单文件 panic 不应让整次解析失败: %v", err)
+	}
+	if res.Files[1].LinkError == "" {
+		t.Fatalf("panic 文件应带 LinkError: %+v", res.Files[1])
+	}
+	if res.Files[0].DownloadURL == "" || res.Files[2].DownloadURL == "" {
+		t.Fatalf("其余文件应照常提链: %+v", res.Files)
+	}
+}
+
+// 并发路径:panic 不得崩进程,也不得把在途的其它文件连坐。
+func TestAutoLinkParallelRecoversPanic(t *testing.T) {
+	files := parFiles(6)
+	d := &parPanicDriver{&panicDriver{files: files, panicFID: "f2"}}
+	resolver, _ := newTestResolver(t, d, config.DriverCommon{Enabled: true, LimitQPS: 1000, DownloadConc: 3})
+
+	res, err := resolver.ResolveShare(context.Background(), testShareURL, "", "")
+	if err != nil {
+		t.Fatalf("并发路径单文件 panic 不应让整次解析失败: %v", err)
+	}
+	if res.Files[2].LinkError == "" {
+		t.Fatalf("panic 文件应带 LinkError: %+v", res.Files[2])
+	}
+	for i := range files {
+		if i == 2 {
+			continue
+		}
+		if res.Files[i].DownloadURL == "" || res.Files[i].LinkError != "" {
+			t.Fatalf("第 %d 个文件应正常提链: %+v", i, res.Files[i])
+		}
+	}
+}
+
+// incompleteListDriver 模拟「部分目录读取失败」的列表:末节点带 incomplete 标记。
+type incompleteListDriver struct{ fakeDriver }
+
+func (d *incompleteListDriver) ResolveShare(context.Context, driver.ShareLink, *driver.Credential) ([]driver.FileNode, error) {
+	return []driver.FileNode{
+		{FID: "f1", Name: "a.bin", Size: 1},
+		{FID: "f2", Name: "b.bin", Size: 1, Ext: map[string]string{"path": "/p/b", "incomplete": "1"}},
+	}, nil
+}
+
+// 列表不完整必须让调用方看见:Truncated 置位 + hint 明说,而不是当成完整结果。
+func TestResolveShareIncompleteSurfacesHint(t *testing.T) {
+	resolver, _ := newTestResolver(t, &incompleteListDriver{}, config.DriverCommon{Enabled: true, LimitQPS: 1000, DownloadConc: 1})
+
+	res, err := resolver.ResolveShare(context.Background(), testShareURL, "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !res.Truncated {
+		t.Fatalf("incomplete 应置 Truncated: %+v", res)
+	}
+	if !strings.Contains(res.Hint, "不完整") {
+		t.Fatalf("hint=%q 应说明列表可能不完整", res.Hint)
+	}
+	if strings.Contains(res.Hint, "分享过大") {
+		t.Fatalf("读取失败不应伪装成「分享过大」: %q", res.Hint)
 	}
 }
 

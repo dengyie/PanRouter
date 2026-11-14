@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"net/url"
+	"runtime/debug"
 	"strings"
 	"sync"
 	"time"
@@ -120,8 +121,13 @@ func canAutoLink(ctx context.Context) bool {
 	return time.Until(deadline) >= minAutoLinkBudget
 }
 
-func listingTruncated(nodes []driver.FileNode) bool {
-	truncated := false
+// listingFlags 提取并清除 driver 打在节点上的「列表不完整」标记。
+//   - truncated: 触达深度/节点上限(分享过大,只展开了前 N 个);
+//   - incomplete: 部分目录读取失败(重试后仍失败),该子树缺失。
+//
+// 两者都必须让调用方看见:把缺节点的快照当成完整结果发出去,比报错更危险
+// (客户端会以为「分享里就这些文件」)。
+func listingFlags(nodes []driver.FileNode) (truncated, incomplete bool) {
 	for i := range nodes {
 		if nodes[i].Ext == nil {
 			continue
@@ -130,8 +136,12 @@ func listingTruncated(nodes []driver.FileNode) bool {
 			truncated = true
 			delete(nodes[i].Ext, "truncated")
 		}
+		if nodes[i].Ext["incomplete"] == "1" {
+			incomplete = true
+			delete(nodes[i].Ext, "incomplete")
+		}
 	}
-	return truncated
+	return
 }
 
 func joinHints(parts ...string) string {
@@ -361,8 +371,8 @@ func (r *Resolver) ResolveShare(ctx context.Context, rawURL, pwd, clientUA strin
 	if err := r.mapErr(ctx, pan, acc, err); err != nil {
 		return nil, err
 	}
-	truncated := listingTruncated(nodes)
-	if truncated && len(nodes) == 1 && nodes[0].FID == "" && nodes[0].Name == "" {
+	truncated, incomplete := listingFlags(nodes)
+	if (truncated || incomplete) && len(nodes) == 1 && nodes[0].FID == "" && nodes[0].Name == "" {
 		nodes = nil
 	}
 	key := r.shareKey(pan, rawURL, pwd)
@@ -418,13 +428,17 @@ func (r *Resolver) ResolveShare(ctx context.Context, rawURL, pwd, clientUA strin
 			"pan", pan, "files", len(nodes), "pending", len(pending), "linked", linked,
 			"list_ms", linkStart.Sub(start).Milliseconds(),
 			"link_ms", time.Since(linkStart).Milliseconds(),
-			"truncated", truncated)
+			"truncated", truncated, "incomplete", incomplete)
 	}
 	if truncated {
 		hint = joinHints(hint, fmt.Sprintf("分享过大,仅展开前 %d 个文件", len(nodes)))
 	}
+	if incomplete {
+		hint = joinHints(hint, "部分目录读取失败,列表可能不完整,建议重试")
+	}
 	r.met.Inc("panrouter_resolve_total", map[string]string{"pan": pan, "kind": "share"})
-	return &ResolveShareResult{Pan: pan, ShareKey: key, Files: items, Hint: hint, Truncated: truncated}, nil
+	return &ResolveShareResult{Pan: pan, ShareKey: key, Files: items, Hint: hint,
+		Truncated: truncated || incomplete}, nil
 }
 
 // autoLinkConcurrency 决定自动提链的并发度:默认 1(串行)。
@@ -456,6 +470,24 @@ func (r *Resolver) autoLinkConcurrency(drv driver.Driver, pan string, pending in
 	return conc
 }
 
+// resolveFileSafe 执行 ResolveFile,并把 driver 的 panic 收口成普通上游错误。
+//
+// ★ 并发自动提链的 worker 是**独立 goroutine**:net/http 只 recover 处理请求
+//   的那个 goroutine,worker 里的 panic 会直接崩掉整个进程。单个文件的提链
+//   失败没有理由毁掉服务,故在这里收口成 KindUpstream 参与常规失败处理
+//   (与 v2.15.3 修 transfer Submit 的 panic 同型)。串行路径同样走它:
+//   一个文件 panic 只应让该文件带 LinkError,而不是让整次 resolve 500。
+func (r *Resolver) resolveFileSafe(ctx context.Context, rawURL, pwd, fid, clientUA, pan string) (res *ResolveFileResult, err error) {
+	defer func() {
+		if p := recover(); p != nil {
+			r.log.Errorw("auto-link panic recovered",
+				"pan", pan, "fid", fid, "panic", fmt.Sprint(p), "stack", string(debug.Stack()))
+			res, err = nil, driver.NewErr(driver.KindUpstream, "提链时发生内部错误,请稍后重试", fmt.Errorf("panic: %v", p))
+		}
+	}()
+	return r.ResolveFile(ctx, rawURL, pwd, fid, false, clientUA)
+}
+
 // autoLinkSerial 逐个自动提链(基线语义):鉴权失败立即停、预算不足停、
 // 结果按原顺序回填。返回已尝试数/鉴权阻断/预算停止/提示。
 func (r *Resolver) autoLinkSerial(ctx context.Context, rawURL, pwd string, nodes []driver.FileNode,
@@ -472,7 +504,7 @@ func (r *Resolver) autoLinkSerial(ctx context.Context, rawURL, pwd string, nodes
 			break
 		}
 		linked++
-		file, lerr := r.ResolveFile(ctx, rawURL, pwd, fid, false, clientUA)
+		file, lerr := r.resolveFileSafe(ctx, rawURL, pwd, fid, clientUA, pan)
 		if lerr != nil {
 			kind := "upstream_error"
 			var de *driver.Error
@@ -521,7 +553,14 @@ func (r *Resolver) autoLinkParallel(ctx context.Context, rawURL, pwd string, nod
 		mu.Unlock()
 		cancel()
 	}
-	tasks := make(chan int)
+	// 任务一次性入队(最多 autoLinkMax 个,容量可忽略):worker 在**取任务时**
+	// 判停,语义与「发送前判停」等价,却不需要发送方与 worker 同步——即使某个
+	// worker 异常退出,也不会有 goroutine 永久阻塞在发送上。
+	tasks := make(chan int, len(pending))
+	for _, idx := range pending {
+		tasks <- idx
+	}
+	close(tasks)
 	var wg sync.WaitGroup
 	for w := 0; w < conc; w++ {
 		wg.Add(1)
@@ -546,7 +585,7 @@ func (r *Resolver) autoLinkParallel(ctx context.Context, rawURL, pwd string, nod
 				mu.Lock()
 				linked++
 				mu.Unlock()
-				file, lerr := r.ResolveFile(cctx, rawURL, pwd, nodes[idx].FID, false, clientUA)
+				file, lerr := r.resolveFileSafe(cctx, rawURL, pwd, nodes[idx].FID, clientUA, pan)
 				if lerr == nil {
 					mu.Lock()
 					items[idx].Route = file.Route
@@ -589,16 +628,6 @@ func (r *Resolver) autoLinkParallel(ctx context.Context, rawURL, pwd string, nod
 			}
 		}()
 	}
-	for _, idx := range pending {
-		mu.Lock()
-		stopped := stop
-		mu.Unlock()
-		if stopped {
-			break
-		}
-		tasks <- idx
-	}
-	close(tasks)
 	wg.Wait()
 	return
 }
@@ -649,11 +678,16 @@ func (r *Resolver) ResolveFile(ctx context.Context, rawURL, pwd, fid string, own
 		return nil, err
 	}
 	var dl driver.DirectLink
-	err = r.guard(ctx, pan, func() error {
-		dl, err = drv.GetDirectLink(ctx, cred, *ref)
-		return err
-	})
-	release()
+	// release 必须走 defer:driver 若 panic(并发 worker 里已被 recover 成
+	// LinkError),顺序执行的 release() 会被跳过 —— 并发额度永久泄漏,
+	// DownloadConc 个 panic 就能把该网盘卡死在「等待并发额度超时」。
+	func() {
+		defer release()
+		err = r.guard(ctx, pan, func() error {
+			dl, err = drv.GetDirectLink(ctx, cred, *ref)
+			return err
+		})
+	}()
 	if err := r.mapErr(ctx, pan, acc, err); err != nil {
 		return nil, err
 	}
